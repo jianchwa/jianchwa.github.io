@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PCIe</title>
+</head>
+<body>
+<div>
+    <h1>PCIe</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#What_is_PCIe">What is PCIe</a><br/>
+<ul>
+<li><a href="#In_Concepts">In Concepts</a><br/>
+<li><a href="#In_Hardware_Structure">In Hardware Structure</a><br/>
+</ul>
+<a href="#How_does_PCIe_work">How does PCIe work</a><br/>
+<ul>
+<li><a href="#How_to_talk">How to talk</a><br/>
+</ul>
+</font>
+</p>
+
+
+<h2><a name="What_is_PCIe">What is PCIe</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<h3><a name="In_Concepts">In Concepts</a></h3>
+<p>
+
+</p>
+
+<h3><a name="In_Hardware_Structure">In Hardware Structure</a></h3>
+<p>
+<a href="https://en.wikipedia.org/wiki/PCI_Express#Architecture">https://en.wikipedia.org/wiki/PCI_Express#ArchitectureM</a><br/>
+Conceptually, the PCI Express bus is a high-speed <strong>serial</strong> replacement of the older PCI/PCI-X bus. One of the key differences between the PCI Express bus and the older PCI is the bus topology; PCI uses a shared <strong>parallel</strong> bus architecture, in which the PCI host and all devices share a common set of address, data and control lines. In contrast, PCI Express is based on point-to-point topology, with separate serial links connecting every device to the root complex (host).<br/>
+</br>
+<pre>
+<strong>Usage of lane</strong>
+The PCI Express link between two devices can consist of anywhere from one to 32 lanes.
+In a multi-lane link, the packet data is <strong>striped across lanes</strong>, and peak data throughput scales with the overall link width.
+The lane count is automatically negotiated during device initialization, and can be restricted by either endpoint.
+For example, a single-lane PCI Express (×1) card can be inserted into a multi-lane slot (×4, ×8, etc.), and the initialization cycle auto-negotiates the highest mutually supported lane count.
+The link can dynamically down-configure itself to use fewer lanes, providing <strong>a failure tolerance</strong> in case bad or unreliable lanes are present.
+The PCI Express standard defines slots and connectors for multiple widths: ×1, ×4, ×8, ×12, ×16 and ×32.This allows the PCI Express bus to serve both cost-sensitive applications where high throughput is not needed, as well as performance-critical applications such as 3D graphics, networking (10 Gigabit Ethernet or multiport Gigabit Ethernet), and enterprise storage (SAS or Fibre Channel).
+</pre>
+</p>
+<p>
+<strong>PCIe Link</strong><br/>
+<font size="2">
+<img src="./pcie_link.png"></br>
+<strong>Interconnect</strong><br/>
+PCI Express devices communicate via a logical connection called an interconnect or link. A link is a point-to-point communication channel between two PCI Express ports allowing both of them to send and receive <strong>ordinary PCI requests (configuration, I/O or memory read/write) and interrupts (INTx, MSI or MSI-X)</strong>. At the physical level, a link is composed of one or more lanes.
+<pre>Low-speed peripherals (such as an 802.11 Wi-Fi card) use a single-lane (×1) link, while a graphics adapter typically uses a much wider and faster 16-lane link.</pre>
+
+<strong>Lane</strong><br/>
+A lane is composed of two differential signaling pairs, with one pair for receiving data and the other for transmitting. Thus, each lane is composed of four wires or signal traces. Conceptually, each lane is used as a full-duplex byte stream, transporting data packets in eight-bit "byte" format simultaneously in both directions between endpoints of a link.<br/><br/>
+<strong>Serial Bus</strong><br/	>
+The bonded serial bus architecture was chosen over the traditional parallel bus due to inherent limitations of the latter, including half-duplex operation, excess signal count, and inherently lower bandwidth due to timing skew. A serial interface does not exhibit timing skew because there is only one differential signal in each direction within each lane, and there is no external clock signal since clocking information is embedded within the serial signal itself. 
+<pre> PCI Express is one example of the general trend toward replacing parallel buses with serial interconnects; other examples include Serial
+ ATA (SATA), USB, Serial Attached SCSI (SAS), FireWire (IEEE 1394), and RapidIO. In digital video, examples in common use are DVI, HDMI and
+ DisplayPort.</pre>
+</font>
+</p>
+<p>
+<strong>Layout of Hardware</strong><br/>
+<font size="2">
+<a href="https://en.wikipedia.org/wiki/PCI_Express#Hardware_protocol_summary">https://en.wikipedia.org/wiki/PCI_Express#Hardware_protocol_summary</a><br/>
+The PCIe link is built around dedicated unidirectional couples of serial (1-bit), point-to-point connections known as lanes. This is in sharp contrast to the earlier PCI connection, which is a bus-based system where all the devices share the same bidirectional, 32-bit or 64-bit parallel bus.<br/>
+PCI Express is a layered protocol, consisting of a transaction layer, a data link layer, and a physical layer.<br/>
+<strong>Physical layer</strong><br/>
+At the electrical level, each lane consists of two unidirectional LVDS(Low-voltage differential signaling) pairs operating at 2.5, 5, 8 or 16 Gbit/s, depending on the negotiated capabilities. Transmit and receive are separate differential pairs, for a total of four data wires per lane. A connection between any two PCIe devices is known as a link, and is built up from a collection of one or more lanes. All devices must minimally support single-lane (×1) link. Devices may optionally support wider links composed of 2, 4, 8, 12, 16, or 32 lane<br/>
+<strong>Data transmission</strong><br/>
+
+PCIe sends all control messages, including interrupts, over the same links used for data. The serial protocol can never be blocked, so latency is still comparable to conventional PCI, which has dedicated interrupt lines.<br/>
+
+Data transmitted on multiple-lane links is interleaved, meaning that each successive byte is sent down successive lanes. The PCIe specification refers to this interleaving as data striping. While requiring significant hardware complexity to synchronize (or deskew) the incoming striped data, striping can significantly reduce the latency of the nth byte on a link.<br/>
+<strong>Data link layer</strong><br/>
+The data link layer performs three vital services for the PCIe express link:
+<ul>
+<li>sequence the transaction layer packets (TLPs) that are generated by the transaction layer,
+<li>ensure reliable delivery of TLPs between two endpoints via an acknowledgement protocol (ACK and NAK signaling) that explicitly requires replay of unacknowledged/bad TLPs,
+<li>initialize and manage flow control credits
+</ul>
+On the transmit side, the data link layer generates an incrementing sequence number for each outgoing TLP. It serves as a unique identification tag for each transmitted TLP, and is inserted into the header of the outgoing TLP<br/>
+<strong>Transaction layer</strong><br/>
+PCI Express implements split transactions (transactions with request and response separated by time), allowing the link to carry other traffic while the target device gathers data for the response.
+</font>
+</p>
+
+<h2><a name="How_does_PCIe_work">How does PCIe work</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<h3><a name="How_to_talk">How to talk</a></h3>
+PCIe is a <strong>packet-based network</strong> but not bus, this is very different from the old PCI-x or other versions. But it has to fake the traditional PCI bus to preserve the downword compatibility.
+<pre>
+PCI Express is based on point-to-point topology, with separate serial links connecting every device to the root complex (host)
+PCI Express communication is encapsulated in packets. The work of packetizing and de-packetizing data 
+and status-message traffic is handled by the transaction layer of the PCI Express port.
+</pre>
+</body>
+</html>

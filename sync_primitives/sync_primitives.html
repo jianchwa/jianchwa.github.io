@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Synchronize Primitives</title>
+</head>
+<body>
+<div>
+    <h1>Synchronize Primitives</h1> 
+</div>
+
+<p>
+<font size="2">
+<a href="#Percpu_reference_count">Percpu reference count</a><br/>
+</font>
+</p>
+
+
+<h2><a name="Percpu_reference_count">Percpu reference count</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+Reference counting is used by the kernel to know when a data structure is unused and can be freed. Most of the time, reference counts are represented by an atomic_t variable, perhaps wrapped by a structure like a kref. If references are added and removed frequently over an object's lifetime, though, that atomic_t variable can become a performance bottleneck.<br/>
+<pre>
+The frequent write access to the shared reference count variable could result in heavy cache line bouncing between different cpus. 
+On other hand, the atomic operations itself could introduce extra overhead in parallel environment.
+</pre>
+<strong>How does it work</strong><br/>
+The percpu reference count was introduced to the 3.11 kernel created by Kent Overstreet. It is to improve the scalability of reference count in parallel environment. Let's look at how does it work next.<br/>
+Typical usage will involve embedding a percpu_ref structure within the data structure being tracked. The counter must be initialized with:
+<pre>
+    int percpu_ref_init(struct percpu_ref *ref, percpu_ref_release *release);
+</pre>
+Where release() is the function to be called when the reference count drops to zero:
+<pre>
+    typedef void (percpu_ref_release)(struct percpu_ref *);
+</pre>
+The call to percpu_ref_init() will initialize the reference count to one. References are added and removed with:
+<pre>
+    void percpu_ref_get(struct percpu_ref *ref);
+    void percpu_ref_put(struct percpu_ref *ref);
+</pre>
+These two functions will operate on a per-cpu array of reference counters, so they will not cause cacheline bouncing across the system. But the question is how does percpu_ref_put() determine the reference count dropped to zero and invoke the realse callback?<br/>
+There is a basic practice in kernel, the reference count will not be zero as long as the initial one held. So percpu_ref_put() needn't to check it until someone decide to drop the initial reference. It's done thought percpu_ref_kill().
+<pre>
+    void percpu_ref_kill(struct percpu_ref *ref);
+</pre>
+After this call, the reference count degrades to the usual model with a single atomic_t counter. This atomic_t counter will be decremented and checked by percpu_ref_put().<br/>
+<strong>Look at the source code</strong><br/>
+The most interesting part of the percpu_ref is how to switch from percpu variable to atomic variable smoothly.<br/>
+<pre>
+percpu_ref_kill()
+    -> percpu_ref_kill_and_confirm()
+        -> __percpu_ref_switch_mode() // set __PERCPU_REF_DEAD
+            -> __percpu_ref_switch_to_atomic()
+
+static void __percpu_ref_switch_to_atomic(struct percpu_ref *ref,
+                      percpu_ref_func_t *confirm_switch)
+{
+    if (ref->percpu_count_ptr & __PERCPU_REF_ATOMIC) {
+        if (confirm_switch)
+            confirm_switch(ref);
+        return;
+    }
+
+    /* switching from percpu to atomic */
+    ref->percpu_count_ptr |= __PERCPU_REF_ATOMIC;
+
+    percpu_ref_get(ref);    /* put after confirmation */
+    call_rcu_sched(&ref->rcu, percpu_ref_switch_to_atomic_rcu);
+}
+</pre>
+All the reference get/put interface will operate the reference under rcu lock. For example:
+<pre>
+static inline bool percpu_ref_tryget_live(struct percpu_ref *ref)
+{
+	unsigned long __percpu *percpu_count;
+	bool ret = false;
+
+	rcu_read_lock_sched();
+
+	if (__ref_is_percpu(ref, &percpu_count)) {
+		this_cpu_inc(*percpu_count);
+		ret = true;
+	} else if (!(ref->percpu_count_ptr & __PERCPU_REF_DEAD)) {
+		ret = atomic_long_inc_not_zero(&ref->count);
+	}
+
+	rcu_read_unlock_sched();
+
+	return ret;
+}
+</pre>
+percpu_ref_switch_to_atomic_rcu() will be invoked in next grace period. At the moment, all the percpu_ref_get/put() and some other similar interfaces will see the __PERCPU_REF_ATOMIC and __PERCPU_REF_DEAD through __ref_is_percpu().<br/>
+
+But there is one question. The percpu_ref_get/put() could race with the rcu
+callback percpu_ref_switch_to_atomic_rcu(). How to handle that ?<br/>
+
+To switch percpu to atomic, we have to sum the reference in percpu variable to 
+the atomic variable. During this procedure, the percpu_ref_put() could decrement
+the atomic reference variable, even drop it to zero and invoke the release function.
+To avoid this, there are two actions taken by percpu_ref.
+<ul>
+<li>give a basis value to the atomic reference count and decrement it after add the percpu reference sum to it. So nobody could drop the atomic reference to zero before add the percpu reference sum to it.
+<li>get one reference before  call_rcu_sched() in __percpu_ref_switch_to_atomic() and put it in percpu_ref_call_confirm_rcu. So if all the reference are gone during this procedure, we could invoke the release callback here.
+</ul>
+Look at the source code:
+<pre>
+static void percpu_ref_switch_to_atomic_rcu(struct rcu_head *rcu)
+{
+    struct percpu_ref *ref = container_of(rcu, struct percpu_ref, rcu);
+    unsigned long __percpu *percpu_count = percpu_count_ptr(ref);
+    unsigned long count = 0;
+    int cpu;
+
+    for_each_possible_cpu(cpu)
+        count += *per_cpu_ptr(percpu_count, cpu);
+
+    pr_debug("global %ld percpu %ld",
+         atomic_long_read(&ref->count), (long)count);
+
+    /*
+     * It's crucial that we sum the percpu counters _before_ adding the sum
+     * to &ref->count; since gets could be happening on one cpu while puts
+     * happen on another, adding a single cpu's count could cause
+     * @ref->count to hit 0 before we've got a consistent value - but the
+     * sum of all the counts will be consistent and correct.
+     *
+     * Subtracting the bias value then has to happen _after_ adding count to
+     * &ref->count; we need the bias value to prevent &ref->count from
+     * reaching 0 before we add the percpu counts. But doing it at the same
+     * time is equivalent and saves us atomic operations:
+     */
+    atomic_long_add((long)count - PERCPU_COUNT_BIAS, &ref->count);
+
+    WARN_ONCE(atomic_long_read(&ref->count) <= 0,
+          "percpu ref (%pf) <= 0 (%ld) after switching to atomic",
+          ref->release, atomic_long_read(&ref->count));
+
+    /* @ref is viewed as dead on all CPUs, send out switch confirmation */
+    percpu_ref_call_confirm_rcu(rcu);
+}
+</pre>
+<strong>A usage of the percpu_ref</strong><br/>
+The request_queue->q_usage_counter is a percpu_ref.
+blk_mq_freeze_queue() exploit it to drain the ongoing requests
+in blk-mq.
+<pre>
+blk_mq_freeze_queue()
+    -> blk_freeze_queue()
+        -> blk_freeze_queue_start()
+            -> percpu_ref_kill() 
+            // switch to atomic mode then the q->q_usage_counter could be dropped to zero.
+        -> blk_mq_freeze_queue_wait()
+            -> wait_event(q->mq_freeze_wq, percpu_ref_is_zero(&q->q_usage_counter));
+blk_mq_unfreeze_queue()
+    -> percpu_ref_reinit() // switch to percpu mode
+</pre>
+The request_queue->q_usage_counter will be operated in the hot path of block and blk-mq.<br/>
+For example:
+<pre>
+generic_make_request()->blk_queue_enter()
+blk_mq_get_request()->blk_queue_enter_live()
+</pre>
+So it will gain a lot of performance improvement.<br/>
+<strong>Reference</strong><br/>
+<a href="https://lwn.net/Articles/557478/">https://lwn.net/Articles/557478/</a>
+</font>
+</p>
+
+
+</body>
+</html>

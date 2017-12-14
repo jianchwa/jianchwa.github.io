@@ -308,13 +308,40 @@ __blk_mq_run_hw_queue()
             srcu_read_unlock(hctx->queue_rq_srcu, srcu_idx);
         }
 >>>>
+Look at the rcu/srcu lock in __blk_mq_run_hw_queue().
+static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
+{
+	int srcu_idx;
 
-The rcu or srcu lock are used to confirm the blk_mq_sched_dispatch_requests()
-has returned.
+	/*
+	 * We should be running this queue from one of the CPUs that
+	 * are mapped to it.
+	 */
+	WARN_ON(!cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask) &&
+		cpu_online(hctx->next_cpu));
 
-So when the blk_mq_quiesce_queue() returns, we could ensure that all the
-blk_mq_sched_dispatch_requests() following could see the QUEUE_FLAG_QUIESCED and
-returns.
+	/*
+	 * We can't run the queue inline with ints disabled. Ensure that
+	 * we catch bad users of this early.
+	 */
+	WARN_ON_ONCE(in_interrupt());
+
+	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+		rcu_read_lock();
+		blk_mq_sched_dispatch_requests(hctx);
+		rcu_read_unlock();
+	} else {
+		might_sleep();
+
+		srcu_idx = srcu_read_lock(hctx->queue_rq_srcu);
+		blk_mq_sched_dispatch_requests(hctx);
+		srcu_read_unlock(hctx->queue_rq_srcu, srcu_idx);
+	}
+}
+
+So when the blk_mq_quiesce_queue() returns, we could ensure that all the __blk_mq_run_hw_queue
+has returned and the following blk_mq_sched_dispatch_requests() will see the QUEUE_FLAG_QUIESCED.
+Consequently, there will be no requests issued after blk_mq_quiesce_queue().
 </pre>
 When the queue is quiesced, the requests will not be handled, but could be allocated and queued.<br/>
 <pre>
@@ -435,6 +462,344 @@ will be triggered.
 </pre>
 On the other hand, the new present cpu ctx->index_hw is zero, when there is pending reqs on its software queue,
 the hctx will goto ctx of cpu0 to get rqs, the reqs on the new present cpu cannot be handled forever.<br/>
+<br/>
+<strong>Will be a hctx executed on other cpu where it is not mapped ?</strong><br/>
+For example, a nvme card on a 8-core PC will create 8 sq-cq pairs as well as 8
+blk_mq_hw_ctxs. Let's look at the mapping between hctx and cpu first.<br/>
+
+<pre>
+blk_mq_alloc_tag_set()
+    -> blk_mq_update_queue_map()
+        -> nvme_pci_map_queues()
+            -> blk_mq_pci_map_queues()
+>>>>
+    for (queue = 0; queue < set->nr_hw_queues; queue++) {
+        mask = pci_irq_get_affinity(pdev, queue);
+        if (!mask)
+            goto fallback;
+
+        for_each_cpu(cpu, mask)
+            set->mq_map[cpu] = queue;
+    }
+
+    return 0;
+>>>>
+Then in 
+blk_mq_init_allocated_queue()
+    -> blk_mq_map_swqueue()
+>>>>
+    for_each_present_cpu(i) {
+        hctx_idx = q->mq_map[i];
+        >>>>
+        ctx = per_cpu_ptr(q->queue_ctx, i);
+        hctx = blk_mq_map_queue(q, i);
+
+        cpumask_set_cpu(i, hctx->cpumask);
+        ctx->index_hw = hctx->nr_ctx;
+        hctx->ctxs[hctx->nr_ctx++] = ctx;
+    }
+>>>>
+
+nvme_alloc_ns()
+    -> device_add_disk()
+        -> blk_register_queue()
+            -> __blk_mq_register_dev()
+                -> echo hctx blk_mq_register_hctx()
+>>>>
+    ret = kobject_add(&hctx->kobj, &q->mq_kobj, "%u", hctx->queue_num);
+    if (ret)
+        return ret;
+
+    hctx_for_each_ctx(hctx, ctx, i) {
+        ret = kobject_add(&ctx->kobj, &hctx->kobj, "cpu%u", ctx->cpu);
+        if (ret)
+            break;
+    }
+
+>>>>
+</pre>
+We could get mapping between hctx and cpu througth sysfs.
+<pre>
+will@will-ThinkCentre-M910s:/sys/block/nvme0n1/mq$ tree
+.
+├── 0
+│   ├── cpu0
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 1
+│   ├── cpu1
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 2
+│   ├── cpu2
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 3
+│   ├── cpu3
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 4
+│   ├── cpu4
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 5
+│   ├── cpu5
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+├── 6
+│   ├── cpu6
+│   ├── cpu_list
+│   ├── nr_reserved_tags
+│   └── nr_tags
+└── 7
+    ├── cpu7
+    ├── cpu_list
+    ├── nr_reserved_tags
+    └── nr_tags
+
+16 directories, 24 files
+</pre>
+Now, we have know that every hctx has been mapped to a specific cpu.
+Return to our question, will a hctx executed on the other cpu to where
+it is not mapped ?<br/>
+
+There are two paths that executes the hctx, sync and async.<br/>
+
+Let's look at one of the sync path.<br/>
+<pre>
+blk_mq_make_request()
+>>>>
+    rq = blk_mq_get_request(q, bio, bio->bi_opf, &data);
+    // blk_mq_get_ctx() will invoke get_cpu() to disable the preempt
+>>>>
+    } else if (q->nr_hw_queues > 1 && is_sync) {
+        blk_mq_put_ctx(data.ctx); // preempt enabled again.
+        blk_mq_bio_to_request(rq, bio);
+        <strong>// There seem to be a gap here with preempt enabled and the 
+        // current task maybe migrated to other cpu.</strong>
+        blk_mq_try_issue_directly(data.hctx, rq, &cookie);
+    }
+>>>> Let's look into the blk_mq_try_issue_directly()
+
+>>>>
+    if (!(hctx->flags & BLK_MQ_F_BLOCKING)) { 
+        // nvme doesn't have this BLK_MQ_F_BLOCKING
+        rcu_read_lock(); // preempt disable here
+        __blk_mq_try_issue_directly(hctx, rq, cookie, false);
+        rcu_read_unlock();
+    }
+>>>>
+</pre>
+Another sync path.
+<pre>
+blk_mq_requeue_work()
+    -> blk_mq_run_hw_queues()  // async = false
+        -> echo hctx run blk_mq_run_hw_queue()
+
+blk_freeze_queue_start()
+    -> blk_mq_run_hw_queues() // async = false
+</pre>
+The two paths above must will execute the hctxs on the the cpu where they are not mapped.<br/>
+
+For the async path, scenario seems different.<br/>
+
+__blk_mq_delay_run_hw_queue() will invoke blk_mq_hctx_next_cpu() to decide 
+on which cpu queue the hctx->run_work, then the blk_mq_run_work_fn() will 
+be executed on the kworker that has been pinned on a specific cpu.<br/>
+
+</p>
+<p>
+<strong>Tags sharing </strong><br />
+The driver tags could be shared between different request_queues. We could think
+fo the following scenario.<br/>
+<pre>
+SCSI HBA ------> SCSI TARGET +------> LU 0
+                             |
+                             +------> LU 1
+                             |
+                             +------> LU 2
+                             |
+                             +------> LU 3
+The count of LU could be very big in SAN case.
+</pre>
+How does the blk-mq handle the fairness between different request_queues on the
+same tag_set ?<br/>
+
+First, we to tell the request_queue and blk tag_set that the tag_set is shared.<br/>
+<pre>
+blk_mq_init_allocated_queue()
+    -> blk_mq_add_queue_tag_set()
+
+static void blk_mq_add_queue_tag_set(struct blk_mq_tag_set *set,
+                     struct request_queue *q)
+{
+    q->tag_set = set;
+
+    mutex_lock(&set->tag_list_lock);
+
+    /*
+     * Check to see if we're transitioning to shared (from 1 to 2 queues).
+     */
+    if (!list_empty(&set->tag_list) &&
+        !(set->flags & BLK_MQ_F_TAG_SHARED)) {
+        set->flags |= BLK_MQ_F_TAG_SHARED;
+        /* update existing queue */
+        blk_mq_update_tag_set_depth(set, true);
+        /*
+         Actually, only the first request_queue on this tag_set will be set here.
+         The blk-mq will be frozen and the hctxs associated with request_queue
+         will be set BLK_MQ_F_TAG_SHARED.
+         */
+    }
+    if (set->flags & BLK_MQ_F_TAG_SHARED)
+        queue_set_hctx_shared(q, true); // Set the BLK_MQ_F_TAG_SHARED
+    list_add_tail_rcu(&q->tag_set_list, &set->tag_list);
+
+    mutex_unlock(&set->tag_list_lock);
+}
+</pre>
+In addition, the meaning of sharing tag_set is to share the driver tags. Look at
+the following code:
+<pre>
+blk_mq_init_allocated_queue()
+    -> blk_mq_add_queue_tag_set()
+    -> blk_mq_map_swqueue()
+>>>>
+    queue_for_each_hw_ctx(q, hctx, i) {
+    >>>>
+        hctx->tags = set->tags[i];
+        WARN_ON(!hctx->tags);
+    >>>>
+    }
+>>>>
+</pre>
+Then all the things will occur around this BLK_MQ_F_TAG_SHARED.<br/>
+<strong>driver tags allocation</strong><br/>
+<pre>
+blk_mq_get_request()
+    -> blk_mq_rq_ctx_init()
+Or 
+blk_mq_get_driver_tag()
+>>>>
+        if (blk_mq_tag_busy(data.hctx)) {
+            rq->rq_flags |= RQF_MQ_INFLIGHT;
+            atomic_inc(&data.hctx->nr_active);
+        }
+>>>>
+blk_mq_tag_busy() will only return true when BLK_MQ_F_TAG_SHARED is set.
+In __blk_mq_tag_busy(), the BLK_MQ_S_TAG_ACTIVE will be set and
+hctx->tags->active_queues will be increased.
+
+In addition, the hctx->nr_active will also be increased.
+
+The hctx->tags->nr_actives is the count of request_queues that use the driver tag.
+The hctx->nr_active is the count of driver tags used by the hctx itself
+
+Where will be these two values used ?
+
+blk_mq_get_request()/blk_mq_get_driver_tag()
+    -> blk_mq_get_tag()
+        -> __blk_mq_get_tag() // if !BLK_MQ_REQ_INTERNAL
+            -> hctx_may_queue()
+
+static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
+                  struct sbitmap_queue *bt)
+{
+    unsigned int depth, users;
+
+    if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_SHARED))
+        return true;
+    if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+        return true;
+
+    /*
+     * Don't try dividing an ant
+     */
+    if (bt->sb.depth == 1)
+        return true;
+
+    users = atomic_read(&hctx->tags->active_queues);
+    if (!users)
+        return true;
+
+    /*
+     * Allow at least some tags
+     */
+    depth = max((bt->sb.depth + users - 1) / users, 4U);
+    return atomic_read(&hctx->nr_active) < depth;
+}
+It is easy to understand the source code above. It just averages the tag depth to
+among the active request_queues to ensure fairness. But it look like not fair
+when a high workload on LU0 and a relatively low workload on LU1. Another sad
+thing is the active_queues will only be decreased when the queue is timed out or
+exits( Look at the blk_mq_tag_idle() ). This indicates that the tags will be shared 
+between the LUs no matter whether there is workload on the LUs.
+
+</pre>
+
+<strong>driver tag release</strong><br/>
+
+<pre>
+__blk_mq_put_driver_tag()/blk_mq_free_request()
+>>>>
+    if (rq->rq_flags & RQF_MQ_INFLIGHT) {
+        rq->rq_flags &= ~RQF_MQ_INFLIGHT;
+        atomic_dec(&hctx->nr_active);
+    }
+>>>>
+
+hctx->nr_active will be decreased here.
+</pre>
+
+<strong>restart hctxs</strong></br>
+
+If we submit a req to blk-mq, when will the reqs not be issued ?
+<pre>
+<ul>
+<li>a> driver tag is used up
+At the moment, the req will be requeued to hctx->dispatch list. The hctx will be
+re-run when the driver tag is freed.
+<li>b> the req inserted into ctx swqueue or IO scheduler cannot be dispatched when there
+is residual reqs in the hctx->dispatch list. In blk_mq_sched_dispatch_requests(), we call 
+blk_mq_sched_mark_restart() after we dispatch requests left over on our hardware queue 
+dispatch list. This is so we'll go back and dispatch requests from the ctx
+swqueue or IO scheduler queue.
+<li>c> merge into ctx swqueue or IO scheduler queue. This will occur when there are
+residual reqs on the queues above. The reqs could be issued through the method
+in a and b.
+</ul>
+Regarding the a.
+blk_mq_mark_tag_wait() will be invoked by blk_mq_dispatch_rq_list().
+(A commit that optimize this path f906a6a blk-mq: improve tag waiting setup for non-shared tags)
+For the non-shared-tags case, the BLK_MQ_S_SCHED_RESTART flag will be enough.
+But for the shared-tags case, it uses the sbq_wake_up().
+
+Regarding the b.
+
+Look at the comment of blk_mq_sched_restart()
+Called after a driver tag has been freed to check whether a hctx needs to
+be restarted. Restarts @hctx if its tag set is not shared. Restarts hardware
+queues in a round-robin fashion if the tag set of @hctx is shared with other
+hardware queues.
+Look at the round-robin part:
+>>>>
+        list_for_each_entry_rcu_rr(q, queue, &set->tag_list,
+                       tag_set_list) {
+            queue_for_each_hw_ctx(q, hctx2, i)
+                if (hctx2->tags == tags &&
+                    blk_mq_sched_restart_hctx(hctx2))
+                    goto done;
+        }
+>>>>
+blk_mq_sched_restart_hctx() will run the hctx in async fashion if has work
+pending on it.
+</pre>
 
 </p>
 </body>
