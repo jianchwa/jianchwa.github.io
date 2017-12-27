@@ -91,11 +91,22 @@ PCI Express implements split transactions (transactions with request and respons
 <h2><a name="How_does_PCIe_work">How does PCIe work</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
 <h3><a name="How_to_talk">How to talk</a></h3>
-PCIe is a <strong>packet-based network</strong> but not bus, this is very different from the old PCI-x or other versions. But it has to fake the traditional PCI bus to preserve the downword compatibility.
+<font size="2">
+PCIe is a <strong>packet-based network</strong> but not bus.
 <pre>
-PCI Express is based on point-to-point topology, with separate serial links connecting every device to the root complex (host)
-PCI Express communication is encapsulated in packets. The work of packetizing and de-packetizing data 
-and status-message traffic is handled by the transaction layer of the PCI Express port.
+this is very different from the old PCI-x or other versions. But it has to fake the traditional PCI bus to preserve the downword compatibility
 </pre>
+PCI Express employ packets (Transport Layer Packet, or TLP) to accomplish data transfer between devices. The basic unit to complete the information transfer between devices is transaction.PCI Express transactions can be grouped into four categories:<br/>
+<ul>
+<li>memory
+<li>IO
+<li>configuration
+<li>message
+</ul> 
+Memory, IO and configuration transactions are supported in PCI and PCI-X architectures, but the message transaction is new to PCI Express.
+<pre>
+
+</pre>
+</font>
 </body>
 </html>

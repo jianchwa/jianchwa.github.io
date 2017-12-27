@@ -12,6 +12,8 @@
 <p>
 <font size="2">
 <a href="#Percpu_reference_count">Percpu reference count</a><br/>
+<a href="#Sequence_lock">Sequence lock</a><br/>
+<a href="#ACCESS_ONCE_Series">ACCESS_ONCE Series</a><br/>
 </font>
 </p>
 
@@ -169,5 +171,319 @@ So it will gain a lot of performance improvement.<br/>
 </p>
 
 
+<h2><a name="Sequence_lock">Sequence lock</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+Sequence lock is used in linux kernel for the read almost data that must be seen in a consistent state by readers. However, unlike the reader-writer lock, the readers don't exclude the writer, but the reader <strong>_must_</strong> retry the operation if they detect activity from the concurrent writer.<br/>
+In fact, in linux kernel, the sequence lock is just a combination of a sequence count and a spinlock which is used to execlude concurrent writers. So sequence lock is nearly equal to sequence count.
+<pre>
+static inline void write_seqlock(seqlock_t *sl)
+{
+	spin_lock(&sl->lock);
+	write_seqcount_begin(&sl->seqcount);
+}
+
+static inline void write_sequnlock(seqlock_t *sl)
+{
+	write_seqcount_end(&sl->seqcount);
+	spin_unlock(&sl->lock);
+}
+</pre>
+Following, let's focus on the implementation of sequence count.<br/>
+The basic idea of seqence count is:<br/>
+The writer will update the sequence count before and after its updating operation. So if the sequence count is a even value, there is no writer ongoing. If it is a odd value, a writer is updating it. In the view of readers, it need to snapshot the value of seqence count. if get a odd value, it indicates a writing is in progress, if two snapshots differ, it indicates a concurrent update has completed and reader may get inconsistent data and need to discard it.<br/>
+<pre>
+read_seqcount_begin()
+    -> raw_read_seqcount_begin()
+        -> __read_seqcount_begin()
+        >>>>
+repeat:
+    ret = READ_ONCE(s->sequence);
+    if (unlikely(ret & 1)) {
+        cpu_relax();
+        goto repeat;
+    } // ensure the concurrent update is completed.
+    return ret;
+        >>>>
+        -> smp_rmb() 
+    //smp_rmb() has two destinations:
+    //1. ensure all read operations is after __read_seqcount_begin() to sharp
+    //the boundary of read critical section.
+    //2. ensure all the read operations see the updating from the other cpu.
+</pre>  
+read_seqcount_begin() ensure to return an even value, then it could ensure a concurrent updating has been completed at least when read_seqcount_begin() returns.
+<pre>
+write_seqcount_begin()
+
+updateing
+
+write_seqcount_end()        read_seqcount_begin()
+                            reading  
+                            read_seqcount_retry()        
+</pre>
+Most important, this could avoid the scenario below:<br/>
+<pre>          context A                  context B                         
+	write_seqcount_begin();
+	updating ...
+	                          
+		                     read_seqcount_begin()
+			             reading
+				     read_seqcount_retry()
+	write_seqcount_end();
+
+</pre>
+But this could introduce other issue, look at the following scenario.
+<pre>          context A                  context B                         
+	write_seqcount_begin();
+	updating ...
+	                  ---preempt--->           
+		                     __read_seqcount_begin()
+			                 while (seq & 1)
+				             cpurelax();
+	write_seqcount_end();
+</pre>
+If the context B is irq context, a live lock comes up. If context B is a normal task, it has to use up its time slice (ideal time in cfs) then come back to context A to update the sequence count to even value. But if context B is a FIFO task, live lock again.<br/>
+To fix this, a irq/preempt disable is needed here.<br/>
+
+The classic usage example in linux kernel, the timekeeping.<br/>
+<pre>
+void update_wall_time(void)
+{
+    >>>>
+    raw_spin_lock_irqsave(&timekeeper_lock, flags);
+    >>>>
+    clock_set |= accumulate_nsecs_to_secs(tk);
+
+    write_seqcount_begin(&tk_core.seq);
+    /*
+     * Update the real timekeeper.
+     *
+     * We could avoid this memcpy by switching pointers, but that
+     * requires changes to all other timekeeper usage sites as
+     * well, i.e. move the timekeeper pointer getter into the
+     * spinlocked/seqcount protected sections. And we trade this
+     * memcpy under the tk_core.seq against one before we start
+     * updating.
+     */
+    timekeeping_update(tk, clock_set);
+    memcpy(real_tk, tk, sizeof(*tk));
+    /* The memcpy must come last. Do not put anything here! */
+    write_seqcount_end(&tk_core.seq);
+out:
+    raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
+    if (clock_set)
+        /* Have to call _delayed version, since in irq context*/
+        clock_was_set_delayed();
+
+}
+
+ktime_t ktime_get_raw(void)
+{
+    struct timekeeper *tk = &tk_core.timekeeper;
+    unsigned int seq;
+    ktime_t base;
+    u64 nsecs;
+
+    do {
+        seq = read_seqcount_begin(&tk_core.seq);
+        base = tk->tkr_raw.base;
+        nsecs = timekeeping_get_ns(&tk->tkr_raw);
+
+    } while (read_seqcount_retry(&tk_core.seq, seq));
+
+    return ktime_add_ns(base, nsecs);
+}
+</pre>
+</font>
+</p>
+<h2><a name="ACCESS_ONCE_Series">ACCESS_ONCE Series</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+There are a lot of ACCESS_ONCE macro in the kernel, what are they for ?<br/>
+<a href="https://lwn.net/Articles/508991/">https://lwn.net/Articles/508991/</a>
+Its functionality has been actually well described by its name. Its purpose is to ensure the address passed by the parameter to be <strong>accessed exactly once</strong> by the final assembly code generated by the compiler. We may suspect that would the address be accessed twice or non ? Actually, yes. The optimizaion option of the C compiler could do that.<br/>
+If not given reasons to the contrary, <strong>assume that there is only one thread of execution in the address space of the program it is compiling</strong>. Concurrency is not built into the C language itself, so mechanisms for dealing with concurrent access must be built on top of the language; ACCESS_ONCE() is one such mechanism.<br/>
+Consider the following example:
+<pre>
+int foo(int x)
+{
+    x = x*x;
+    x = x>>6;
+    printf("result is %d\n", x);
+    return x;
+}
+
+int main()
+{
+    int x;
+    int conti;
+    int *p_value = (int *)malloc(sizeof(int));
+
+     for (;;) {
+        x = *p_value;
+        conti = foo(x);
+        if (conti)
+            break;
+     }
+
+    return 0;
+}
+</pre>
+gcc -O2 test.c -S -o test.asm
+<pre>
+main:
+.LFB39:
+    .cfi_startproc
+    pushq    %rbx
+    .cfi_def_cfa_offset 16
+    .cfi_offset 3, -16
+    movl    $4, %edi
+    call    malloc
+    <strong>movl    (%rax), %ebx</strong>
+    imull    %ebx, %ebx
+    sarl    $6, %ebx
+    .p2align 4,,10
+    .p2align 3
+.L4:
+    xorl    %eax, %eax
+    movl    %ebx, %edx
+    movl    $.LC0, %esi
+    movl    $1, %edi
+    call    __printf_chk
+    testl    %ebx, %ebx
+    je    .L4
+    xorl    %eax, %eax
+    popq    %rbx
+    .cfi_def_cfa_offset 8
+    ret
+</pre>
+The actual scenario may be more complicated than above. But the result is similar. To prevent the optimization, we could introduce the ACCESS_ONCE() macro.
+<pre>
+#define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+</pre>
+Then
+<pre>
+#define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+int foo(int x)
+{
+    x = x*x;
+    x = x>>6;
+    printf("result is %d\n", x);
+    return x;
+}
+
+int main()
+{
+    int x;
+    int conti;
+    int *p_value = (int *)malloc(sizeof(int));
+
+     for (;;) {
+        x = ACCESS_ONCE(*p_value);
+        conti = foo(x);
+        if (conti)
+            break;
+     }
+
+    return 0;
+}
+</pre>
+gcc -O2 test.c -S -o test.asm
+<pre>
+main:
+.LFB39:
+    .cfi_startproc
+    pushq    %rbp
+    .cfi_def_cfa_offset 16
+    .cfi_offset 6, -16
+    pushq    %rbx
+    .cfi_def_cfa_offset 24
+    .cfi_offset 3, -24
+    movl    $4, %edi
+    subq    $8, %rsp
+    .cfi_def_cfa_offset 32
+    call    malloc
+    movq    %rax, %rbp
+    .p2align 4,,10
+    .p2align 3
+.L4:
+    <strong>movl    0(%rbp), %ebx</strong>
+    xorl    %eax, %eax
+    movl    $.LC0, %esi
+    movl    $1, %edi
+    imull    %ebx, %ebx
+    sarl    $6, %ebx
+    movl    %ebx, %edx
+    call    __printf_chk
+    testl    %ebx, %ebx
+    je    .L4
+    addq    $8, %rsp
+    .cfi_def_cfa_offset 24
+    xorl    %eax, %eax
+</pre>
+
+As it happens, an optimized-out access is not the only peril that this code could encounter. Some processor architectures (x86, for example) are not richly endowed with registers; on such systems, the compiler must make careful choices regarding which values to keep in registers if it is to generate the highest-performing code. Specific values may be pushed out of the register set, then pulled back in later. The address is accessed twice actually, and this may introcue inconsistence into kernel.<br/><br/>
+
+There are two other macro to achieve same functionality, READ_ONCE() and WRITE_ONCE(), the implementation is similar with ACCESS_ONCE<br/>
+Another expample is:
+<a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4444.html">http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2015/n4444.html</a>
+<pre>
+	while (tmp = atomic_load_explicit(a, memory_order_relaxed))
+		do_something_with(tmp);
+</pre>
+The compiler would be permitted to unroll it as follows:
+<pre>
+	while (tmp = atomic_load_explicit(a, memory_order_relaxed))
+		do_something_with(tmp);
+		do_something_with(tmp);
+		do_something_with(tmp);
+		do_something_with(tmp);
+	}
+</pre>
+This would be unacceptable for real-time applications, which need the value to be reloaded from a on each iteration, unrolled or not. The volatile qualifier prevents this transformation. For example, consider the following loop.
+<pre>
+	while (tmp = READ_ONCE(a))
+		do_something_with(tmp);
+</pre>
+This loop could still be unrolled, but the read would also need to be unrolled, for example, like this:
+<pre>
+	for (;;) {
+		if (!(tmp = READ_ONCE(a)))
+			break;
+		do_something_with(tmp);
+		if (!(tmp = READ_ONCE(a)))
+			break;
+		do_something_with(tmp);
+		if (!(tmp = READ_ONCE(a)))
+			break;
+		do_something_with(tmp);
+		if (!(tmp = READ_ONCE(a)))
+			break;
+		do_something_with(tmp);
+	}
+</pre>
+
+Let's look at the implementation of READ_ONCE:
+<pre>
+#define __READ_ONCE_SIZE						\
+({									\
+	switch (size) {							\
+	case 1: *(__u8 *)res = *(volatile __u8 *)p; break;		\
+	case 2: *(__u16 *)res = *(volatile __u16 *)p; break;		\
+	case 4: *(__u32 *)res = *(volatile __u32 *)p; break;		\
+	case 8: *(__u64 *)res = *(volatile __u64 *)p; break;		\
+	default:							\
+		barrier();						\
+		__builtin_memcpy((void *)res, (const void *)p, size);	\
+		barrier();						\
+	}								\
+})
+</pre>
+Why we need this __u8,u16,u32... here ?<br/>
+At one time, gcc guaranteed that <strong>properly aligned accesses to machine-word-sized variables would be atomic</strong>. Although gcc <strong>_no longer_</strong> documents this guarantee, there is still code in the Linux kernel that relies on it. These accesses could be modeled as non-volatile memory_order_relaxed accesses.
+</font>
+</p>
 </body>
 </html>

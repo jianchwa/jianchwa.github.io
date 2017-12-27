@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Block Basis</title>
+</head>
+<body>
+<div>
+    <h1>Block Basis</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#BIO">BIO</a>
+<ul>
+<li><a href="#Setup_and_complete_a_bio">Setup and complete a bio</a>
+<li><a href="#Bio_operations">Bio operations</a>
+</ul>
+<a href="#FLUSH_and_FUA">FLUSH and FUA</a>
+</font>
+</p>
+
+
+<h2><a name="BIO">BIO</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+Let's look into the _basic unit_ in block layer, the bio.<br/>
+We could deem there is a bio layer between the fs and block layer.
+<pre>
+                         
+                FS LAYER
+     ------------------------------------------------
+                          | submit_bio 
+                          |
+                          V generic_make_request <-------+
+     ------------------------------------------------    |
+                             blk-throttl                 |
+                BIO LAYER    bio remap +--> partition    |
+                                       |                 |
+                                       +--> bio based device mapper (stackable)
+    -------------------------------------------------    |
+                          |                              |
+                          V  blk_queue_bio/blk_mq_make_request
+
+                BLOCK LAGACY/BLK-MQ
+</pre>
+<strong>The basic architecture of a bio.</strong>
+<pre>
+request->bio __                    
+               \                  
+                \     bio        
+                 \   ________    
+                  ->| bi_next        next bio in one request, the blocks in these bios should be contigous on disk
+                    |
+                    | bi_disk        gendisk->request_queue 
+                    |
+                    | bi_partno      partition NO.
+                    |
+                    | bi_opf         bio_op, req_flag_bits, same with req->cmd_flags
+                    |
+                    | bi_phys_segments  Number of segments in this BIO after physical address coalescing is performed.
+                    |
+                    | bi_end_io　　　blk_update_request->req_bio_endio->bio_endio
+                    |
+                    | bi_vcnt        how many bio_vec's
+                    | bi_max_vecs    max bio_vecs can hold
+                    | bi_io_vec      pointer to bio_io_vec list    
+                    |         \     　________    
+                    |          --->  | bv_page       
+                    |                | bv_len        
+                    |                | bv_offset     
+                    |                 ________       
+                    |                | bv_page       
+                    |                | bv_len        
+                    |                | bv_offset    These two pages could be non physical contigously
+                    |                               But the corresponding blocks on storage disk should be contigous.
+                    | bi_pool        as its name
+                    | 
+                    | bi_iter        the current iterating status in bio_vec list
+                                      ___________
+                                     | bi_sector    device address in 512 byte sectors
+                                     | bi_size      residual I/O count
+                                     | bi_idx       current index into bvl_vec
+                                     | bi_done      number of bytes completed
+                                     | bi_bvec_done number of bytes completed in current bvec
+
+
+(Some members associated with cgroup,blk-throttle,merge-assistant are ignored here.)
+</pre>
+</font>
+</p>
+
+<h3><a name="Setup_and_complete_a_bio">Setup and complete a bio</a></h3>
+<p>
+<font size="2">
+Let's take the submit_bh_wbc() as example to show how to setup a bio
+<pre>
+static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
+			 enum rw_hint write_hint, struct writeback_control *wbc)
+{
+	struct bio *bio;
+	>>>>
+	bio = bio_alloc(GFP_NOIO, 1); // the second parameter is the count of bvec
+
+	if (wbc) {
+		wbc_init_bio(wbc, bio);
+		wbc_account_io(wbc, bh->b_page, bh->b_size);
+	}
+
+	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+	bio_set_dev(bio, bh->b_bdev);
+	//(bio)->bi_disk = (bdev)->bd_disk;
+	//(bio)->bi_partno = (bdev)->bd_partno;
+	bio->bi_write_hint = write_hint;
+
+	bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+	>>>>//Fs with blocksize smaller than pagesize, could reach here.
+		if (bio->bi_vcnt > 0) {
+			bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+
+			if (page == bv->bv_page &&
+		   	 offset == bv->bv_offset + bv->bv_len) {
+				bv->bv_len += len;
+				goto done;
+			} 
+		} //merged with previous one 
+
+		if (bio->bi_vcnt >= bio->bi_max_vecs)
+			return 0;
+
+		bv		= &bio->bi_io_vec[bio->bi_vcnt];
+		bv->bv_page	= page;
+		bv->bv_len	= len;
+		bv->bv_offset	= offset;
+
+		bio->bi_vcnt++;
+	done:
+		bio->bi_iter.bi_size += len;
+	>>>>
+	BUG_ON(bio->bi_iter.bi_size != bh->b_size);
+
+	bio->bi_end_io = end_bio_bh_io_sync;
+	bio->bi_private = bh; //reverse mapping to the bh
+
+	/* Take care of bh's that straddle the end of the device */
+	guard_bio_eod(op, bio);
+
+	if (buffer_meta(bh))
+		op_flags |= REQ_META;
+	if (buffer_prio(bh))
+		op_flags |= REQ_PRIO;
+	bio_set_op_attrs(bio, op, op_flags);
+	
+	submit_bio(bio);
+	return 0;
+}
+</pre>
+Most of the information to construct a bio is from the bh. If we want to dig deeper, we have to look into how to setup a bh.<br/>
+<pre>
+static int
+grow_dev_page(struct block_device *bdev, sector_t block,
+	      pgoff_t index, int size, int sizebits, gfp_t gfp)
+{
+	>>>>
+	page = find_or_create_page(inode->i_mapping, index, gfp_mask);
+		-> pagecache_get_page()
+			-> __page_cache_alloc() //no_page case
+				-> __alloc_pages_node(n, gfp, 0);
+	/*
+	 <strong>The pages of page cache are allocated one by one</strong>. It's more flexible to
+	 map and unmap, page in and swap out. And in the past, the memory is limited, there is not
+	 enougth contiguous pages to take advantage of.
+	 */
+	BUG_ON(!PageLocked(page));
+	>>>>`
+	/*
+	 * Allocate some buffers for this page
+	 */
+	bh = alloc_page_buffers(page, size, true);
+
+	/*
+	 * Link the page to the buffers and initialise them.  Take the
+	 * lock to be atomic wrt __find_get_block(), which does not
+	 * run under the page lock.
+	 */
+	spin_lock(&inode->i_mapping->private_lock);
+	link_dev_buffers(page, bh);
+	end_block = init_page_buffers(page, bdev, (sector_t)index << sizebits,
+			size);
+	>>>>
+	do {
+		if (!buffer_mapped(bh)) {
+			init_buffer(bh, NULL, NULL);
+			bh->b_bdev = bdev;
+			bh->b_blocknr = block;
+			if (uptodate)
+				set_buffer_uptodate(bh);
+			if (block < end_block)
+				set_buffer_mapped(bh);
+		}
+		block++;
+		bh = bh->b_this_page;
+	} while (bh != head);
+	>>>>
+	spin_unlock(&inode->i_mapping->private_lock);
+done:
+	ret = (block < end_block) ? 1 : -ENXIO;
+failed:
+	unlock_page(page);
+	put_page(page);
+	return ret;
+}
+</pre>
+
+One page from pagecache could be broken up into several bh's based on the blocksize of the associated filesystem (sb->s_blocksize). <strong>One bh corresponds to one block in disk</strong>. Then echo bh will be used to constructed a bio and submitted to block layer. At the moment, the bio only contain one bio_vec pointing to page of the bh. This is the classical path to setup a bio. Nowadays, some filesystems would like to create bios itself, during the procedure, the bio containing multiple bio_vec maybe created. For example:
+<pre>
+static int io_submit_add_bh(struct ext4_io_submit *io,
+			    struct inode *inode,
+			    struct page *page,
+			    struct buffer_head *bh)
+{
+	int ret;
+
+	if (io->io_bio && bh->b_blocknr != io->io_next_block) {
+submit_and_retry:
+		ext4_io_submit(io);
+	}
+	if (io->io_bio == NULL) {
+		ret = io_submit_init_bio(io, bh);
+		if (ret)
+			return ret;
+		io->io_bio->bi_write_hint = inode->i_write_hint;
+	}
+	ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
+	if (ret != bh->b_size)
+		goto submit_and_retry;
+	wbc_account_io(io->io_wbc, page, bh->b_size);
+	io->io_next_block++;
+	return 0;
+}
+</pre>
+We could see that: one bio_vec would correspond to part or the whole page. 	
+
+</font>
+</p>
+
+<h3><a name="Bio_operations">Bio operations</a></h3>
+<p>
+<font size="2">
+<strong>bio advance</strong>
+<pre>
+static inline void bio_advance_iter(struct bio *bio, struct bvec_iter *iter,
+                    unsigned bytes)
+{
+    iter->bi_sector += bytes >> 9;
+    /* So this is why the bi_sector is located in bio->bi_iter, it could be
+     * put forward */
+    if (bio_no_advance_iter(bio))
+    {/REQ_OP_DISCARD/SECTOR_ERASE/WRITE_SAME/WRITE_ZERO
+        iter->bi_size -= bytes;
+        iter->bi_done += bytes;
+    } else {
+        bvec_iter_advance(bio->bi_io_vec, iter, bytes);
+        /* TODO: It is reasonable to complete bio with error here. */
+    }
+}
+
+static inline bool bvec_iter_advance(const struct bio_vec *bv,
+        struct bvec_iter *iter, unsigned bytes)
+{
+    >>>>
+    while (bytes) {
+        unsigned iter_len = bvec_iter_len(bv, *iter);
+        unsigned len = min(bytes, iter_len);
+
+        bytes -= len;
+        iter->bi_size -= len; // remaining length
+        iter->bi_bvec_done += len; //completed length of current bvec
+        iter->bi_done += len; //completed length of this bio
+
+        if (iter->bi_bvec_done == __bvec_iter_bvec(bv, *iter)->bv_len) {
+            iter->bi_bvec_done = 0;
+            iter->bi_idx++; //push forward the bvec table here
+        }
+    }
+    return true;
+}
+</pre>
+After invoke this function, we could confirm one bio has been finished througth
+(bio->bi_iter.bi_size == 0). For example, in blk_update_request()
+<pre>
+blk_mq_end_request()
+    -> blk_update_request()
+        -> req_bio_endio()
+>>>>
+    bio_advance(bio, nbytes);
+
+    /* don't actually finish bio if it's part of flush sequence */
+    // when RQF_FLUSH_SEQ is set, the req->end_io would be invoked instead of
+    // bio_end.
+    if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
+        bio_endio(bio);
+>>>>
+</pre>
+<strong>bio clone</strong><br/>
+
+in the device mapper stack, the bio will be cloned. Let's look at how to do that.
+
+clone_bio(), clone a new bio contain the sector ~ (sector+len) of original one.
+<pre>
+static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+             sector_t sector, unsigned len)
+{
+    struct bio *clone = &tio->clone;
+
+    __bio_clone_fast(clone, bio);
+    >>>>
+        bio->bi_disk = bio_src->bi_disk;
+        bio->bi_partno = bio_src->bi_partno;
+        bio_set_flag(bio, BIO_CLONED); // a cloned bio
+        bio->bi_opf = bio_src->bi_opf;
+        bio->bi_write_hint = bio_src->bi_write_hint;
+        bio->bi_iter = bio_src->bi_iter;
+        bio->bi_io_vec = bio_src->bi_io_vec;
+        //The cloned bio will shared a same bvec table with previous one.
+        bio_clone_blkcg_association(bio, bio_src);
+    >>>>
+    if (bio_op(bio) != REQ_OP_ZONE_REPORT)
+        bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));
+    clone->bi_iter.bi_size = to_bytes(len);
+    //cut out the sector ~ (sector+len) part of original one here
+    if (unlikely(bio_integrity(bio) != NULL))
+        bio_integrity_trim(clone);
+
+    return 0;
+}
+</pre>
+
+</font>
+</p>
+
+<h2><a name="FLUSH_and_FUA">FLUSH and FUA</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+First, we need to know the volatile write cache. <br/>
+Quote from Documentation/block/writeback_cache_control.txt 
+<pre>
+Many storage devices, especially in the consumer market, come with volatile
+write back caches.  That means the devices signal I/O completion to the
+operating system before data actually has hit the non-volatile storage.  This
+behavior obviously speeds up various workloads, but it means the operating
+system needs to force data out to the non-volatile storage when it performs
+a data integrity operation like fsync, sync or an unmount. >
+</pre>
+
+There are two flag set in bio or req to indicate which operation on vwc will be
+carried out.
+<ul>
+<li> REQ_FLUSH, REQ_FLUSH flag indicates a explicit cache flushes. 
+<pre>
+The REQ_FLUSH flag can be OR ed into the r/w flags of a bio submitted from
+the filesystem and will make sure the volatile cache of the storage device
+has been flushed before the actual I/O operation is started.  This explicitly
+guarantees that previously completed write requests are on non-volatile
+storage before the flagged bio starts. In addition the REQ_FLUSH flag can be
+set on an otherwise empty bio structure, which causes only an explicit cache
+flush without any dependent I/O. 
+</pre>
+<li> REQ_FUA, REQ_FUA means Force Unit Access.
+<pre>
+The REQ_FUA flag can be OR ed into the r/w flags of a bio submitted from the
+filesystem and will make sure that I/O completion for this request is only
+signaled after the data has been committed to non-volatile storage.
+</pre>
+</ul>
+
+The block device driver need to notify the queue that whether it supports
+REQ_FLUSH and REQ_FUA through blk_queue_write_cache(). And the flags will 
+be set into queue->queue_flags.
+<pre>
+void blk_queue_write_cache(struct request_queue *q, bool wc, bool fua)
+{
+    spin_lock_irq(q->queue_lock);
+    if (wc)
+        queue_flag_set(QUEUE_FLAG_WC, q);
+    else
+        queue_flag_clear(QUEUE_FLAG_WC, q);
+    if (fua)
+        queue_flag_set(QUEUE_FLAG_FUA, q);
+    else
+        queue_flag_clear(QUEUE_FLAG_FUA, q);
+    spin_unlock_irq(q->queue_lock);
+
+    wbt_set_write_cache(q->rq_wb, test_bit(QUEUE_FLAG_WC, &q->queue_flags));
+}
+</pre>
+
+<strong>How to implement the flush operation</strong><br/>
+There are 4 flush sequence flag:
+<ul>
+<li> REQ_FSEQ_PREFLUSH
+<li> REQ_FSEQ_DATA
+<li> REQ_FSEQ_POSTFLUSH
+<li> REQ_FSEQ_DONE
+</ul>
+
+These flush operation life cycle could include any ones of them. blk core will
+execute them in sequence. blk_flush_policy() is used to construct this sequence.
+Let's see it.
+<pre>
+static unsigned int blk_flush_policy(unsigned long fflags, struct request *rq)
+{
+    unsigned int policy = 0;
+
+    if (blk_rq_sectors(rq))
+        policy |= REQ_FSEQ_DATA;
+
+    if (fflags & (1UL << QUEUE_FLAG_WC)) {
+        if (rq->cmd_flags & REQ_PREFLUSH)
+            policy |= REQ_FSEQ_PREFLUSH;
+        if (!(fflags & (1UL << QUEUE_FLAG_FUA)) &&
+            (rq->cmd_flags & REQ_FUA))
+            policy |= REQ_FSEQ_POSTFLUSH;
+    }
+    return policy;
+}
+</pre>
+
+Two things need to be emphasized here.
+<ul>
+<li>REQ_FSEQ_PREFLUSH/POSTFLUSH are only executed when the block device support vwc.
+<li>if the device not support fua, blk-core use data+flush pair to simulate it.
+</ul>
+
+
+If blk_flush_policy() just return REQ_FSEQ_DATA, the request can be processed
+directly without going through flush machinery. For blk-mq, it will be inserted
+into the tail of hctx->dispatch.<br/>
+
+Otherwise, a flush sequence will be started.<br/>
+The flush sequence is carried out based on blk_flush_queue->flush_queue[2].
+In addition, there are two idx to indicates the current state of the flush_queue.
+<ul>
+<li>flush_pending_idx
+<li>flush_running_idx
+</ul>
+Both of them only have two values 0/1. At initial state, pending == running.
+After kick a flush sequence, the pending_idx is toggled, then the pending_idx become
+different from running_idx which means flush is in flight. During the process
+while flush is in flight, the new flushes will be queued on pending_idx which is
+different from the running_idx. After the flush is completed, the running_idx
+is toggled then the running_idx is same with pending_idx again.
+<br/>
+a preallocated request - flush_rq will do the actual flush work on behalf of the
+FLUSH requests. when completed, all the FLUSH request on the running queuee would
+be pushed forward to next step.
+
+<pre>
+                         (seq = PREFLUSH)
+                   new flush rq --
+                                  \
+                                  |
+pending_flush_queue <- rqa0    <--+
+                        (seq = PREFLUSH)         <-----+   kick the next flush sequence      
+                                                        \
+                        (seq = PREFLUSH)                 \
+running_flush_queue <- rqb0 <--                           \  
+                               \    (seq = POSTFLUSH)     |
+                                +-- rqb1              <-+ |
+                                                         \|  
+    proxy flush_rq                                        | push forward the running 
+        (w/ tag borrowd from bqb0, RQF_FLUSH_SEQ)         | FLUSH requests to next step
+              \                                          /
+               \ requeue -> bypass_insert               /
+                \                                      /
+                 +--> hctx->dispatch      completion --+
+
+<strong>Note: all the rqs in flush queue are flagged RQF_FLUSH_SEQ</strong>
+
+</pre>
+
+we ignore the REQ_FSEQ_DATA in above diagram. One thing need to be noted here:
+<pre>
+A sequenced PREFLUSH/FUA request with DATA is completed twice.
+Once while executing DATA and again after the whole sequence is
+complete.  The first completion updates the contained bio but doesn't
+finish it so that the bio submitter is notified only after the whole
+sequence is complete.  This is implemented by testing RQF_FLUSH_SEQ in
+req_bio_endio().
+</pre>
+
+<strong>Talking about the borrowed tag</strong><br/>
+Why does the flush_rq borrow tags from the FLUSH request ?
+
+flush_rq is allocated separately, so it is not in the tag_set of blk-mq.
+
+For the non-scheduler case, the FLUSH request has occupied a driver tag and it
+depends on the completion of flush_rq. Assume the scenario, all the driver tags
+are held by FLUSH requests, consequentially, the flush_rq cannot get driver tag
+any more and cannot make the flush sequence forward. A IO hang comes up. To
+avoid this, flush_rq could borrow driver tag from the FLUSH requests.
+
+Recently, a commit 923218f (blk-mq: don't allocate driver tag upfront for flush rq
+) was introduced, it change the way how to handle the tag borrowing in blk-mq. Let's
+look into the patch next. That will be helpful to get deeper into the blk-mq and blk-flush.
+<br/><br/>
+Before this patch, when with io scheduler, the blk-mq will allocate driver tag ahead
+of deliver it to blk-flush. Then blk-flush may borrow this driver tag to the proxy
+flush_rq. Then this flush_rq will be queued to hctx->dispatch.
+<pre>
+blk_mq_make_request()
+>>>>
+    if (unlikely(is_flush_fua)) {
+        blk_mq_put_ctx(data.ctx);
+        blk_mq_bio_to_request(rq, bio);
+        if (q->elevator) {
+            blk_mq_sched_insert_request(rq, false, true, true,
+                    true);
+        } 
+>>>>
+
+blk_mq_sched_insert_request()
+>>>>
+    if (rq->tag == -1 && op_is_flush(rq->cmd_flags)) {
+        blk_mq_sched_insert_flush(hctx, rq, can_block);
+        return;
+    }
+>>>>
+static void blk_mq_sched_insert_flush(struct blk_mq_hw_ctx *hctx,
+                      struct request *rq, bool can_block)
+{
+    if (blk_mq_get_driver_tag(rq, &hctx, can_block)) {
+        blk_insert_flush(rq);
+        blk_mq_run_hw_queue(hctx, true);
+    } else
+        blk_mq_add_to_requeue_list(rq, false, true);
+}
+</pre>
+
+And this will cause a issue. Look at the comment of reorder_tags_to_front()
+<pre>
+If we fail getting a driver tag because all the driver tags are already
+assigned and on the dispatch list, BUT the first entry does not have a
+tag, then we could deadlock. For that case, move entries with assigned
+driver tags to the front, leaving the set of tagged requests in the
+same order, and the untagged set in the same order.
+</pre>
+
+The patch changes the way to handle this case, just allocate driver tag upfront.
+And let flush_rq get a driver tag just before .queue_rq() in
+blk_mq_dispatch_rq_list(). This will not cause IO hang described above, because
+the FLUSH requests just occupy sched tags. But the flush_rq still need to borrow
+the sched tag to cheat the blk-mq.
+<pre>
+blk_kick_flush()
+>>>>
+    if (q->mq_ops) {
+        struct blk_mq_hw_ctx *hctx;
+
+        flush_rq->mq_ctx = first_rq->mq_ctx;
+
+        if (!q->elevator) {
+            fq->orig_rq = first_rq;
+            flush_rq->tag = first_rq->tag;
+            hctx = blk_mq_map_queue(q, first_rq->mq_ctx->cpu);
+            blk_mq_tag_set_rq(hctx, first_rq->tag, flush_rq);
+        } else {
+            flush_rq->internal_tag = first_rq->internal_tag;
+>>>>
+</pre>
+
+
+</font>
+</p>
+</body>
+</html>

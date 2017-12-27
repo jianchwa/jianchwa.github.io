@@ -8,7 +8,26 @@
 <div>
     <h1>Blk Multi-queue understanding</h1> 
 </div>
-<p><h2>Background of introducing blk-mq</h2></p>
+<p>
+<font size="2">
+<a href="#Background_of_introducing_blk-mq">Background of introducing blk-mq</a><br/>
+<a href="#Design_of_blk-mq">Design of blk-mq</a>
+<ul>
+<li><a href="#The_tags">The tags</a>
+<li><a href="#IO_scheduler_in_blk-mq">IO scheduler in blk-mq</a>
+</ul>
+<a href="#Source_code_of_blk-mq">Source code of blk-mq</a>
+<ul>
+<li><a href="#Quiesce_and_Freeze">Quiesce and Freeze</a>
+<li><a href="#Mapping_between_ctx_and_hctx">Mapping between ctx and hctx</a>
+<li><a href="#Tags_sharing">Tags sharing</a>
+</ul>
+</font>
+</p>
+
+
+
+<h2><a name="Background_of_introducing_blk-mq">Background of introducing blk-mq</a></h2>
 
 <hr style="height:5px;border:none;border-top:3px solid black;" />
 
@@ -34,7 +53,7 @@ Nearly all the operations in block layer need this request queue lock.
 <ul>
 <li>Merge/Sort
 <li>IO scheduling
-<li	>Submission and completion of request
+<li>Submission and completion of request
 </ul>
 </p>
 
@@ -54,7 +73,7 @@ Data on an HDD is stored in concentric tracks on platters (the recording media).
 </p>
 
 
-<p><h2>Design of blk-mq</h2></p>
+<h2><a name="Design_of_blk-mq">Design of blk-mq</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
 <p>
 <pre>
@@ -87,8 +106,9 @@ in V4.13."
 </p>
 
 
+<h3><a name="The_tags">The tags</a></h3>
 <p>
-<strong>The tags</strong><br/>
+<font size="2">
 Device command tagging was first introduced with hardware supporting native command queuing. A tag
 is an integer value that uniquely identifies the position of the block IO in the driver submission queue, so when completed
 the tag is passed back from the device indicating which IO has been completed. This eliminates the need to perform a
@@ -131,10 +151,12 @@ blk_mq_init_sched()
 </pre>
 The max nr_tags of sched is 256. For the qla2xxx of which queue depth is 4096, is it too small ?.<br />
 Actually no. The reqs in io sched's queue will always be dispatched to hctx->dispatch queue and hardware dispatch queue. If there are too many reqs residual in io sched queue, there must be some issues in hardware. 
+</font>
 </p>
 
+<h3><a name="IO_scheduler_in_blk-mq">IO scheduler in blk-mq</a></h3>
 <p>
-<strong>IO scheduler in blk-mq</strong><br/>
+<font size="2">
 Quote from Jen's paper Linux Block IO: Introducing Multi-queue SSD Access on Multi-core Systems
 <pre> 
 While global sequential re-ordering is still possible across the multiple software
@@ -158,7 +180,6 @@ scheduler, high per-operation overhead
 lightweight, intended for fast multiqueue devices
 </ul>
 Let's look at the kyber.
-<font size="3">
 kyber, the lightweight io scheduler for fast SSDs<br/>
 Quote from <a href="https://lwn.net/Articles/720675/">https://lwn.net/Articles/720675/</a>
 <pre>
@@ -267,11 +288,18 @@ static void kyber_stat_timer_fn(struct blk_stat_callback *cb)
 There is no insert_requests callbacks in kyber, so the merge/sort will be done
 by the ctx software queue.
 </pre>
-<font>
+</font>
 </p>
 
+
+
+<h2><a name="Source_code_of_blk-mq">Source code of blk-mq</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+
+
+<h3><a name="Quiesce_and_Freeze">Quiesce and Freeze</a></h3>
 <p>
-<strong>Quiesce and Freeze</strong><br/>
+<font size="2">
 Quiescing and freezing a blk-mq queue is different.
 Let's check the source code.
 <pre>
@@ -373,10 +401,12 @@ has been drained and no new request will enter the io path.
 </pre>
 An issue about the queue quiesced flag.<br/>
 <a href="https://lkml.org/lkml/2017/10/3/548">https://lkml.org/lkml/2017/10/3/548</a>
+</font>
 </p>
 
+<h3><a name="Mapping_between_ctx_and_hctx">Mapping between ctx and hctx</a></h3>
 <p>
-<strong>Mapping between ctx and hctx</strong><br />
+<font size="2">
 Look at the source code <br/>
 <pre>
 blk_mq_alloc_tag_set()
@@ -400,6 +430,7 @@ blk_mq_alloc_tag_set()
             map[cpu] = map[first_sibling];
     }
 >>>>
+<strong>Do the mapping from cpu to hctx queue.</strong><br/>
 
 blk_mq_init_allocated_queue()
     -> q->mq_map = set->mq_map
@@ -417,6 +448,14 @@ blk_mq_init_allocated_queue()
         hctx->ctxs[hctx->nr_ctx++] = ctx;
     }
 >>>>
+<strong>Gather the cpus that mapped to one hctx queue to the hctx queue</strong><br/>
+Including:
+<ul>
+<li> set the hctx->cpumask
+<li> asign hctx->nr_ctx to ctx->index_hw
+<li> increment hctx->nr_ctx
+<li> save the ctx in hctx->ctx[]
+</ul>
 </pre>
 this index_hw is very important, the hw queue will know there is pending request on the ctx queue through it.<br/>
 <pre>
@@ -612,10 +651,12 @@ For the async path, scenario seems different.<br/>
 __blk_mq_delay_run_hw_queue() will invoke blk_mq_hctx_next_cpu() to decide 
 on which cpu queue the hctx->run_work, then the blk_mq_run_work_fn() will 
 be executed on the kworker that has been pinned on a specific cpu.<br/>
-
+</font>
 </p>
+
+<h3><a name="Tags_sharing">Tags sharing</a></h3>
 <p>
-<strong>Tags sharing </strong><br />
+<font size="2">
 The driver tags could be shared between different request_queues. We could think
 fo the following scenario.<br/>
 <pre>
@@ -743,6 +784,7 @@ between the LUs no matter whether there is workload on the LUs.
 
 </pre>
 
+
 <strong>driver tag release</strong><br/>
 
 <pre>
@@ -800,7 +842,7 @@ Look at the round-robin part:
 blk_mq_sched_restart_hctx() will run the hctx in async fashion if has work
 pending on it.
 </pre>
-
+</font>
 </p>
 </body>
 </html>
