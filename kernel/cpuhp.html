@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Cpu Hotplug</title>
+</head>
+<body>
+<div>
+    <h1>Cpu Hotplug</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#State_Diagram">State Diagram</a>
+</font>
+</p>
+
+<h2><a name="State_Diagram">State Diagram</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+<pre>
+The state digram in include/linux/cpuhotplug.h 
+/*
+ * CPU-up                       CPU-down
+ *
+ * BP           AP              BP              AP
+ *
+ * OFFLINE                      OFFLINE
+ *   |                            ^
+ *   v                            |
+ * BRINGUP_CPU->AP_OFFLINE      BRINGUP_CPU  <- AP_IDLE_DEAD (idle thread/play_dead)
+ *                |                             AP_OFFLINE
+ *                v (IRQ-off)     ,---------------^
+ *              AP_ONLNE          | (stop_machine)
+ *                |             TEARDOWN_CPU <- AP_ONLINE_IDLE
+ *                |                               ^
+ *                v                               |
+ *              AP_ACTIVE                       AP_ACTIVE
+ */
+
+Let's detial it.
+
+We write 0 > /sys/devices/system/cpu/<font color="red">cpuT</font>/online 
+
+  CPU A                    CPU T
+                 kick  
+  _cpu_down()     ->       cpuhp_thread_fun (cpuhpT kthread)
+                               AP_ACTIVE           (clear cpu_active_mask)
+                                 |
+                                 v
+                               AP_WORKQUEUE_ONLINE (unbind workers)
+                                 |
+                                 v
+                               TEARDOWN_CPU        (stop_machine)
+                                    ,                   | execute
+                                     \_ _ _ _ _ _       v
+                                        preempt  V  take_cpu_down ( migration kthread)
+                                                    <font color="red">set_cpu_online(smp_processor_id(), false)</font> (__cpu_disable)
+                                                    TEARDOWN_CPU
+                                                        |
+             cpuhpT kthead is    |                      v
+             migrated away       ,                    AP_SCHED_STARTING (migrate_tasks)
+                 _ _ _ _ _ _ _ _/                       |
+                V                                       v
+              CPU X                                   AP_OFFLINE
+                                                        
+                                                        |
+                                                        ,
+                                             _ _ _ _ _ /
+                                            V
+                                      do_idle (idle task)
+ <_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ cpuhp_report_idle_dead
+                         complete st->done_down
+           __cpu_die (cpuhpT kthread, teardown_cpu) 
+
+ AP_OFFLINE
+   |
+   v
+ BRINGUP_CPU
+   |
+   v
+ BLK_MQ_DEAD
+   |
+   v
+ OFFLINE
+
+
+We write 1 > /sys/devices/system/cpu/<font color="red">cpuT</font>/online 
+
+  CPU A                                    CPU T
+ _cpu_up 
+ OFFLINE
+   |
+   v                     kick up cpu       <font color="red">set_cpu_online(smp_processor_id(), true)</font>
+ BRINGUP_CPU (__cpu_up)      ->            cpu_startup_entry
+                                           AP_ONLINE_IDLE
+                                           cpuhp_online_idle()
+             <_ _ _ _ _ _ _ _ _ _ _ _ _ _/  
+                   complete st->done_upa   do_idle()
+
+kthread_unpark cpuhpT kthread
+                           kick
+                           ->              cpuhp_thread_fun (cpuhpT kthread)
+                                           AP_ONLINE_IDLE
+                                                |
+                                                v
+                                           AP_SMPBOOT_THREADS
+                                                |
+                                                v
+                                           AP_IRQ_AFFINITY_ONLINE
+                                                |
+                                                v
+                                            AP_WORKQUEU_ONLINE (rebind workers)
+                                                |
+                                                V
+                                            AP_ACTIVE (set cpu_active_mask)
+                   
+
+</pre>
+</font>
+</p>
+
+
+
+
+
+</body>
+</html>

@@ -10,15 +10,110 @@
 </div>
 <p>
 <font size="2">
+<a href="#Block_legacy">Block legacy</a>
+<ul>
+<a href="#Tag">Tag</a>
+</ul>
 <a href="#BIO">BIO</a>
 <ul>
 <li><a href="#Setup_and_complete_a_bio">Setup and complete a bio</a>
 <li><a href="#Bio_operations">Bio operations</a>
 </ul>
-<a href="#FLUSH_and_FUA">FLUSH and FUA</a>
+<a href="#FLUSH_and_FUA">FLUSH and FUA</a><br/>
+<a href="#Queue_state_flags">Queue state flags</a><br/>
+<a href="#WBT">WBT</a>
 </font>
 </p>
 
+<h2><a name="Block_legacy">Block legacy</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<h3><a name="Tag">Tag</a></h3>
+<p>
+<font size="2">
+There is also a tag mechanism in block legacy. Quote comment from blk-mq about tagging.
+<pre>
+Device command tagging was first introduced with hardware supporting native command queuing. A tag is an integer value that uniquely identifies the position of the block IO in the driver submission queue, so when completed the tag is passed back from the device indicating which IO has been completed. This eliminates the need to perform a linear search of the in-flight window to determine which IO has completed.
+</pre>
+We don't look into how to implement it but just how to employ it in block legacy and do some comparing with tagging in blk-mq.<br/>
+How to use it in driver level ?
+<pre>
+static inline struct scsi_cmnd *scsi_host_find_tag(struct Scsi_Host *shost,
+        int tag)
+{
+    struct request *req = NULL;
+
+    if (tag == SCSI_NO_TAG)
+        return NULL;
+
+    if (shost_use_blk_mq(shost)) {
+        u16 hwq = blk_mq_unique_tag_o_hwq(tag);
+
+        if (hwq < shost->tag_set.nr_hw_queues) {
+            req = blk_mq_tag_to_rq(shost->tag_set.tags[hwq],
+                blk_mq_unique_tag_to_tag(tag));
+        }
+    } else {
+        req = <font color="red">blk_map_queue_find_tag(shost->bqt, tag)</font>;
+    }
+
+    if (!req)
+        return NULL;
+    return blk_mq_rq_to_pdu(req);
+}
+</pre>
+A reverse mapping tag -> req -> driver pdu <br/>
+
+How to assign tag to a req ?
+<pre>
+scsi_request_fn()
+>>>>
+        /*
+         * Remove the request from the request list.
+         */
+        if (!(blk_queue_tagged(q) && !blk_queue_start_tag(q, req)))
+            blk_start_request(req);
+        <font color="blue">/*
+         blk_queue_tagged() will check QUEUE_FLAG_QUEUED in the q->flags, means the hardware support native command queuing.
+         blk_queue_start_tag() will try to assign tag for this rq, if tags has been used up, return 1.
+         otherwise,
+         bqt->next_tag = (tag + 1) % bqt->max_depth;
+         rq->rq_flags |= RQF_QUEUED; //indicates tag has been assigned
+         rq->tag = tag;
+         bqt->tag_index[tag] = rq;
+         blk_start_request(rq);
+         list_add(&rq->queuelist, &q->tag_busy_list);
+         */</font>
+>>>>
+        /*
+         * We hit this when the driver is using a host wide
+         * tag map. <font color="red">For device level tag maps the queue_depth check
+         * in the device ready fn would prevent us from trying
+         * to allocate a tag</font>. Since the map is a shared host resource
+         * we add the dev to the starved list so it eventually gets
+         * a run when a tag is freed.
+         */
+        if (blk_queue_tagged(q) && !(req->rq_flags & RQF_QUEUED)) {
+            spin_lock_irq(shost->host_lock);
+            if (list_empty(&sdev->starved_entry))
+                list_add_tail(&sdev->starved_entry,
+                          &shost->starved_list);
+            spin_unlock_irq(shost->host_lock);
+            goto not_ready;
+        }
+>>>>
+ not_ready:
+    <font color="blue">/*
+     * The tag here looks like the driver tag in blk-mq.
+     * In block legacy, the req is requeued and inserted to the head of q->queue_head directly.
+     * In blk-mq, the action is similar, refer to blk_mq_dispatch_rq_list. (but __blk_mq_try_issue_directly looks like not assigned with this.)
+     */</font>
+    spin_lock_irq(q->queue_lock);
+    blk_requeue_request(q, req);
+    atomic_dec(&sdev->device_busy);
+>>>>
+</pre>
+</font>
+</p>
 
 <h2><a name="BIO">BIO</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
@@ -569,8 +664,204 @@ blk_kick_flush()
             flush_rq->internal_tag = first_rq->internal_tag;
 >>>>
 </pre>
+</font>
+</p>
 
 
+<h2><a name="Queue_state_flags">Queue state flags</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+Let's look at the similar 3 flags of request_queue.
+<ul>
+<li> QUEUE_FLAG_STOPPED<br/>
+It is only used in block legacy, looks like the BLK_MQ_S_STOPPED.
+The quiescing mechanism has big advantage on it, so BLK_MQ_S_STOPPED is rarely
+used now.
+<br/>
+<li> <strong>QUEUE_FLAG_DYING</strong><br/>
+First, let's look at blk_set_queue_dying()
+<pre>
+void blk_set_queue_dying(struct request_queue *q)
+{
+    spin_lock_irq(q->queue_lock);
+    queue_flag_set(QUEUE_FLAG_DYING, q);
+    spin_unlock_irq(q->queue_lock);
+
+    /*
+     * <font color="red">When queue DYING flag is set, we need to block new req
+     * entering queue, </font>so we call blk_freeze_queue_start() to
+     * prevent I/O from crossing blk_queue_enter().
+     */
+    blk_freeze_queue_start(q);  // just kill the percpu ref and will not wait.
+    <font color="blue">
+    /*
+       blk_queue_enter()
+
+       percpu_ref_tryget_live() will fail when the     percpu ref is killed (__PERCPU_REF_DEAD)
+       >>>>
+       ret = wait_event_interruptible(q->mq_freeze_wq,
+                (atomic_read(&q->mq_freeze_depth) == 0 &&
+                 (preempt || !blk_queue_preempt_only(q))) ||
+                blk_queue_dying(q));
+        if (blk_queue_dying(q))
+            return -ENODEV;
+
+     */
+    </font>
+
+    if (q->mq_ops)
+        blk_mq_wake_waiters(q); //<font color="red">wake the ones waiting on driver tag</font>
+    else {
+        struct request_list *rl;                                                                                      
+                                                             /
+        spin_lock_irq(q->queue_lock);                       |  block legacy
+        blk_queue_for_each_rl(rl, q) {                      |  
+            if (rl->rq_pool) {                              |  get_request()    <------------------ +
+                wake_up_all(&rl->wait[BLK_RW_SYNC]);        |      -> __get_request()               |
+                wake_up_all(&rl->wait[BLK_RW_ASYNC]); ----> |             -> if blk_queue_dying()   |
+            }                                               |               return                  |
+        }                                                   |      -> if blk_queue_dying            |
+        spin_unlock_irq(q->queue_lock);                     |            return                     | wakeup retry
+    }                                                       |      -> waiting on rl->wait[is_sync]  |
+                                                            |              |                        |
+                                                            |              |                        |
+                                                             \             +------------------------+
+
+
+    /* Make blk_queue_enter() reexamine the DYING flag. */
+    wake_up_all(&q->mq_freeze_wq);   //after this, no one could cross blk_queue_enter() in generic_make_request()
+}
+</pre>
+QUEUE_FLAG_DYING mainly gates the blk_queue_enter() and generic_make_request(),
+the difference from blk queue freezing is blk_queue_enter() <font color="red">will fail and return
+-ENODEV</font> instead of block there. <br/>
+
+There are some differences between block legacy and blk-mq. <br/>
+<ul>
+<li> there is not any QUEUE_FLAG_DYING checking in blk_mq_get_tag(), it means
+that even if someone waiting tag is waked up by blk_set_queue_dying(), but it
+will do anything for it.
+<li> no checking in blk_execute_rq_nowait() as the block legacy and only a
+comment as follow:
+<pre>
+     don't check dying flag for MQ because the request won't
+     be reused after dying flag is set
+</pre>
+</ul>
+These seems to mean that if someone crosses the blk_queue_enter() in blk_mq, it
+will be able to submit request on a dying queue. Is it right or safe ?
+Maybe yes, at least, in blk_cleanup_queue(), it will wait to drain the queue
+first. <br/>
+
+<br/>
+<li> <strong>QUEUE_FLAG_QUIESCED</strong><br/>
+Checked through blk_queue_quiesced() in the following paths.
+<pre>
+__blk_mq_run_hw_queue()
+    -> blk_mq_sched_dispatch_requests() // under <font color="red"> rcu or src lock</font>
+        -> if blk_queue_quiesced()
+            return  // will not dequeue from io scheduler or ctx queue
+blk_mq_try_issue_directly()
+    -> __blk_mq_try_issue_directly() // under <font color="red"> rcu or src lock</font>
+        -> if blk_queue_quiesced
+            blk_mq_sched_insert_request() // to io scheduler or ctx queue
+</pre>
+When the queue is quiesced, the <font color="red">reqs will not enter into lldd but only stay in
+blk-mq layer queues. In the other words, bios still could be submitted and will
+not be issued.</font></br>
+In blk_mq_quiesce_queue, synchronize_srcu/rcu ensure the QUEUE_FLAG_QUIESCED
+will be visible when it returns.<br/>
+
+</ul>
+</font>
+</p>
+
+
+<h2><a name="WBT">WBT</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+WBT = Write Buff Throttle <br/>
+<strong>Why we need wbt ?</strong><br/>
+Let's quote some comment from the developer of this feature Jens.
+<pre>
+When we do background buffered writeback, it should have little impact
+on foreground activity. That's the definition of background activity...
+But for as long as I can remember, heavy buffered writers have not
+behaved like that. For instance, if I do something like this:
+
+$ dd if=/dev/zero of=foo bs=1M count=10k
+
+on my laptop, and then try and start chrome, it basically won't start
+before the buffered writeback is done. Or, for server oriented
+workloads, where installation of a big RPM (or similar) adversely
+impacts database reads or sync writes. When that happens, I get people
+yelling at me.
+</pre>
+In conclusion, the <font color="red">foreground IOs</font> should be priorized
+over the <font color="red">background</font> ones.
+<br/>
+<strong>Who will be throttled</strong><br/>
+wbt_should_throttle() gives the answer.
+<pre>
+static inline bool wbt_should_throttle(struct rq_wb *rwb, struct bio *bio)
+{
+    const int op = bio_op(bio);
+
+    /*
+     * If not a WRITE, do nothing
+     */
+    if (op != REQ_OP_WRITE)
+        return false;
+
+    /*
+     * Don't throttle WRITE_ODIRECT
+     */
+    if ((bio->bi_opf & (REQ_SYNC | REQ_IDLE)) == (REQ_SYNC | REQ_IDLE))
+        return false;
+
+    return true;
+}
+</pre>
+The suspect is what's about the synchronous write ?<br/>
+For example, the updating of the metadata of filesystem ?<br/>
+
+<strong>How to implement it</strong><br/>
+Let's first look at the hooks across the blk-mq layer. <br/>
+<pre>
+          blk_mq_make_request()
+                wbt_wait()
+                    if !may_queue()
+                        sleep
+
+                wbt_track()
+                    save track info 
+                    on rq->issue_stat
+
+          blk_mq_start_request()                        wb_timer_fn()
+                wbt_issue()                                 account the latency of sync IO
+                    sync issue time                         and adjust the limits of different IO type
+
+          blk_mq_free_request()/__blk_mq_end_request()
+                wbt_done()
+                    dec inflight
+                    wake up
+
+          __blk_mq_requeue_request()
+                wbt_requeue()
+                    clear sync issue time
+</pre>
+Yeah, it looks like the kyber IO scheduler.<br/>
+But there is a big difference regarding to the action when limit is reached. <br>
+<ul>
+<li>For wbt, submitting path will sleep before blk_mq_get_request in blk_mq_make_request(), 
+On the one hand, wbt can limit the usage of requests/tags, on the other hand the
+submiting path cannot insert request any more.
+<li>For kyber, the path who sleep to wait token is dispatching path, which is the
+kworker context for write back. At the moment, the requests still could be
+inserted, even merged.
+</ul>
 </font>
 </p>
 </body>

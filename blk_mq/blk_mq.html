@@ -21,6 +21,7 @@
 <li><a href="#Quiesce_and_Freeze">Quiesce and Freeze</a>
 <li><a href="#Mapping_between_ctx_and_hctx">Mapping between ctx and hctx</a>
 <li><a href="#Tags_sharing">Tags sharing</a>
+<li><a href="#Polling">Polling</a>
 </ul>
 </font>
 </p>
@@ -150,7 +151,58 @@ blk_mq_init_sched()
 >>>>
 </pre>
 The max nr_tags of sched is 256. For the qla2xxx of which queue depth is 4096, is it too small ?.<br />
-Actually no. The reqs in io sched's queue will always be dispatched to hctx->dispatch queue and hardware dispatch queue. If there are too many reqs residual in io sched queue, there must be some issues in hardware. 
+Actually no. The reqs in io sched's queue will always be dispatched to hctx->dispatch queue and hardware dispatch queue. If there are too many reqs residual in io sched queue, there must be some issues in hardware. <br/>
+
+These two tags both have its own static request arrary.<br/>
+<pre>
+blk_mq_alloc_tag_set()
+    -> blk_mq_alloc_rq_maps() // the actual depth may be lower than the set->queue_depth
+        -> __blk_mq_alloc_rq_maps()
+            -> __blk_mq_alloc_rq_map() //per-hctx-idx set->queue_depth
+OR
+        blk_mq_init_sched()
+            -> blk_mq_sched_alloc_tags() // per-hctx q->nr_requests
+                
+                -> blk_mq_alloc_rq_map() // alloc tags->rqs and tags->static_rqs arrary
+                -> blk_mq_alloc_rqs() // alloc pages to carry the (request + driver payload)
+                    -> blk_mq_ops->init_request()
+
+blk_mq_get_request()
+    -> blk_mq_rq_ctx_init()
+        -> blk_mq_tags_from_data() // hctx->tags or sched_tags
+        -> rq = tags->static_rqs[tag] // when w/o io scheduler
+</pre>
+when w/ ioscheduler, the reverse mapping is done in blk_mq_get_driver_tag()<br>
+
+The request instance could come from driver tags or sched tags. But no 
+matter w/ or w/o io scheduler, the request must be saved in hctx->tags->rq[] as
+a reverse mapping from tag to request.
+<pre>
+request_queue->queue_hw_ctx[] -> sched_tags -> static_rqs[] 
+                   |                              /       
+                   V                   ___ ___ __/____ ___
+                  tags                |   |   |   |   |   |  w/ scheduler
+                   |                  |___|___|___|___|___| <------------+
+                   |                            /\                        \
+                   |                           /  \                        \
+                  /                  _________/    \___________             \
+                 /                  | request + driver payload |             \
+------------------------------------------------                              \  
+               /                                                               |   
+              |   maybe shared (Multiple LUs SCSI HBA, or Multiple ns NVMe)    |
+              V                                                                |  
+ tag_set->tags[] ---> rqs  [ ][ ][ ][ ][ ][ ] a reverse mapping from tag to request 
+                 |                                                          /   
+                 +--> static_rqs[]                                         /          
+                                /                                         /
+                     ___ ___ __/____ ___                                 /
+                    |   |   |   |   |   |  w/o  scheduler               /
+                    |___|___|___|___|___|  <---------------------------
+                              /\
+                             /  \
+                   _________/    \___________
+                  | request + driver payload |
+</pre>
 </font>
 </p>
 
@@ -844,5 +896,128 @@ pending on it.
 </pre>
 </font>
 </p>
+
+<h3><a name="Polling">Polling</a></h3>
+<p>
+<font size="2">
+
+Regarding the blk-mq polling, please refer to <a href="https://lwn.net/Articles/663879/">Block-layer I/O polling</a>
+
+<pre>
+blk_mq_poll()
+    -> rq = blk_mq_tag_to_rq() //hctx->tags/hctx->sched_tags based on the cookie
+    -> __blk_mq_poll()
+    >>>>
+    while (!need_resched()) {
+        int ret;
+
+        hctx->poll_invoked++;
+
+        ret = q->mq_ops->poll(hctx, rq->tag);
+        if (ret > 0) {
+            hctx->poll_success++;
+            set_current_state(TASK_RUNNING);
+            return true;
+        }
+        >>>>
+        if (ret < 0)
+            break;
+        cpu_relax();
+    }
+
+    >>>>
+
+static int __nvme_poll(struct nvme_queue *nvmeq, unsigned int tag)
+{
+    struct nvme_completion cqe;
+    int found = 0, consumed = 0;
+
+    if (!nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase))
+        return 0;
+    //First check whether there is valid cqe, if no, return.
+    <strong>//This procedure is interrupt-enabled, before __nvme_poll() get the valid
+    //cqe, the interrupt has come and process the cqe. So nvme_poll() will not
+    //get any cqe here, but how does it get out of the loop of __blk_mq_poll() ?</strong>
+    spin_lock_irq(&nvmeq->q_lock);
+    while (nvme_read_cqe(nvmeq, &cqe)) {
+        nvme_handle_cqe(nvmeq, &cqe);
+        consumed++;
+
+        if (tag == cqe.command_id) {
+            found = 1;
+            break;
+        }
+       }
+
+    if (consumed)
+        nvme_ring_cq_doorbell(nvmeq);
+    spin_unlock_irq(&nvmeq->q_lock);
+
+    return found;
+<strong><font color="red">In fact, it cannot disable the irq there, because the context may have been migrated to other cpu</font></strong>
+}
+</pre>
+
+The answer is task state.<br />
+<pre>
+__blkdev_direct_IO_simple()
+>>>>
+qc = submit_bio(&bio);
+    for (;;) {
+        set_current_state(TASK_UNINTERRUPTIBLE);
+        if (!READ_ONCE(bio.bi_private))
+            break;
+        if (!(iocb->ki_flags & IOCB_HIPRI) ||
+            !blk_mq_poll(bdev_get_queue(bdev), qc))
+            io_schedule();
+    }
+>>>>
+</pre>
+The task state is set to TASK_UNINTERRUPTIBLE
+The blk completion path will try to wake up this 
+process in bi_end_io callback, blkdev_bio_end_io_simple()
+<br/>
+<pre>
+try_to_wake_up()
+    -> ttwu_queue()
+        -> ttwu_do_activate()
+            -> ttwu_do_wakeup()
+                -> p->state = TASK_RUNNING
+</pre>
+in loop of __blk_mq_poll(), it will check the task state.
+<pre>
+>>>>
+    while (!need_resched()) {
+        int ret;
+
+        hctx->poll_invoked++;
+
+        ret = q->mq_ops->poll(hctx, rq->tag);
+        >>>>
+        if (current->state == TASK_RUNNING)
+            return true;
+        if (ret < 0)
+            break;
+        cpu_relax();
+    }
+>>>>
+</pre>
+if the task state is set to TASK_RUNNING, it returns true.<br/>
+
+The following is test result w/ or w/o blk-mq polling.<br/>
+<pre>
+w/o blk-mq polling
+  read : io=131072KB, bw=79007KB/s, iops=19751, runt=  1659msec
+    clat (usec): min=27, max=253, avg=49.46, stdev=33.61
+
+w/ blk-mq polling
+  read : io=131072KB, bw=97019KB/s, iops=24254, runt=  1351msec
+    clat (usec): min=19, max=302, avg=40.90, stdev=34.31
+</pre>
+
+The difference of average completion latency is 9us, about the time of two scheduling.<br/> 
+</font>
+</p>
+
 </body>
 </html>

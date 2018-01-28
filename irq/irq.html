@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>IRQ</title>
+</head>
+<body>
+<div>
+    <h1>IRQ</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Framework">Framework</a>
+<ul>
+<li><a href="#IRQ_Domain">IRQ Domain</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="Framework">Framework</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+<pre>
+struct irq_chip
+ - A set of methods describing how to drive the interrupt controller
+ - Directly called by core IRQ code
+struct irqdomain
+ - A pointer to the firmware node for a given interrupt controller (fwnode)
+ - A method to convert a firmware description of an IRQ into an ID local to this interrupt controller (hwirq)
+ - A way to retrieve the Linux view of an IRQ from the hwirq
+struct irq_desc
+ - Linux’s view of an interrupt
+ - Contains all the core stuff
+ - 1:1 mapping to the Linux interrupt number
+struct irq_data
+ - Contains the data that is relevant to the irq_chip managing this interrupt
+ - Both the Linux IRQ number and the hwirq
+ - A pointer to the irq_chip
+ - Embedded in irq_desc (for now)
+</pre>
+</font>
+</p>
+<h3><a name="IRQ_Domain">IRQ Domain</a></h3>
+<p>
+<font size="2">
+There are two main reasons for linux kernel to introduce irq_domain.
+<ul>
+<li> there could be multiple interrupt controllers in system, the single irq number space cannot ensure non-overlapping accross irq numbers of different controllers
+<li> irq number has loose all kind of correspondence to hardware interrupt numbers
+</ul>
+The irq_domain library adds mapping between hwirq and IRQ numbers on top of the irq_alloc_desc*() API <br/>
+<br/>
+
+<strong>Where is the irq number in nowadays kernel ?</strong><br/>
+<pre>
+nr_irqs = NR_IRQS
+
+static DECLARE_BITMAP(allocated_irqs, IRQ_BITMAP_BITS);
+
+struct irq_desc *irq_to_desc(unsigned int irq)
+{
+	return radix_tree_lookup(&irq_desc_tree, irq);
+}
+All the irq_desc structures are stored in a radix tree irq_desc_tree <font color="red">indexed by irq number</font>.
+
+</pre>
+
+<strong>A irq domain example on x86 platform</strong>
+<pre>
+On some architectures, there may be multiple interrupt controllers
+involved in delivering an interrupt from the device to the target CPU.
+Let's look at a typical interrupt delivering path on x86 platforms::
+
+  Device --> IOAPIC -> Interrupt remapping Controller -> Local APIC -> CPU
+
+There are three interrupt controllers involved:
+
+1) IOAPIC controller
+2) Interrupt remapping controller
+3) Local APIC controller
+
+To support such a hardware topology and make software architecture match
+hardware architecture, an irq_domain data structure is built for each
+interrupt controller and those irq_domains are organized into hierarchy.
+When building irq_domain hierarchy, the irq_domain near to the device is
+child and the irq_domain near to CPU is parent. So a hierarchy structure
+as below will be built for the example above::
+
+	CPU Vector irq_domain (root irq_domain to manage CPU vectors)
+		^
+		|
+	Interrupt Remapping irq_domain (manage irq_remapping entries)
+		^
+		|
+	IOAPIC irq_domain (manage IOAPIC delivery entries/pins)
+</pre>
+Following is the output of irq debugfs about this:
+<pre>
+domain:  INTEL-IR-MSI-1-2
+ hwirq:   0x100003
+ chip:    IR-PCI-MSI
+  flags:   0x10
+             IRQCHIP_SKIP_SET_WAKE
+ parent:
+    domain:  INTEL-IR-1
+     hwirq:   0x160000
+     chip:    INTEL-IR
+      flags:   0x0
+     parent:
+        domain:  VECTOR
+         hwirq:   0x80
+         chip:    APIC
+          flags:   0x0
+         Vector:    33
+         Target:     3
+</pre>
+
+</font>
+</p>
+
+
+
+
+
+</body>
+</html>

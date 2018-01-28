@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>multipath</title>
+</head>
+<body>
+<div>
+    <h1>Multipath</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Concepts">Concepts</a><br/>
+<a href="#Implementation">Implementation</a>
+</font>
+</p>
+
+<h2><a name="Concepts">Concepts</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+<strong>The Three Primary Functions of Storage Networking</strong><br/>
+The storage process could be broken into 3 different functional areas as following:
+<pre>
+Connecting - Provides the transmission of data between systems and storage
+Storing    - A lower-level application with specialized commands and control protocols for 
+             system/device interactions.
+Filing     - Directs the placement of data objects in storage and is responsible for
+             presenting data to applications and users
+</pre>
+
+For the iSCSI, the TCP/IP is _connecting_, iSCSI is the _storing_.<br/>
+For the NVMe, the NVMe is storing, the _connecting_ could be pcie, fc or rdma.
+... <br/>
+Filing is commonly the filesystem.<br/>
+<br/>
+<br/>
+<br/>
+<br/>
+We could easily infer that the multipath is in <font color="red">_connecting_</font>, it depends on the redundant IO path between<br/>
+system and storage. Generally, the multipath is on the top and SCSI protocol.<br/>
+Following is an example of multipath
+<pre>
+        +------+
+        | SAN  |__                             <font color="green">Mirrored</font>
+        | port0|  \  LUN0                     +-------+
+        +------+   \        +----+ <--------->| Disk  |
+                    \_ _ _ _| LU |            +-------+
+                    /       | __ |            +-------+
+        +------+   / LUN1   +----+ <--------->| Disk  |
+        | SAN  |__/                           +-------+
+        | port1|                               <font color="green">Mirrored</font>
+        +------+
+
+   Note: <font color="red">The SAN port here is _connecting_ element</pre>
+</pre>
+</font>
+</p>
+
+
+<h2><a name="Implementation">Implementation</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+The kernal part of multipath is based on Device mapper and it is the only one <font color="red">request-based</font> dm driver.<br/>
+<pre>
+                 Filesystem
+ ---------------------------------- generic_make_request
+                 BIO
+ ---------------------------------- blk_make_request
+                 Blk-mq
+                 Queue
+ ---------------------------------- dm_mq_queue_rq
+                 Blk-mq 
+                 w/o sched
+         Queue0         Queue1
+ ---------------------------------- scsi_queue_rq
+                 SCSI-mq
+                 
+</pre>
+
+</font>
+</p>
+
+
+
+</body>
+</html>

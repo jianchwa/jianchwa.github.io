@@ -754,6 +754,22 @@ If the nvme device is not dead, it could still handle the requests, so we could 
 		nvme_suspend_queue(dev->queues[i]);
 </pre>
 nvme_stop_queues() will quiesce the queues, so the hctx will not handle requests and interact with nvme devices.<br/>
+nvme_suspend_queue will clear the irqs.
+<pre>
+nvme_suspend_queue
+    -> pci_free_irq
+        -> __free_irq //if no other irq_action
+            -> irq_shutdown
+                -> __irq_disable
+                    -> mask_irq
+                        -> pci_msi_mask_irq
+            -> irq_domain_deactivate_irq
+                -> __irq_domain_deactivate_irq
+                    -> intel_irq_remapping_deactivate
+                    -> x86_vector_deactivate
+                        -> clear_irq_vector
+            -> synchronize_irq
+</pre>
 <pre>
 	if (dead) {
 		/* A device might become IO incapable very soon during

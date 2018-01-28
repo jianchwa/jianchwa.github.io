@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PM</title>
+</head>
+<body>
+<div>
+    <h1>Power Management in Linux</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#S3">S3</a><br/>
+<a href="#How_to_freeze_tasks">How to freeze tasks</a>
+<a href="#PM_and_block">PM and block</a>
+</font>
+</p>
+
+
+<h2><a name="S3">S3</a></h2>
+<p>
+<font size="2">
+S3 is the ACPI state that is known as "sleep" or <font color="red">"suspend to RAM"</font>. It essentially turns off most power of the system but keeps memory powered.<br/>
+The break down of calls in kernel.
+<pre>
+state_store(): 
+  handles write of "mem" to  /sys/power/state
+  calls enter_state() to enter the S3 state
+
+    enter_state():
+      syncs filesystem
+      calls suspend_prepare():
+
+        suspend_prepare():
+          prepares console for suspend
+          freezes processes
+          calls suspend_devices_and_enter():
+
+            suspend_devices_and_enter():
+              suspends devices
+              suspends console
+              calls suspend_enter():
+
+                suspend_enter():
+                  prepares all devices for power down
+                  disables all CPUs apart from boot CPU (<font color="red">freeze_secondary_cpus</font>)
+                  disables interrupts
+                  calls acpi_suspend_enter()
+
+                    acpi_suspend_enter():
+                      flushes CPU cache
+                      calls acpi_save_state_mem()
+
+                        acpi_save_state_mem():
+                          sets wakeup_header for resume
+                          32 bit: return via wakeup_pmode_return
+                          64 bit: trampoline via setup_trampoline()
+                          calls do_suspend_lowlevel() (assembler)
+
+                            do_suspend_lowlevel():
+                              save processor state
+                              save registers
+                              call acpi_enter_sleep_state()
+                         
+                                acpi_enter_sleep_state():
+                                  disables all GPEs
+                                  enables all wakeup GPEs
+                                  executes the _GTS() ACPI Method (if it exists)
+                                  Set SLP_TYP in PM1a and PM1b registers
+                                  flush CPU caches
+                                  Set SLP_TYP + SLP_EN in PM1a and PM1b registers
+                                  idle for a while, eventually the PM1a/1b registers kick
+                                  in and machine goes into S3
+</pre>
+</font>
+</p>
+
+<h2><a name="How_to_freeze_tasks">How to freeze tasks</a></h2>
+<p>
+<font size="2">
+<pre>
+freeze_task()
+>>>>
+    if (!freezing(p) || frozen(p)) {
+        spin_unlock_irqrestore(&freezer_lock, flags);
+            return false;
+    }
+
+    if (!(p->flags & PF_KTHREAD))
+        fake_signal_wake_up(p);
+    else
+        wake_up_state(p, TASK_INTERRUPTIBLE);
+>>>>
+</pre>
+wake up the userland process with signal or wake up the kthread directly.<br/>
+How does the task to be frozen know it should enter into frozen state ?<br/>
+The answer is the interface : try_to_freeze()<br/>
+
+It is hooked into get_signal() thus the userland tasks could detect the
+freezing. And every developer of kernel thread should add try_to_freeze() into
+its kthread body to detect the freezing request of pm system.<br/>
+<pre>
+try_to_free()
+    -> try_to_freeze_unsafe()
+        -> __refrigerator() // if freezing(current)
+>>>>
+            set_current_state(TASK_UNINTERRUPTIBLE);
+
+            spin_lock_irq(&freezer_lock);
+            current->flags |= PF_FROZEN;
+            if (!freezing(current) ||
+                 (check_kthr_stop && kthread_should_stop()))
+                current->flags &= ~PF_FROZEN;
+            spin_unlock_irq(&freezer_lock);
+
+            if (!(current->flags & PF_FROZEN))
+                break;
+            was_frozen = true;
+            schedule();
+>>>>
+</pre>
+The task need to <font color="red">set flag PF_FROZEN self</font> and invoke schedule() to go to frozen state.
+
+The freezing() interface will check whether the task should enter into frozen state.<br/>
+<pre>
+static inline bool freezing(struct task_struct *p)
+{
+	if (likely(!atomic_read(&system_freezing_cnt)))
+		return false;
+	/*
+	   This global variable is increased in freeze_processes()
+	 */
+	return freezing_slow_path(p);
+}
+</pre>
+frozen() is to check whether a task has been frozon, in the other word, the PF_FROZEN has been set. 
+
+We have seen how does freeze_task() wakeup the tasks, no mater userland or
+kernel ones. It cannot handle the tasks that in TASK_UNINTERRUPTIBLE state.
+These tasks may be waiting for I/O or locks. <br/> 
+
+try_to_freeze_tasks() will loop and wait until all the tasks enter into frozen state or
+the freezing procedure has lasted for freeze_timeout_msecs (20s). 
+<pre>
+In theory, 20s is long enough to complete I/O or get a lock, otherwise, there maybe IO hang or deadlock occurring.
+</pre>
+Then it will invoke sched_show_task() to show the state of tasks cannot be frozen. try_to_freeze_tasks() will return -EBUSY then the suspend procedure will be stopped and fail.<br/>
+</font>
+</p>
+
+
+<h2><a name="PM_and_block">PM and block</a></h2>
+<p>
+<font size="2">
+It is essential that neither filesystem state nor metadata changes during system suspend. This is why SCSI devices are quiesced. The SCSI core quiesces devices through scsi_device_quiesce() and scsi_device_resume(). In the SDEV_QUIESCE state execution of non-preempt requests is deferred. This is realized by returning BLKPREP_DEFER from inside scsi_prep_state_check() for quiesced SCSI devices.<br/>
+In the past, scsi_device_quiesce() will invoke scsi_run_queue() until sdev->device_busy drops to zero to drain all the outstanding requests. Because the device has been quiesced, no requests could enter into scsi driver, but only stay in blk-mq layer. There is a big defect here, even though the requests stay in blk-mq layer and will not enter into scsi driver, but they actually have occupied tags even used up the tags. This will prevent PM management requests to be submitted and finally IO hangs.<br/>
+
+So 3a0a529( block, scsi: Make SCSI quiesce and resume work reliably) was introduced to fix this issue through defferring allocation of non-preempt requests. Let's go to look at how to achieve that.
+<pre>
+scsi_device_quiesce(struct scsi_device *sdev)
+{
+    struct request_queue *q = sdev->request_queue;
+    int err;
+
+    /*
+     * It is allowed to call scsi_device_quiesce() multiple times from
+     * the same context but concurrent scsi_device_quiesce() calls are
+     * not allowed.
+     */
+    WARN_ON_ONCE(sdev->quiesced_by && sdev->quiesced_by != current);
+
+    blk_set_preempt_only(q); // <font color="red">set the queue to preempt-only mode</font>
+
+    blk_mq_freeze_queue(q); // <font color="red">drain all the non-preempt requests</font>
+    /*
+     * Ensure that the effect of blk_set_preempt_only() will be visible
+     * for percpu_ref_tryget() callers that occur after the queue
+     * unfreeze even if the queue was already frozen before this function
+     * was called. See also https://lwn.net/Articles/573497/.
+     */
+    synchronize_rcu();
+    blk_mq_unfreeze_queue(q);
+
+    mutex_lock(&sdev->state_mutex);
+    err = scsi_device_set_state(sdev, SDEV_QUIESCE);
+    if (err == 0)
+        sdev->quiesced_by = current;
+    else
+        blk_clear_preempt_only(q);
+    mutex_unlock(&sdev->state_mutex);
+
+    return err;
+}
+
+int blk_queue_enter(struct request_queue *q, blk_mq_req_flags_t flags)
+{
+    const bool preempt = flags & BLK_MQ_REQ_PREEMPT;
+
+    while (true) {
+        bool success = false;
+        int ret;
+
+        rcu_read_lock_sched();
+        if (percpu_ref_tryget_live(&q->q_usage_counter)) {
+            /*
+             * The code that sets the PREEMPT_ONLY flag is
+             * responsible for ensuring that that flag is globally
+             * visible before the queue is unfrozen.
+             */
+            if (preempt || !blk_queue_preempt_only(q)) { //<font color="red">the non-preempt ones will be 
+                                                           intercepted in preempt-only mode</font>
+                success = true;
+            } else {
+                percpu_ref_put(&q->q_usage_counter);
+            }
+        }
+        rcu_read_unlock_sched();
+
+        if (success)
+            return 0;
+
+        if (flags & BLK_MQ_REQ_NOWAIT)
+            return -EBUSY;
+
+        smp_rmb();
+
+        ret = wait_event_interruptible(q->mq_freeze_wq,
+                (atomic_read(&q->mq_freeze_depth) == 0 &&
+                 (preempt || !blk_queue_preempt_only(q))) ||
+                blk_queue_dying(q));
+        if (blk_queue_dying(q))
+            return -ENODEV;
+        if (ret)
+            return ret;
+    }
+}
+
+scsi_execute() will carry BLK_MQ_REQ_PREEMPT flag 
+scsi_execute()
+>>>>
+req = blk_get_request_flags(sdev->request_queue,
+            data_direction == DMA_TO_DEVICE ?
+            REQ_OP_SCSI_OUT : REQ_OP_SCSI_IN, <font color="red">BLK_MQ_REQ_PREEMPT</font>);
+>>>>
+
+</pre> 
+
+First, need to emphasize, NVMe doesn't have this kind issue, it have seperated queues for admin and IO requests.<br/>
+On the other hand, this patch change the quiesced state of scsi device a lot, it actually <font color="red">'freezes'</font> the request queue.
+In the past, new IO cannot enter into scsi driver, but can enter into blk-mq layer. Now, IO submitter will be blocked on generic_make_request(), this looks like the request queue has been frozen.
+</font>
+</p>
+</body>
+</html>

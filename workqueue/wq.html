@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Workqueue</title>
+</head>
+<body>
+<div>
+    <h1>workqueue</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Overview">Overview</a>
+<a href="#Design">Desgin</a>
+<ul>
+<li><a href="#workqueue_attrs">workqueue attrs</a>
+<li><a href="#The_multi-functional_work->data">The multi-functional work->data</a>
+<li><a href="#ASSOCIATED_&_BOUND">ASSOCIATED & BOUND</a>
+<li><a href="#Non-reentrancy">Non-reentrancy</a>
+<li><a href="#Will_kworkers_be_frozen">Will kworkers be frozen ?</a>
+</ul>
+<a href="#Operations">Operations</a>
+<ul>
+<li><a href="#How_to_queue_a_work">How to queue a work</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="Overview">Overview</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+per-cpu kworker pool (normal, highpri)
+<pre>
+
+
+             wq -> cpu_pwqs[]               ( workqueue_struct )
+                       |
+              +----------------+
+              |                |
+              V                V
+             pwq0->pool       pwq1->pool    ( pool_workqueue, an association between worker_pool and workqueue) 
+                    |                |
+                    V                V
+                worker_pool0       worker_pool1
+                |
+                +--->idle_list--
+                |                \
+                |                V
+                |                worker2 (WORKER_DIE)
+                |
+                +--->busy_hash--             worker_pool0 -> worklist
+                                \     (sleeping)   (running)  /
+                                 +--> worker0 ---> worker1   / fetch a work
+                                                            V
+                                                         process_one_work()
+
+            <font color="blue">Note: kworker1 is wakeup by worker0 when it enter into
+                __schedule() -> try_to_wake_up_local()</font>
+</pre>
+</font>
+</p>
+
+
+<h2><a name="Design">Design</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+
+
+<h3><a name="workqueue_attrs">workqueue attrs</a></h3>
+<p>
+<font size="2">
+Their default workqueue_attrs(nice, cpumask, no_numa) is set in workqueue_init_early() <br/>
+<pre>
+>>>>
+    int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL }; //-20
+>>>>
+    for_each_possible_cpu(cpu) {
+        struct worker_pool *pool;
+
+        i = 0;
+        for_each_cpu_worker_pool(pool, cpu) {
+            BUG_ON(init_worker_pool(pool));
+            pool->cpu = cpu;
+            <font color="red">cpumask_copy(pool->attrs->cp  cpumask_of(cpu));</font>
+            pool->attrs->nice = std_nice[i++];
+            pool->node = cpu_to_node(cpu);
+
+            /* alloc pool ID */
+            mutex_lock(&wq_pool_mutex);
+            BUG_ON(worker_pool_assign_id(pool));
+            mutex_unlock(&wq_pool_mutex);
+        }
+    }
+>>>>
+</pre>
+This workqueue_attr(nice, cpumask, no_numa) will used when create kworker in the pool.
+<pre>
+workqueue_init()
+>>>>
+    for_each_online_cpu(cpu) {
+        for_each_cpu_worker_pool(pool, cpu) {
+            pool->flags &= ~POOL_DISASSOCIATED;
+            BUG_ON(!create_worker(pool));
+        }
+    }
+>>>>
+
+static struct worker *create_worker(struct worker_pool *pool)
+{
+    struct worker *worker = NULL;
+    int id = -1;
+    char id_buf[16];
+
+    /* ID is needed to determine kthread name */
+    id = ida_simple_get(&pool->worker_ida, 0, 0, GFP_KERNEL);
+    if (id < 0)
+        goto fail;
+
+    worker = alloc_worker(pool->node);
+    if (!worker)
+        goto fail;
+
+    worker->pool = pool;
+    worker->id = id;
+
+    <font color="blue">/*
+      The pattern of naming a kworker
+     */</font>
+    if (pool->cpu >= 0)
+        snprintf(id_buf, sizeof(id_buf), "%d:%d%s", pool->cpu, id,
+             pool->attrs->nice < 0  ? "H" : "");
+    else
+        snprintf(id_buf, sizeof(id_buf), "u%d:%d", pool->id, id);
+
+    worker->task = kthread_create_on_node(worker_thread, worker, pool->node,
+                          "kworker/%s", id_buf);
+    if (IS_ERR(worker->task))
+        goto fail;
+
+    set_user_nice(worker->task, pool->attrs->nice);
+    <font color="red">kthread_bind_mask(worker->task, pool->attrs->cpumask);</font>
+
+    /* successful, attach the worker to the pool */
+    worker_attach_to_pool(worker, pool);
+
+    /* start the newly created worker */
+    spin_lock_irq(&pool->lock);
+    worker->pool->nr_workers++;
+    worker_enter_idle(worker);
+    wake_up_process(worker->task);
+    spin_unlock_irq(&pool->lock);
+
+    return worker;
+
+fail:
+    if (id >= 0)
+        ida_simple_remove(&pool->worker_ida, id);
+    kfree(worker);
+    return NULL;
+}
+</pre>
+</font>
+</p>
+
+<h3><a name="The_multi-functional_work->data">The multi-functional work->data</a></h3>
+<p>
+<font size="2">
+It is a atomic_long_t, 64bits on x86-64.
+<pre>
+        63               7      4 3       0
+      |----.......-----|--------|--------|
+on q  |       pwq      | color  |
+      +-------------------------| bit0  work item is pending execution
+off q |         last pool id     \ bit1  work item is delayed
+      +---------------------------\ bit2  data points to pwq
+                                   \ bit3  next work is linked to this one
+
+</pre>
+
+How does this work->data change along with the process of work item ?
+
+<pre>
+
+            PENDING            -->       pwq | PENDING | PWQ | color
+            queue_work_on()              insert_work()
+            irq disabled                 irq disabled | pool->lock held
+                                         on worklist
+
+                        ^                |                     
+                        |                v 
+                        pool id               
+                        process_one_work()
+                        irq disabled | pool->lock held
+                        off worklist
+                
+                        worker->current_func()
+
+<font color="red">
+Note: the on/off worklist is the state after get out of pool->lock critical section
+</font>
+</pre>
+
+There are some usages based on diagram, especially the try_to_grab_pending().
+Let's look at it.
+
+<pre>
+static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
+                   unsigned long *flags)
+{
+    struct worker_pool *pool;
+    struct pool_workqueue *pwq;
+
+    local_irq_save(*flags);
+
+    /* try to steal the timer if it exists */
+    >>>>
+    /* try to claim PENDING the normal way */
+    if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
+        return 0;
+
+    /*
+     * <font color="red">The queueing is in progress, or it is already queued.</font> Try to
+     * steal it from ->worklist without clearing WORK_STRUCT_PENDING.
+     */
+    pool = get_work_pool(work);
+    if (!pool)
+        goto fail;
+
+    spin_lock(&pool->lock);
+    /*
+     * work->data is guaranteed to point to pwq only while the work
+     * item is queued on pwq->wq, and both updating work->data to point
+     * to pwq on queueing and to pool on dequeueing are done under
+     * pwq->pool->lock.  This in turn guarantees that, <font color="red">if work->data
+     * points to pwq which is associated with a locked pool, the work
+     * item is currently queued on that pool.</font>
+     */
+    pwq = get_work_pwq(work);
+    if (pwq && pwq->pool == pool) {
+        >>>>
+        list_del_init(&work->entry);
+        pwq_dec_nr_in_flight(pwq, get_work_color(work));
+
+        /* work->data points to pwq iff queued, point to pool */
+        set_work_pool_and_keep_pending(work, pool->id);
+
+        spin_unlock(&pool->lock);
+        return 1;
+    }
+    spin_unlock(&pool->lock);
+fail:
+    local_irq_restore(*flags);
+    if (work_is_canceling(work))
+        return -ENOENT;
+    cpu_relax();
+    return -EAGAIN;
+}
+
+</pre>
+</font>
+</p>
+
+<h3><a name="ASSOCIATED_&_BOUND">ASSOCIATED & BOUND</a></h3>
+<p>
+<font size="2">
+When we offline a cpu, how to handle the kworkers bound to that cpu ? <br/>
+The comment of unbind_workers says:
+<pre>
+allowing the pools to be disassociated from the CPU running as an unbound one 
+and allowing it to be reattached later if the cpu comes back online.
+</pre>
+What's the _disassociated_ and _unbound_ ? <br/>
+Look at the comment from workqueue.c
+<pre>
+ A bound pool is either associated or disassociated with its CPU. While associated 
+ (!DISASSOCIATED), all workers are bound to the CPU and none has %WORKER_UNBOUND 
+ set and concurrency management is in effect.
+While DISASSOCIATED, the cpu may be offline and all workers have %WORKER_UNBOUND
+set and concurrency management disabled, and may be executing on any CPU.  The 
+pool behaves as an unbound one.
+</pre>
+Whenever the WORKER_UNBOUND is set, workqueue core thinks of it is NOT_RUNNING,
+then the pool->nr_running will not be changed in the sched callback.<br/>
+<font color="red">For unbound worker, the pool->nr_running will always be zero,
+then the idle worker will be wakeup when worklist is not empty. This is a big difference
+between bound and unboun worker</font><br/>
+
+Look at how to unbind workers:
+<pre>
+        mutex_lock(&pool->attach_mutex);
+        spin_lock_irq(&pool->lock);
+
+        for_each_pool_worker(worker, pool)
+            worker->flags |= WORKER_UNBOUND;
+
+        pool->flags |= POOL_DISASSOCIATED;
+
+        spin_unlock_irq(&pool->lock);
+        mutex_unlock(&pool->attach_mutex);
+
+        /*
+         * Call schedule() so that we cross rq->lock and thus can
+         * guarantee sched callbacks see the %WORKER_UNBOUND flag.
+         * This is necessary as scheduler callbacks may be invoked
+         * from other cpus.
+         */
+        schedule(); <font color="blue">If just synchronize with
+        wq_worker_waking_up, synchronize_rcu_sched should be ok,
+        wq_worker_waking_up is under preempt disable critical section.</font>
+
+        /*
+         * Sched callbacks are disabled now.  Zap nr_running.
+         * <font color="red">After this, nr_running stays zero and need_more_worker()
+         * and keep_working() are always true as long as the
+         * worklist is not empty.  This pool now behaves as an
+         * unbound (in terms of concurrency management) pool which
+         * are served by workers tied to the pool. </font>
+         */
+        atomic_set(&pool->nr_running, 0);
+
+        /*
+         * With concurrency management just turned off, a busy
+         * worker blocking could lead to lengthy stalls.  Kick off
+         * unbound chain execution of currently pending work items.
+         */
+        spin_lock_irq(&pool->lock);
+        wake_up_worker(pool);
+        spin_unlock_irq(&pool->lock);
+</pre>
+
+This is done by the cpuhp/T kthread on the cpu which is going to offline. <br/>
+Then stop_machine will migrate all the tasks out of the dying cpu. <br/>
+
+A question is : <font color="red">the per cpu kworker's cpumask only contains
+the dead cpu, how to schedule later, the unbind_workers doesn't change the
+kworkers cpumask.</font><br/>
+The cpu has been clear online when migrate_tasks().<br/>
+select_task_rq() will fallback to select_fallback_rq() to choose other online
+cpu when the task's allowed cpus are all offlined. The task's allowed_cpumask
+will be changed here. <br/>
+
+
+<br/>
+<br/>
+<br/>
+<br/>
+
+When the cpu online again, workqueue core will rebind the workers on the cpu
+again. <br/>
+rebind_workers will clear the POOL_DISASSOCIATED flag and WORKER_UNBOUND flag,
+then set WORKER_REBOUND flag. <br/>
+the worker_thread will clear the WORKER_REBOUND flag itself and add the
+pool->nr_running.
+<pre>
+    worker_clr_flags(worker, WORKER_PREP | WORKER_REBOUND);
+</pre>
+Another important work is to restore the allowed_cpumask of the kworker's.
+set_cpus_allowed_ptr() will set the allowed_cpumask and migrate the task to the
+target cpu. <br/>
+<pre>
+The cpu has been set onlined, but not active, could it be migrated ?
+Yes,  <font color="red">kernel threads are allowed on online && !active CPUs</font>
+</pre>
+
+
+
+</font>
+</p>
+
+
+<h3><a name="Non-reentrancy">Non-reentrancy</a></h3>
+<p>
+<font size="2">
+The workqueue mechanism ensure there is only one instance of a specific work
+being executed across the whole system at one moment. We call this <font color="red">Non-reentrancy</font>.
+<br/>
+How to implement this ?<br/>
+There are two points to achieve this. <br/>
+<strong>Only one pending</strong><br/>
+This flag will be tested and set in queue_work_on.
+<pre>
+bool queue_work_on(int cpu, struct workqueue_struct *wq,
+           struct work_struct *work)
+{
+    bool ret = false;
+    unsigned long flags;
+
+    local_irq_save(flags);
+
+    if (!<font color="red">test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))</font>) {
+        __queue_work(cpu, wq, work);
+        ret = true;
+    }
+
+    local_irq_restore(flags);
+    return ret;
+}
+</pre>
+Then it will be cleared by process_one_work after the work->entry is dequeued from the
+workpool->worklist.
+<pre>
+static void process_one_work(struct worker *worker, struct work_struct *work)
+{
+>>>>
+    /* claim and dequeue */
+    debug_work_deactivate(work);
+    hash_add(pool->busy_hash, &worker->hentry, (unsigned long)work);
+    worker->current_work = work;
+    worker->current_func = work->func;
+    worker->current_pwq = pwq;
+    work_color = get_work_color(work);
+
+    list_del_init(&work->entry);
+    >>>>
+    /*
+     * Record the last pool and clear PENDING which should be the last
+     * update to @work.  Also, do this inside @pool->lock so that
+     * PENDING and queued state changes happen together while IRQ is
+     * disabled.
+     */
+    <font color="red">set_work_pool_and_clear_pending(work, pool->id);</font>
+
+    spin_unlock_irq(&pool->lock);
+>>>>
+}
+</pre>
+<font color="red">This could ensure there is only one work pending.</font> <br/>
+The set_work_pool_and_clear_pending not only clear the pending flag, but also record the 
+current workpool id in the work. This is another point to ensure the Non-reentrancy. <br/>
+<br/>
+
+<strong>Only one executed by one <font color="red">workpool</font></strong><br/>
+<br/>
+We have know that the pending flag is cleared by process_one_work after the work->entry is
+dequeued bfore prepare to be executed. In the other words, a new work could be queued again
+at the moment. We should ensure that newly queued work will not be queued on different workpool
+while the previous instance is still running by other workpool, otherwise the new work instance
+will be executed by another workpool concurrently <br/>
+This is done in __queue_work.
+<pre>
+    /*
+     * <font color="red">If @work was previously on a different pool, it might still be
+     * running there, in which case the work needs to be queued on that
+     * pool to guarantee non-reentrancy.</font>
+     */
+    last_pool = get_work_pool(work); //<font color="blue">depends on the pool is set in process_one_work</font>
+    if (last_pool && last_pool != pwq->pool) {
+        struct worker *worker;
+
+        spin_lock(&last_pool->lock);
+
+        worker = find_worker_executing_work(last_pool, work);
+
+        if (worker && worker->current_pwq->wq == wq) {
+            pwq = worker->current_pwq;
+        } else {
+            /* meh... not running there, queue here */
+            spin_unlock(&last_pool->lock);
+            spin_lock(&pwq->pool->lock);
+        }
+    }
+</pre>
+The comment above has said everything. <br/>
+Then the new work will be queued on the previous one.<br/>
+<br/>
+<strong>Only one executed by one <font color="red">worker</font></strong><br/>
+<br/>
+Even if the work has been queued to the same workpool when the previous instance is
+running there, but the new work instance still could be executed by a different 
+<font color="red">worker</font>. Because the work->func may sleep to wait something, or
+unbound workpool which will always wakeup new workers to execute new work, 
+at the moment a new worker will be waked up to executed the new work instance. <br/>
+How to avoid this case? <br/>
+Look at the process_one_work code segment.
+<pre>
+    /*
+     * A single work shouldn't be executed concurrently by
+     * multiple workers on a single cpu.  Check whether anyone is
+     * already processing the work.  If so, defer the work to the
+     * currently executing one.
+     */
+    collision = find_worker_executing_work(pool, work);
+    if (unlikely(collision)) {
+        move_linked_works(work, &collision->scheduled, NULL);
+        return;
+    }
+</pre>
+The new work instance is linked into scheduled list of the worker which is executing the work.
+The process is under spin_lock_irq(pool->lock). <br/>
+Then it will be executed as following in process_one_work: <br/>
+<pre>
+    do {
+        struct work_struct *work =
+            list_first_entry(&pool->worklist,
+                     struct work_struct, entry);
+
+        pool->watchdog_ts = jiffies;
+
+        if (likely(!(*work_data_bits(work) & WORK_STRUCT_LINKED))) {
+            /* optimization path, not strictly necessary */
+            process_one_work(worker, work);
+            if (unlikely(!list_empty(&worker->scheduled)))
+                <font color="red">process_scheduled_works(worker);</font>
+        } else {
+            move_linked_works(work, &worker->scheduled, NULL);
+            process_scheduled_works(worker);
+        }
+    } while (keep_working(pool));
+<font color="red">Note: pool->lock will ensure the safe. </font>
+</pre>
+
+</font>
+</p>
+
+
+
+<h3><a name="Will_kworkers_be_frozen">Will kworkers be frozen ?</a></h3>
+<p>
+<font size="2">
+We have known that the PM core will try to freeze the user mode processes and kernel
+thread. <br/>
+<pre>
+suspend_freeze_processes()
+    -> freeze_processes()
+    -> freeze_kernel_threads()
+        -> try_to_freeze_tasks() //user_only == false
+            -> freeze_workqueues_begin()
+            -> freeze_task()
+                -> freezing()
+                    -> freezing_slow_path()
+                        -> if (p->flags & PF_NOFREEZE) return false
+            -> freeze_workqueues_busy()
+</pre>
+The task which has <font color="red">PF_NOFREEZE</font> will not be frozen.<br/>
+In fact, all the kernel thread will have this flag by default. <br/>
+Look at kthreadd() which is father of all the kernel threads. <br/>
+<pre>
+/* Setup a clean context for our children to inherit. */
+    set_task_comm(tsk, "kthreadd");
+    ignore_signals(tsk);
+    set_cpus_allowed_ptr(tsk, cpu_all_mask);
+    set_mems_allowed(node_states[N_MEMORY]);
+
+    <font color="red">current->flags |= PF_NOFREEZE;</font>
+    cgroup_init_kthreadd();
+</pre>
+All the children will inherit this flag. <br/>
+<br/>
+<br/>
+set_freezable() helper interface could clean this flag. some kthreads will invoke this,
+such as kswapd<br/>
+<font color="red">kworker doesn't have this flag, so they are not freezable</font><br/>
+<br/>
+<br/>
+However, we have seen that there are hooks corresponding to wq, what do they do ?<br/>
+
+<pre>
+void freeze_workqueues_begin(void)
+{
+    struct workqueue_struct *wq;
+    struct pool_workqueue *pwq;
+
+    mutex_lock(&wq_pool_mutex);
+
+    WARN_ON_ONCE(workqueue_freezing);
+    workqueue_freezing = true;
+
+    list_for_each_entry(wq, &workqueues, list) {
+        mutex_lock(&wq->mutex);
+        for_each_pwq(pwq, wq)
+            pwq_adjust_max_active(pwq);
+        mutex_unlock(&wq->mutex);
+    }
+
+    mutex_unlock(&wq_pool_mutex);
+}
+pwq_adjust_max_active() will clear pwq->max_active to zero when it is freezing. <br/>
+</pre>
+
+<strong>So what is the pwq->max_active for ?</strong> <br/>
+
+<pre>
+__queue_work()
+...
+    if (likely(pwq->nr_active < pwq->max_active)) {
+        trace_workqueue_activate_work(work);
+        pwq->nr_active++;
+        worklist = &pwq->pool->worklist;
+        if (list_empty(worklist))
+            pwq->pool->watchdog_ts = jiffies;
+    } else {
+        work_flags |= WORK_STRUCT_DELAYED;
+        worklist = &pwq->delayed_works;
+    }
+....
+<font color="red">Note: this delayed_works list is not related to deleyed work, __queue_delayed_work just
+add a timer which will invoke __queue_work when expires.</font>
+</pre>
+If the max_active threshold has been reached, the work will be queued on pwq->delayed_works. <br/>
+They are actually deferred. But when will they be handled ? <br/>
+<pre>
+process_one_work()
+    -> pwq_dec_nr_in_flight()
+    >>>> //under pool->lock
+    pwq->nr_active--;
+    if (!list_empty(&pwq->delayed_works)) {
+        /* one down, submit a delayed one */
+        if (pwq->nr_active < pwq->max_active)
+            pwq_activate_first_delayed(pwq);
+    }
+    >>>>
+        -> pwq_activate_delayed_work()
+
+static void pwq_activate_delayed_work(struct work_struct *work)
+{
+    struct pool_workqueue *pwq = get_work_pwq(work);
+
+    trace_workqueue_activate_work(work);
+    if (list_empty(&pwq->pool->worklist))
+        pwq->pool->watchdog_ts = jiffies;
+    move_linked_works(work, &pwq->pool->worklist, NULL);
+    __clear_bit(WORK_STRUCT_DELAYED_BIT, work_data_bits(work));
+    pwq->nr_active++;
+}
+</pre>
+Work will be moved to pwq->pool->worklist. <br/>
+
+When the pwq->max_active is set zero, new work will be deferred. 
+try_to_freeze_tasks will wait the active ones to be completed through
+freeze_workqueues_busy. <br/>
+<br/>
+Only the wq with WQ_FREEZABLE can be frozen. This flag is set in alloc_workqueue()<br/>
+For example:
+<pre>
+    bdi_wq = alloc_workqueue("writeback", WQ_MEM_RECLAIM | WQ_FREEZABLE |
+                          WQ_UNBOUND | WQ_SYSFS, 0);
+</pre>
+<font color="red">Note: Freezing processes is to prevent them from change filesystem state, data, metadata, so the wq or kthread associated with writeback are freezable, which will access the filesystem</font>
+
+</font>
+</p>
+
+
+
+<h2><a name="Operations">Operations</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+
+
+<h3><a name="How_to_queue_a_work">How to queue a work</a></h3>
+<p>
+<font size="2">
+<font color="red">queue_work_on is irq safe interface, no sleep, irq disabled in it</font>
+<pre>
+bool queue_work_on(int cpu, struct workqueue_struct *wq,
+           struct work_struct *work)
+{
+    bool ret = false;
+    unsigned long flags;
+
+    local_irq_save(flags);
+
+    <font color="blue">
+    /*
+     When a work is pending, it will not be queued again.
+     */
+    </font>
+    if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+        __queue_work(cpu, wq, work);
+        ret = true;
+    }
+
+    local_irq_restore(flags);
+    return ret;
+}
+static void __queue_work(int cpu, struct workqueue_struct *wq,
+             struct work_struct *work)
+>>>>
+    if (req_cpu == WORK_CPU_UNBOUND)
+        cpu = wq_select_unbound_cpu(raw_smp_processor_id());
+
+    /* pwq which will be used unless @work is executing elsewhere */
+    if (!(wq->flags & WQ_UNBOUND))
+        pwq = per_cpu_ptr(wq->cpu_pwqs, cpu);
+    else
+        pwq = unbound_pwq_by_node(wq, cpu_to_node(cpu));
+
+>>>>
+    spin_lock(&pwq->pool->lock);
+    if (likely(pwq->nr_active < pwq->max_active)) {
+        trace_workqueue_activate_work(work);
+        pwq->nr_active++;
+        worklist = &pwq->pool->worklist;
+        if (list_empty(worklist))
+            pwq->pool->watchdog_ts = jiffies;
+    } else {
+        work_flags |= WORK_STRUCT_DELAYED;
+        worklist = &pwq->delayed_works;
+    }
+
+    insert_work(pwq, work, worklist, work_flags);
+
+    spin_unlock(&pwq->pool->lock)
+>>>>
+
+static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
+            struct list_head *head, unsigned int extra_flags)
+{
+    struct worker_pool *pool = pwq->pool;
+
+    /* we own @work, set data and link */
+    set_work_pwq(work, pwq, extra_flags);
+    list_add_tail(&work->entry, head);
+    get_pwq(pwq);
+
+    /*
+     * Ensure either wq_worker_sleeping() sees the above
+     * list_add_tail() or we see zero nr_running to avoid workers lying
+     * around lazily while there are works to be processed.
+     */
+    smp_mb();
+
+    if (__need_more_worker(pool))
+        wake_up_worker(pool);
+}
+</pre>
+</font>
+</p>
+
+
+
+
+
+</body>
+</html>
