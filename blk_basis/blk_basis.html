@@ -19,9 +19,11 @@
 <li><a href="#Setup_and_complete_a_bio">Setup and complete a bio</a>
 <li><a href="#Bio_operations">Bio operations</a>
 </ul>
+<a href="#Merge">Merge</a><br/>
 <a href="#FLUSH_and_FUA">FLUSH and FUA</a><br/>
 <a href="#Queue_state_flags">Queue state flags</a><br/>
-<a href="#WBT">WBT</a>
+<a href="#WBT">WBT</a><br/>
+<a href="#DISK_and_BLKDEV">DISK and BLKDEV</a>
 </font>
 </p>
 
@@ -433,6 +435,91 @@ static int clone_bio(struct dm_target_io *tio, struct bio *bio,
 
 </font>
 </p>
+
+
+
+
+<h2><a name="Merge">Merge</a></h2>
+<p>
+<font size= "2">
+The main merging point.
+<pre>
+<font color="red">blk_mq_sched_try_merge</font>
+This is used to merge bio with req.
+It is usually in <font color="red">bio submitting</font> path.
+elv_merge choose a rq which could merge with a new bio
+and return how to merge.
+(bio) (req) indicates the new one
+
+if ELEVATOR_BACK_MERGE
+    req -> bio -> (bio)
+    then try to merge this req with latter one.
+    (req) -?-> req
+
+if ELEVATOR_FRONT_MERGE
+    req -> (bio) -> bio
+    then try to merge this req with former one.
+    req -?-> (req)
+
+<font color="red">elv_attempt_insert_merge</font>
+This is used to merge req with req.
+It is usually in <font color="red">req inserting</font> path.
+
+Both elv_merge and elv_attempt_insert_merge employ <font color="red">q->last_merge
+and request_queue elv rqhash </font>to find out contiguous reqs.
+
+</pre>
+
+<strong>Note: req is just a package. The real things are bios in them.</strong>
+<br/>
+<br/>
+
+attempt_merge is used to merge two reqs (req, next).<br/>
+The mainly checking it does:
+<ul>
+<li> !rq_mergeable(req) || !rq_mergeable(next) ?
+<li> req_op(req) != req_op(next) ?
+<li> blk_rq_pos(req) + blk_rq_sectors(req) != blk_rq_pos(next) ?
+<li> rq_data_dir(req) != rq_data_dir(next) ?
+<li> req->rq_disk != next->rq_disk ?
+<li> req->write_hint != next->write_hint ?
+<li> ll_merge_requests_fn (<font color="red">'ll' here means low level ?</font>)
+<ul>
+<li> (blk_rq_sectors(req) + blk_rq_sectors(next)) > blk_rq_get_max_sectors(req, blk_rq_pos(req))
+<li> total_phys_segments > queue_max_segments(q)
+</ul>
+</ul>
+<br/>
+If two requests could be merged with echo other:
+<pre>
+    req->biotail->bi_next = next->bio;
+    req->biotail = next->biotail;
+
+    req->__data_len += blk_rq_bytes(next);
+
+    elv_merge_requests(q, req, next);
+
+    /*
+     * 'next' is going away, so update stats accordingly
+     */
+    blk_account_io_merge(next);
+
+    req->ioprio = ioprio_best(req->ioprio, next->ioprio);
+    if (blk_rq_cpu_valid(next))
+        req->cpu = next->cpu;
+
+    /*
+     * ownership of bio passed from next to req, return 'next' for
+     * the caller to free
+     */
+    next->bio = NULL;
+</pre>
+
+Then next one will be freed though __blk_put_request().<br/>
+
+</font>
+</p>
+
 
 <h2><a name="FLUSH_and_FUA">FLUSH and FUA</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
@@ -864,5 +951,94 @@ inserted, even merged.
 </ul>
 </font>
 </p>
+
+
+<h3><a name="DISK_and_BLKDEV">DISK and BLKDEV</a></h3>
+<p>
+<font size="2">
+Except for <strong>QUEUE</strong> in block layer, there is another important
+concept <strong>DISK</strong>. QUEUE is an equipment of DISK to process the IOs.
+blk-mq or blk-legacy is regarding to QUEUE, but DISK is still the DISK. BLKDEV
+is a concept of fs layer. "Everything is file" in linux, BLKDEV is the "file" of
+DISK.<br/>
+
+
+There is a special filesystem <font color="red">"bdev"</font> defined in
+fs/block_dev.c. We could get the block_device from it through blkdev number <br/>
+
+<pre>
+struct block_device *bdget(dev_t dev)
+{
+    struct block_device *bdev;
+    struct inode *inode;
+
+    /* if not exist, a new one will be created. */
+    inode = iget5_locked(blockdev_superblock, hash(dev),
+            bdev_test, bdev_set, &dev);
+
+    if (!inode)
+        return NULL;
+
+    bdev = &BDEV_I(inode)->bdev;
+
+    if (inode->i_state & I_NEW) {
+    ...
+    }
+    return bdev;
+}
+</pre>
+
+When we access the block device directly, for example /dev/sda1, we will not pass 
+througth bdev fs first. /dev/ is devtmpfs, not bdev fs. We could refer to init_special_inode
+to know this. <br/>
+
+Look at the diagram of BLKDEV, DISK and QUEUE.
+<pre>
+        sda1    sda2    sda3    sda4              <font color="red">BLKDEV</font>
+
+        __disk_get_part(blkdev->bd_disk,        \
+                blkdev->bd_partno)              |
+                                                | 
+       hd1      hd2     hd3     hd4              > <font color="red">DISK</font>
+                                                |
+       bio->bi_iter.bi_sector += hd->start_sect |
+       bio->bi_partno = 0;                      /
+
+           request_queue->make_request_fn      
+           blk_queue_bio/blk_mq_make_request       <font color="red">QUEUE</font>
+                     ...
+
+blkdev - block_device
+disk   - gendisk
+hd     - hd_struct
+</pre>
+
+In a realy workload, the stream is as following:
+<pre>
+mount_bdev
+  sget
+    set_bdev_super       xxx_get_block
+      set sb->s_bdev       map_bh
+                             bh->bdev = sb->s_bdev
+                             |
+                             V
+                         submit_bh_wbc
+                           bio_set_dev(bio, bh->b_bdev)
+                             bio->bi_disk = bdev->bd_disk 
+                             bio->bi_partno = bdev->bd_partno
+                             |
+                             V
+                         generic_make_request
+                           generic_make_request_checks
+                             blk_partition_remap
+                               bio->bi_iter.bi_sector += hd->start_sect |
+                                  bio->bi_partno = 0;
+                           queue->make_request_fn
+
+</pre>
+
+</font>
+</p>
+
 </body>
 </html>

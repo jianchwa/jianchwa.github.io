@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>scsi</title>
+</head>
+<body>
+<div>
+    <h1>scsi</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Concepts">Concepts</a><br/>
+<a href="#Implementation">Implementation</a>
+<ul>
+<li><a href="#Completion">Completion</a>
+<li><a href="#EH">Error Handler</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="Implementation">Implementation</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+
+<h3><a name="Completion">Completion</a></h3>
+<p>
+<font size="2">
+There are two ways to get scmds completed:
+<ul>
+<li> LLDD complete the scmd by calling scsi_done
+<li> block layer time the scmd out
+</ul>
+During this, the scmd->result will be set.
+<pre>
+scsi_cmnd->result
+(((result) >> 1) & 0x7f)     status byte = set from target device
+(((result) >> 8) & 0xff)     msg_byte    = return status from host adapter itself.
+(((result) >> 16) & 0xff)    host_byte   = set by low-level driver to indicate status.
+(((result) >> 24) & 0xff)    driver_byte = set by mid-level.
+</pre>
+
+scsi_decide_disposition will check them to decide what to do next.
+<pre>
+It will also check the sense data status byte is CHECK_CONDITION and sense data
+is valid.
+scsi_decide_disposition
+--
+case CHECK_CONDITION:
+        rtn = scsi_check_sense(scmd);
+        if (rtn == NEEDS_RETRY)
+            goto maybe_retry;
+        /* if rtn == FAILED, we have no sense information;
+         * returning FAILED will wake the error handler thread
+         * to collect the sense and redo the decide
+         * disposition */
+        return rtn;
+--
+</pre>
+4 results will be returned by scsi_decide_disposition
+<ul>
+<li> SUCCESS, scsi_finish_command will be invoked next
+<li> NEEDS_RETRY/ADD_TO_MLQUEUE, scmd will be requeued to blk queue
+     During this, the scsi_device will be set blocked.
+<pre>
+__scsi_queue_insert
+  -> scsi_set_blocked
+  --
+    case SCSI_MLQUEUE_DEVICE_BUSY:
+    case SCSI_MLQUEUE_EH_RETRY:
+        <font color="red">atomic_set(&device->device_blocked,
+               device->max_device_blocked);</font>
+  --
+  -> blk_requeue_request
+</pre>
+<li> others, scmd will be delivered to EH.
+</ul>
+
+Next, scsi_finish_command will check the whether the scmd has been completed
+correctly. <br/>
+<pre>
+scsi_finish_command
+--
+    good_bytes = scsi_bufflen(cmd);
+    ..
+    scsi_io_completion(cmd, good_bytes);
+--
+
+scsi_io_completion
+--
+    /*
+     * special case: failed zero length commands always need to
+     * drop down into the retry code. Otherwise, if we finished
+     * all bytes in the request we are done now.
+     */
+    if (!(blk_rq_bytes(req) == 0 && error) &&
+        !scsi_end_request(req, error, good_bytes, 0))
+        return;
+--
+</pre>
+It will check whether the scmd has been finished completely. <br/>
+If not, further action will be done based on the scsi_cmnd->result and sense data.<br/>
+<ul>
+<li> We can call scsi_requeue_command().  The request
+   will be unprepared and put back on the queue.  Then
+   a new command will be created for it.  This should
+   be used if we made forward progress, or if we want
+   to switch from READ(10) to READ(6) for example.
+   cmd->device->use_10_for_rw = 0;
+                                                        
+<li> We can call __scsi_queue_insert().  The request will
+   be put back on the queue and retried using the same
+   command as before, possibly after a delay.
+                                                        
+<li> We can call scsi_end_request() with -EIO to fail
+   the remainder of the request.
+</ul>
+
+
+</font>
+</p>
+
+<h3><a name="EH">Error Handler</a></h2>
+<p>
+<font size="2">
+The error handling procedure is done in scsi EH thread context. <br/>
+Before the acutal procedure, it need to take over the host. <br/>
+<strong>Take over scsi host</strong>
+<ul>
+<li> set SHOST_RECOVERY in shost->shost_state, then new scmds cannot enter LLDD
+any more.
+<pre>
+scsi_queue_rq
+  -> scsi_host_queue_ready
+    -> scsi_host_in_recovery
+    if yes, goto out_dec_target_busy
+  -> scsi_mq_prep_fn // if !RQF_DONTPREP
+  -> scsi_dispatch_command
+</pre>
+<li> wait for all in-flight scmds to be failed.
+<font color="red">Note</font>: the 'failed' here indicates the scmds enters
+into EH through scsi_eh_scmd_add, it could be either due to target's feedback,
+or abort failed in time out path.
+The EH kthread will be waked up only if shost->host_failed == shost->host_busy
+shost->host_busy means the in-flight scmds around the scsi host.
+<pre>
+scsi_queue_rq
+  -> scsi_host_queue_ready
+--
+    busy = atomic_inc_return(&shost->host_busy) - 1;
+    ...
+    if (shost->can_queue > 0 && busy >= shost->can_queue)
+        goto starved;
+--
+</pre>
+shost->host_failed means the scmds entering into EH through scsi_eh_scmd_add.
+
+
+Even through we say "shost->host_busy == shost->host_failed", the LLDD cannot be 
+really quiescent, <font color="red">the timeout path may not clean up the
+scmds on the target, it may be still active there</font>, the irq commpletion could
+occur at any time. Currently, we will try to abort the scmd firstly in the
+timeout path, but it still may fail.
+On the other hand, all such completions are ignored as the scmds have been marked
+completed by the timeout path (<font color="red">scsi_times_out usually return BLK_EH_NOT_HANDLED</font>).
+</ul>
+
+
+<strong>How SCSI EH work</strong><br/>
+Quote from the Documentation/scsi/scsi_eh.txt 
+<pre>
+If eh_strategy_handler() is not present, SCSI midlayer takes charge
+of driving error handling.  EH's goals are two - make LLDD, host and
+device forget about timed out scmds and make them ready for new
+commands.  A scmd is said to be recovered if the scmd is forgotten by
+lower layers and lower layers are ready to process or fail the scmd
+again.
+
+ To achieve these goals, EH performs recovery actions with increasing
+severity.  Some actions are performed by issuing SCSI commands and
+others are performed by invoking one of the following fine-grained
+hostt EH callbacks.  Callbacks may be omitted and omitted ones are
+considered to fail always.
+
+int (* eh_abort_handler)(struct scsi_cmnd *);
+int (* eh_device_reset_handler)(struct scsi_cmnd *);
+int (* eh_bus_reset_handler)(struct scsi_cmnd *);
+int (* eh_host_reset_handler)(struct scsi_cmnd *);
+
+ Higher-severity actions are taken only when lower-severity actions
+cannot recover some of failed scmds.  Also, note that failure of the
+highest-severity action means EH failure and results in offlining of
+all unrecovered devices.
+
+</pre>
+
+More details we could refer to Documentation/scsi/scsi_eh.txt.
+<br/>
+<br/>
+<br/>
+Here, let's talk about a theme below:<br/>
+When we issue a r/w command to scsi host adapter, we will do the dma map for the
+sglist (usually stream mappings). When the command times out, can we complete
+the command directly ? In the other words, can we unmap the DMA mappings
+directly ?
+<br/>
+The answer should be <font color="red">NO</font>, given that the mappings are
+stream ones, so they will be unmapped when the request is completed. And then
+the <font color="red">DMA resource maybe used by other context.</font> If this
+DMA resource is still active in the scsi host adapter, memory corruption will
+come up. <br/>
+How does the SCSI EH handle this ? Let's look into it<br/>
+<pre>
+enum blk_eh_timer_return scsi_times_out(struct request *req)
+{
+    struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(req);
+    enum blk_eh_timer_return rtn = BLK_EH_NOT_HANDLED;
+    struct Scsi_Host *host = scmd->device->host;
+...
+    if (host->hostt->eh_timed_out)
+        rtn = host->hostt->eh_timed_out(scmd);
+    // <font color="blue">eh_timed_out is usually NULL</font>
+    if (rtn == BLK_EH_NOT_HANDLED) {
+    // <font color="blue">hand over scmd to abort_work</font>
+        if (scsi_abort_command(scmd) != SUCCESS) {
+            // <font color="blue">if abort_work has been scheduled, hand over to EH</font>
+            set_host_byte(scmd, DID_TIME_OUT);
+            scsi_eh_scmd_add(scmd);
+        }
+    }
+    // <font color="red">BLK_EH_NOT_HANDLED will be always returned.</font>
+    return rtn;
+}
+</pre>
+timeout path will not complete the request. <br/>
+Let's look at how does abort work handle it. <br/>
+<pre>
+void
+scmd_eh_abort_handler(struct work_struct *work)
+{
+    ...
+        rtn = scsi_try_to_abort_cmd(sdev->host->hostt, scmd);
+        if (rtn == SUCCESS) {
+            /*<font color="blue">If the scmd is aborted successfully,
+              the DMA mapping is cleaned. Right now, we could finish/reissue it safely</font> */
+            set_host_byte(scmd, DID_TIME_OUT);
+            if (scsi_host_eh_past_deadline(sdev->host)) {
+                ...
+            } else if (!scsi_noretry_cmd(scmd) &&
+                (++scmd->retries <= scmd->allowed)) {
+                SCSI_LOG_ERROR_RECOVERY(3,
+                    scmd_printk(KERN_WARNING, scmd,
+                            "retry aborted command\n"));
+                scsi_queue_insert(scmd, SCSI_MLQUEUE_EH_RETRY);
+                return;
+            } else {
+                ...
+                <font color="red">scsi_finish_command(scmd);</font >
+                return;
+            }
+        }
+        ...
+    // If abort fails, hand over to EH
+    scsi_eh_scmd_add(scmd);
+}
+</pre>
+
+scmd_eh_abort_handler will not complete the request if abort fails, but hand
+over it to SCSI EH. <br/>
+<pre>
+scsi_error_handler
+  -> scsi_unjam_host
+    -> scsi_eh_get_sense //<font color="red">will not work on the scmd with failed aborting </font>
+    -> scsi_eh_ready_devs
+void scsi_eh_ready_devs(struct Scsi_Host *shost,
+            struct list_head *work_q,
+            struct list_head *done_q)
+{
+    if (!scsi_eh_stu(shost, work_q, done_q))
+        if (!scsi_eh_bus_device_reset(shost, work_q, done_q))
+            if (!scsi_eh_target_reset(shost, work_q, done_q))
+                if (!scsi_eh_bus_reset(shost, work_q, done_q))
+                    if (!scsi_eh_host_reset(shost, work_q, done_q))
+                        scsi_eh_offline_sdevs(work_q,
+                                      done_q);
+}
+
+The scsi_eh_stu will also not work for scmd with failed aborted.
+static int scsi_eh_stu(struct Scsi_Host *shost,
+                  struct list_head *work_q,
+                  struct list_head *done_q)
+{
+...
+        stu_scmd = NULL;
+        list_for_each_entry(scmd, work_q, eh_entry)
+            if (scmd->device == sdev && SCSI_SENSE_VALID(scmd) &&
+                scsi_check_sense(scmd) == FAILED ) {
+                stu_scmd = scmd;
+                break;
+            }
+
+        if (!stu_scmd)
+            continue;
+...
+        if (!scsi_eh_try_stu(stu_scmd)) {
+...
+}
+</pre>
+SCSI EH will try bus_device_reset/target_reset/bus_reset/host_reset. <br/>
+If succeeds, the DMA mapping must could be cleaned (the target will also be
+operational), then we could finish the command or reissue safely. <br/>
+If all of them fail, it indicates the target or host adapter is totally dead.
+It should be ok to complete the request.
+
+<pre>
+void scsi_eh_flush_done_q(struct list_head *done_q)
+{
+    struct scsi_cmnd *scmd, *next;
+
+    list_for_each_entry_safe(scmd, next, done_q, eh_entry) {
+        list_del_init(&scmd->eh_entry);
+        if (scsi_device_online(scmd->device) &&
+            !scsi_noretry_cmd(scmd) &&
+            (++scmd->retries <= scmd->allowed)) {
+                scsi_queue_insert(scmd, SCSI_MLQUEUE_EH_RETRY);
+        } else {
+            /*
+             * If just we got sense for the device (called
+             * scsi_eh_get_sense), scmd->result is already
+             * set, do not set DRIVER_TIMEOUT.
+             */
+            if (!scmd->result)
+                scmd->result |= (DRIVER_TIMEOUT << 24);
+            scsi_finish_command(scmd);
+        }
+    }
+}
+
+</pre>
+</font>
+</p>
+
+
+
+</body>
+</html>

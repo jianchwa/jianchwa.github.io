@@ -18,6 +18,7 @@
 <li><a href="#ASSOCIATED_&_BOUND">ASSOCIATED & BOUND</a>
 <li><a href="#Non-reentrancy">Non-reentrancy</a>
 <li><a href="#Will_kworkers_be_frozen">Will kworkers be frozen ?</a>
+<li><a href="#Delayed_work">Delayed work</a>
 </ul>
 <a href="#Operations">Operations</a>
 <ul>
@@ -726,8 +727,82 @@ static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
 </font>
 </p>
 
+<h3><a name="Delayed_work">Delayed work</a></h3>
+<p>
+<font size="2">
+Look at queue_delayed_work_on
+<pre>
+bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
+               struct delayed_work *dwork, unsigned long delay)
+{
+    struct work_struct *work = &dwork->work;
+    bool ret = false;
+    unsigned long flags;
 
+    /* read the comment in __queue_work() */
+    local_irq_save(flags);
 
+    if (!<font color="red">test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))</font>) {
+        __queue_delayed_work(cpu, wq, dwork, delay);
+        ret = true;
+    }
+
+    local_irq_restore(flags);
+    return ret;
+}
+__queue_delayed_work will setup a timer which will queue the work when expires.
+</pre>
+Actually, the work has not been queued, in the other words, the work is not on
+pool->work_list, but the PENDING bit has been set. <br/>
+There is a big defect here. Consider the following scenario:
+<pre>
+queue_delayed_work(wq, dw, 10<font color="green">/*ms*/</font>)
+/*5ms later*/
+queue_delayed_work(wq, dw, 0<font color="green">/*ms*/</font>)
+</pre>
+The second queue_delayed_work will not trigger the work right now, because the
+PENDING bit has been set.<br/>
+At the moment, we need mod_delayed_work_on
+<pre>
+bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
+             struct delayed_work *dwork, unsigned long delay)
+{
+    unsigned long flags;
+    int ret;
+
+    do {
+        ret = <font color="red">try_to_grab_pending(&dwork->work, true, &flags)</font>;
+    } while (unlikely(ret == -EAGAIN));
+
+    if (likely(ret >= 0)) {
+        __queue_delayed_work(cpu, wq, dwork, delay);
+        local_irq_restore(flags);
+    }
+
+    /* -ENOENT from try_to_grab_pending() becomes %true */
+    return ret;
+}
+</pre>
+A commit about this is in blk-mq, we could refer to.
+<pre>
+commit ae943d20624de0a6aac7dd0597616dce2c498029
+Author: Bart Van Assche <bart.vanassche@wdc.com>
+Date:   Fri Jan 19 08:58:55 2018 -0800
+
+    blk-mq: Avoid that blk_mq_delay_run_hw_queue() introduces unintended delays
+    
+    Make sure that calling blk_mq_run_hw_queue() or
+    blk_mq_kick_requeue_list() triggers a queue run without delay even
+    if blk_mq_delay_run_hw_queue() has been called recently and if its
+    delay has not yet expired.
+    
+    Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+</pre>
+</font>
+</p>
 
 
 </body>

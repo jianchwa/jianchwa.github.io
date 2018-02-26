@@ -14,6 +14,14 @@
 <a href="#Percpu_reference_count">Percpu reference count</a><br/>
 <a href="#Sequence_lock">Sequence lock</a><br/>
 <a href="#ACCESS_ONCE_Series">ACCESS_ONCE Series</a><br/>
+<a href="#RCU">RCU</a>
+<ul>
+<li><a href="#Rcu_Tree">Rcu Tree</a>
+<li><a href="#How_does_RCU_run">How does RCU run</a>
+<ul>
+<li><a href="#Grace_period_and_Quiescent_state">Grace period and Quiescent state</a>
+</ul>
+</ul>
 </font>
 </p>
 
@@ -485,5 +493,143 @@ Why we need this __u8,u16,u32... here ?<br/>
 At one time, gcc guaranteed that <strong>properly aligned accesses to machine-word-sized variables would be atomic</strong>. Although gcc <strong>_no longer_</strong> documents this guarantee, there is still code in the Linux kernel that relies on it. These accesses could be modeled as non-volatile memory_order_relaxed accesses.
 </font>
 </p>
+
+<h2><a name="RCU">RCU</a></h2>
+
+<h3><a name="Rcu_Tree">Rcu Tree</a></h3>
+<p>
+<font size="2">
+<pre>
+                    rcu_state                 
+                       |
+    +-----------+-----------+----------+
+    |           |           |          |
+ rcu_node    rcu_node    rcu_node   rcu_note <,  
+                                               \ 
+    |           |           |          |      mynode
+                                               /
+ rcu_data    rcu_data   rcu_data    rcu_data  /
+
+<font color="blue">rcu_state - rcu(sched/preemptible) rcu_sched, rcu_bh</font>    
+<font color="blue">rcu_node  - Just RCU TREE Orginazition</font>
+<font color="blue">rcu_data  - PER-CPU Indicate a specific CPUs
+                               Get it through raw_cpu_ptr(rsp->rda)</font>
+</pre>
+rcu_node is just for RCU Tree orginazition. We could get the topology from the
+following member.<br/>
+<pre>
+rcu_node->qsmask, qsmaskinit, grpmask
+qsmask           The mark that indicate the the CPUs or children nodes in this
+                 node has not passed the quiescent state. Per bit indicate one CPU or
+                 child node.
+qsmaskinit       Use to initialize the qsmask when a new grace period start.
+grpmask          The position in parent's qsmaskinit.
+
+rcu_data->grpmask
+grpmask          The position in qsmaskinit of the node where local CPU belongs to.
+</pre>
+
+A quiescent state is reported through:<br/>
+<pre>
+   ^                       -> rcu_report_qs_rsp
+   |               -> rcu_report_qs_rnp
+   |            ...
+           -> rcu_report_qs_rnp
+   rcu_report_qs_rdp
+</pre>
+
+</font>
+</p>
+
+<h3><a name="How_does_RCU_run">How does RCU run</a></h3>
+<p>
+<font size="2">
+There are 3 types rcu in kernel.
+<ul>
+<li> preemptible
+<li> sched
+<li> bh
+</ul>
+We just talk abot sched and bh rcu in this section.<br/>
+</font>
+</p>
+
+
+<h4><a name="Grace_period_and_Quiescent_state">Grace period and Quiescent state</a></h4>
+<p>
+<font size="2">
+When all the cpu pass quiescent state, we say the system passes grace
+period.<br/>
+rcu_gp_in_progress() tell us whether a gp is in progress.
+<pre>
+static int rcu_gp_in_progress(struct rcu_state *rsp)
+{
+    return READ_ONCE(rsp->completed) != READ_ONCE(rsp->gpnum);
+}
+</pre>
+rcu_start_gp() will start a new grace period.<br/>
+<pre>
+rcu_start_gp()
+    -> rcu_start_gp_advanced()
+        -> WRITE_ONCE(rsp->gp_flags, RCU_GP_FLAG_INIT);
+rcu_gp_kthread will be wakeup and handle the grace-period start.
+This is done in rcu_gp_init().
+ - record_gp_stall_check_time(rsp), calculate a new rsp->jiffies_stall which
+   will be used in rcu_stall detection.
+ - smp_store_release(&rsp->gpnum, rsp->gpnum + 1)
+ - iterate all the rnp and rdp:
+   - rnp->qsmask = rnp->qsmaskinit
+   - WRITE_ONCE(rnp->gpnum, rsp->gpnum);
+   - __note_gp_changes()
+
+__note_gp_changes()
+----
+    if (rdp->gpnum != rnp->gpnum || unlikely(READ_ONCE(rdp->gpwrap))) {
+        rdp->gpnum = rnp->gpnum;
+        need_gp = !!(rnp->qsmask & rdp->grpmask);
+        <font color="red">rdp->cpu_no_qs.b.norm = need_gp;</font>
+        <font color="red">rdp->core_needs_qs = need_gp;</font>
+    }
+----
+
+</pre>
+<br/>
+<br/>
+How to <font color="red">report</font> a cpu has passed qs ?<br/>
+<pre>
+SOFTIRQ_RCU context
+rcu_process_callbacks() //iterate all the rsp
+    -> __rcu_process_callbacks()
+        -> rcu_check_quiescent_state()
+rcu_check_quiescent_state()
+----
+    <font color="red">if (!rdp->core_needs_qs)</font>
+        return;
+
+    <font color="red">if (rdp->cpu_no_qs.b.norm)</font>
+        return;
+
+    rcu_report_qs_rdp(rdp->cpu, rsp, rdp);
+----
+</pre>
+<br/>
+How to <font color="red">check</font> a cpu has passed qs ?<br/>
+<pre>
+bh qs
+<font color="red">cpu tick irq context</font>
+update_process_times()
+    -> rcu_check_callbacks()
+        -> rcu_bh_qs() // <font color="red">user mode or !in_softirq</font>
+
+Note: local_bh_disable will increase SOFTIRQ part of preempt_count, in_softirq
+will return true at the moment.
+
+__do_softirq()
+    -> rcu_bh_qs() //<font color="red">after loop of invoking softirq action</font>
+</pre>
+
+</font>
+</p>
+
 </body>
 </html>
