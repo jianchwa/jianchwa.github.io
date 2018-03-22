@@ -23,7 +23,16 @@
 <a href="#FLUSH_and_FUA">FLUSH and FUA</a><br/>
 <a href="#Queue_state_flags">Queue state flags</a><br/>
 <a href="#WBT">WBT</a><br/>
-<a href="#DISK_and_BLKDEV">DISK and BLKDEV</a>
+<a href="#DISK_and_BLKDEV">DISK and BLKDEV</a><br/>
+<a href="#blk_integrity">blk_integrity</a><br/>
+<a href="#blk-loop">blk loop</a>
+<ul>
+<li><a href="#How_to_create">How to create</a>
+<li><a href="#Kthread_or_workqueue">Kthread or Workqueue ?</a>
+<li><a href="#DIO_AIO_on_backing_file">DIO & AIO on backing file</a>
+
+</ul>
+<a href="#blk-stats">blk-stats</a>
 </font>
 </p>
 
@@ -953,7 +962,7 @@ inserted, even merged.
 </p>
 
 
-<h3><a name="DISK_and_BLKDEV">DISK and BLKDEV</a></h3>
+<h2><a name="DISK_and_BLKDEV">DISK and BLKDEV</a></h2>
 <p>
 <font size="2">
 Except for <strong>QUEUE</strong> in block layer, there is another important
@@ -1039,6 +1048,819 @@ mount_bdev
 
 </font>
 </p>
+
+
+<h2><a name="blk_integrity">blk_integrity</a></h2>
+<p>
+<font size="2">
+<strong>What is blk_integrity for ?</strong><br/>
+<pre>
+
+       [ system memory ]
+               |   
+               | D  
+               | M   path1
+               | A
+               V        sas/fc/iscsi
+         [ HBA memory]- - - - - - - - ->[ storage volume ]
+                             path2
+</pre>
+The data integrity on path2 could be ensured by the transport protocol, for example:
+e.g
+<ul>
+<li> SCSI family protocols (SBC Data Integrity Field, SCC protection proposal)
+<li> SATA/T13 (External Path Protection) t
+<li> <font color="red">iscsi head/data digest ?</font>
+</ul>
+The path1 is protected by blk_integrity what we will talk next.<br/>
+<br/>
+<br/>
+<strong>How is blk_integrity implemented ?</strong><br/>
+Quote from Documentation/block/data-integrity.txt
+<pre>
+Because the format of the protection data is tied to the physical
+disk, each block device has been extended with a block integrity
+profile (struct blk_integrity).  This optional profile is registered
+with the block layer using blk_integrity_register().
+
+The profile contains callback functions for generating and verifying
+the protection data, as well as getting and setting application tags.
+The profile also contains a few constants to aid in completing,
+merging and splitting the integrity metadata.
+</pre>
+Let's look at how does the scsi sd implement this.<br/>
+<pre>
+sd_probe_async
+  -> sd_dif_config_host
+--
+    /* Enable DMA of protection information */
+    if (scsi_host_get_guard(sdkp->device->host) & SHOST_DIX_GUARD_IP) {
+        if (type == T10_PI_TYPE3_PROTECTION)
+            bi.profile = &t10_pi_type3_ip;
+        else
+            bi.profile = &t10_pi_type1_ip;
+
+        bi.flags |= BLK_INTEGRITY_IP_CHECKSUM;
+    } else
+        if (type == T10_PI_TYPE3_PROTECTION)
+            bi.profile = &t10_pi_type3_crc;
+        else
+            bi.profile = &t10_pi_type1_crc;
+
+    bi.tuple_size = sizeof(struct t10_pi_tuple);
+    sd_printk(KERN_NOTICE, sdkp,
+          "Enabling DIX %s protection\n", bi.profile->name);
+
+    if (dif && type) {
+        bi.flags |= BLK_INTEGRITY_DEVICE_CAPABLE;
+
+        if (!sdkp->ATO)
+            goto out;
+
+        if (type == T10_PI_TYPE3_PROTECTION)
+            bi.tag_size = sizeof(u16) + sizeof(u32);
+        else
+            bi.tag_size = sizeof(u16);
+
+        sd_printk(KERN_NOTICE, sdkp, "DIF application tag size %u\n",
+              bi.tag_size);
+    }
+
+out:
+    blk_integrity_register(disk, &bi);
+--
+</pre>
+<br/>
+<br/>
+The process of blk_integrity<br/>
+<pre>
+blk_mq_make_request
+  -> bio_integrity_prep
+    -> bio_integrity_add_page  //bio->bi_integrity
+    -> bio_integrity_process(bio, &bio->bi_iter, bi->profile->generate_fn); //<font color="red">bio_data_dir(bio) == WRITE)</font>
+
+bio_endio
+  -> bio_integrity_endio
+    -> __bio_integrity_endio
+--
+    if (bio_op(bio) == REQ_OP_READ && !bio->bi_status &&
+        (bip->bip_flags & BIP_BLOCK_INTEGRITY) && bi->profile->verify_fn) {
+        INIT_WORK(&bip->bip_work, bio_integrity_verify_fn);
+        queue_work(kintegrityd_wq, &bip->bip_work);
+        return false;
+    }
+--
+
+static void bio_integrity_verify_fn(struct work_struct *work)
+{
+    struct bio_integrity_payload *bip =
+        container_of(work, struct bio_integrity_payload, bip_work);
+    struct bio *bio = bip->bip_bio;
+    struct blk_integrity *bi = blk_get_integrity(bio->bi_disk);
+    struct bvec_iter iter = bio->bi_iter;
+
+    /*
+     * At the moment verify is called bio's iterator was advanced
+     * during split and completion, we need to rewind iterator to
+     * it's original position.
+     */
+    if (bio_rewind_iter(bio, &iter, iter.bi_done)) {
+        bio->bi_status = bio_integrity_process(bio, &iter,
+                               bi->profile->verify_fn);
+    } else {
+        bio->bi_status = BLK_STS_IOERR;
+    }
+
+    bio_integrity_free(bio);
+    bio_endio(bio);
+}
+
+</pre>
+<br/>
+<br/>
+<strong>blk_integrity and fs</strong><br/>
+After the request is issued to HBA, the data will be transported to HBA internal
+buffer through DMA and then verify it based on protection meta data. During the
+DMA transporting, the data in the sglist (<font color="red">page caches</font>) cannot be be
+modified. This is guaranteed by fs.<br/>
+<pre>
+Steps of writing data to a file:
+1. writing into the page cache
+aops.write_begin
+  -> lock page
+  -> wait_for_stable_page
+    -> if bdi_cap_stable_pages_required //<font color="red">BDI_CAP_STABLE_WRITES</font>
+         wait_on_page_writeback
+copy from user buffer to page cache
+aops.write_end
+
+2. writeback the pagecache to disk
+lock page
+set page writeback
+submit_bio
+unlock page
+
+3. io completion
+end bio
+  -> end_page_writeback
+    -> test_clear_page_writeback
+    -> wake_up_page(page, PG_writeback)
+</pre>
+BDI_CAP_STABLE_WRITES is set in <strong>blk_integrity_register</strong>.
+
+</font>
+</p>
+
+
+<h2><a name="blk-loop">blk loop</a></h2>
+<p>
+<font size="2">
+What's blk-loop for ?
+<pre>
+
+    /dev/loopX     /home/ubuntu-16.04.4-desktop-amd64.iso
+         |         ^         |              |
+         v         |         v              v
+    +-------------C-------------------+  +-------+
+    |     vfs cache|                  |  |  DIO  |
+    +-------------C-------------------+  +-------+
+         |         |         |              |
+         v         |         v              v
+    +-------------C------------------------------+
+    |  block layer |                             |
+    +-------------C------------------------------+
+         |         |         |
+         v         |         v
+        blk-loop driver    SCSI layer
+</pre> 
+The backend of a block device could be a HDD, SSD, or storage subsystem linked
+by fc or iscsi, and also could be a local file.<br/>
+<br/>
+There is another concept: direct IO.
+<pre>
+The data from applications will go directly to block layer, bypassing the system
+file cache.
+</pre>
+
+</font>
+</p>
+
+<h3><a name="How_to_create">How to create</a></h3>
+<p>
+<font size="2">
+<strong>Step 1</strong>
+<pre>
+/dev/loop-control 
+loop_ctl_fops
+  -> loop_control_ioctl //LOOP_CTL_ADD
+    -> loop_add
+There are a lot of interesting things in loop_add, let's look at it.
+static int loop_add(struct loop_device **l, int i)
+{
+    struct loop_device *lo;
+    struct gendisk *disk;
+    int err;
+
+    err = -ENOMEM;
+    lo = kzalloc(sizeof(*lo), GFP_KERNEL);
+    if (!lo)
+        goto out;
+
+    lo->lo_state = Lo_unbound; //<font color="green">This means no file is bound on this device</font>
+
+    /* allocate id, if @id >= 0, we're requesting that specific id */
+    if (i >= 0) {
+        err = idr_alloc(&loop_index_idr, lo, i, i + 1, GFP_KERNEL);
+        if (err == -ENOSPC)
+            err = -EEXIST;
+    } else {
+        err = idr_alloc(&loop_index_idr, lo, 0, 0, GFP_KERNEL);
+    }
+    if (err < 0)
+        goto out_free_dev;
+    i = err;
+
+    err = -ENOMEM;
+    lo->tag_set.ops = &loop_mq_ops;
+    lo->tag_set.nr_hw_queues = 1;
+    <font color="green">/*
+    It should be an interesting theme to find out how many hw_queues to be
+    required to get better performance.
+    The real work is done in loop kthread, what .queue_rq does is just to insert
+    a work or wakeup the kthread.
+     */</font>
+    lo->tag_set.queue_depth = 128;
+    lo->tag_set.numa_node = NUMA_NO_NODE;
+    lo->tag_set.cmd_size = sizeof(struct loop_cmd);
+    lo->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+    lo->tag_set.driver_data = lo;
+
+    err = blk_mq_alloc_tag_set(&lo->tag_set);
+    if (err)
+        goto out_free_idr;
+
+    lo->lo_queue = blk_mq_init_queue(&lo->tag_set);
+    if (IS_ERR_OR_NULL(lo->lo_queue)) {
+        err = PTR_ERR(lo->lo_queue);
+        goto out_cleanup_tags;
+    }
+    lo->lo_queue->queuedata = lo;
+
+    blk_queue_max_hw_sectors(lo->lo_queue, BLK_DEF_MAX_SECTORS);
+
+    <font color="green">/*
+     * By default, we do buffer IO, so it doesn't make sense to enable
+     * merge because the I/O submitted to backing file is handled page by
+     * page. For directio mode, merge does help to dispatch bigger request
+     * to underlayer disk. We will enable merge once directio is enabled.
+     */</font>
+    queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, lo->lo_queue);
+
+    err = -ENOMEM;
+    disk = lo->lo_disk = alloc_disk(1 << part_shift);
+    ...
+    disk->fops        = &lo_fops; //<font color="red">this the fops for /dev/loopX</font>
+    disk->private_data    = lo;
+    disk->queue        = lo->lo_queue;
+    sprintf(disk->disk_name, "loop%d", i);
+    add_disk(disk);
+    *l = lo;
+    return lo->lo_number;
+    ...
+}
+
+</pre>
+
+<strong>Step 2</strong>
+
+<pre>
+/dev/loopX
+lo_fops
+  -> lo_ioctl //LOOP_SET_FD
+    -> loop_set_fd
+static int loop_set_fd(struct loop_device *lo, fmode_t mode,
+               struct block_device *bdev, unsigned int arg)
+{
+    ...
+    file = fget(arg);
+    if (!file)
+        goto out;
+    ...
+    mapping = file->f_mapping;
+    inode = mapping->host;
+    <font color="green">//regular file or block file</font>
+    if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
+        goto out_putf;
+
+    if (!(file->f_mode & FMODE_WRITE) || !(mode & FMODE_WRITE) ||
+        !file->f_op->write_iter)
+        lo_flags |= LO_FLAGS_READ_ONLY;
+
+    error = -EFBIG;
+    size = get_loop_size(lo, file);
+    if ((loff_t)(sector_t)size != size)
+        goto out_putf;
+    error = loop_prepare_queue(lo);
+    <font color="blue">
+            kthread_init_worker(&lo->worker);
+            lo->worker_task = kthread_run(loop_kthread_worker_fn,
+                    &lo->worker, "loop%d", lo->lo_number);
+            if (IS_ERR(lo->worker_task))
+            return -ENOMEM;
+            set_user_nice(lo->worker_task, MIN_NICE);
+    </font>
+
+    set_device_ro(bdev, (lo_flags & LO_FLAGS_READ_ONLY) != 0);
+
+    lo->use_dio = false;
+    lo->lo_device = bdev;
+    lo->lo_flags = lo_flags;
+    lo->lo_backing_file = file;
+    lo->transfer = NULL;
+    lo->ioctl = NULL;
+    lo->lo_sizelimit = 0;
+    lo->old_gfp_mask = mapping_gfp_mask(mapping);
+    mapping_set_gfp_mask(mapping, lo->old_gfp_mask & ~(__GFP_IO|__GFP_FS));
+
+    if (!(lo_flags & LO_FLAGS_READ_ONLY) && file->f_op->fsync)
+        blk_queue_write_cache(lo->lo_queue, true, false);
+
+    loop_update_dio(lo);
+    set_capacity(lo->lo_disk, size);
+    bd_set_size(bdev, size << 9);
+    loop_sysfs_init(lo);
+    /* let user-space know about the new size */
+    kobject_uevent(&disk_to_dev(bdev->bd_disk)->kobj, KOBJ_CHANGE);
+
+    set_blocksize(bdev, S_ISBLK(inode->i_mode) ?
+              block_size(inode->i_bdev) : PAGE_SIZE);
+
+    lo->lo_state = Lo_bound;
+    ...
+}
+</pre>
+
+</font>
+</p>
+
+
+
+<h3><a name="Kthread_or_workqueue">Kthread or Workqueue ?</a></h3>
+<p>
+<font size="2">
+When request enters into .queue_rq, how to handle it next ? <br/>
+It need to be handled in another context, because we have owned a deep stack
+from vfs_read/write to driver .queue_rq. This context  could be kworker or
+standalone kthread. But which one shoud we use ? <br/>
+commit e03a3d7 ( block: loop: use kthread_work ) change the block loop from work
+to kthread context. Let's look at what block loop does before and after this patch.
+<pre>
+Work based.
+
+           Concurrently                   Sequentially                         
+    Read   Read   Read   Read      Write<->Write<->Write<->Write
+    +---+  +---+  +---+  +---+     +---+
+    | W |  | W |  | W |  | W |     | W |
+    +---+  +---+  +---+  +---+     +---+
+      |      |      |      |         |
+   + -v- - - v - - -v- - - v - - - - v - - +
+   |          Unbound worker pool          |
+   + - - - - - - - - - - - - - - - - - - - +
+
++---+
+| W |  work instance
++---+
+
+</pre>
+For the read, block loop issues them concurrently as far as possible.
+This is due to read operastions often need to wait for the page caches to be
+filled, it is usually a sychronous one. Issuing Read concurrently is good for
+random read, but it is not so efficient for sequential read which often could
+hit the page cache.<br/>
+For the write, block loop issue them sequentially, because writes usually
+reaches on page cache, it is usually fast enough.
+<br/>
+<pre>
+             Write<->Write<->Read<->Read<->Write ....
+          +- - - - -+
+          | kthread |
+          +- - - - -+
+</pre>
+When DIO/AIO is introduced, the read/write on backing file is not blocking
+operations.
+</font>
+</p>
+
+
+<h3><a name="DIO_AIO_on_backing_file">DIO & AIO on backing file</a></h3>
+<p>
+<font size="2">
+In linux, read operastions are almost synchronous except for the required data
+has been already in the page cache, otherwise, it has to wait for the page cache
+to be filled by the block device through block layer and blk driver. Even if we
+have readahead mechanism, but the page cache cannot be often hit with random
+read.<br/>
+Consequently, the loop driver execute context (kworker or standalone kthread)
+has to wait and this will delay the other requests which may has associated page
+cache already. <br/>
+On ther other hand, there are two layer page cache would be involved, one for
+file over loop device, one for the backing file. This is unnecessary and wastes
+memory.<br/>
+<br/>
+Leiming introduced backing file DIO and AIO supporting in block loop.
+<pre>
+commit bc07c10a3603a5ab3ef01ba42b3d41f9ac63d1b6
+Author: Ming Lei <ming.lei@canonical.com>
+Date:   Mon Aug 17 10:31:51 2015 +0800
+
+    block: loop: support DIO & AIO
+    
+    There are at least 3 advantages to use direct I/O and AIO on
+    read/write loop's backing file:
+    
+    1) double cache can be avoided, then memory usage gets
+    decreased a lot
+    
+    2) not like user space direct I/O, there isn't cost of
+    pinning pages
+    
+    3) avoid context switch for obtaining good throughput
+    - in buffered file read, random I/O top throughput is often obtained
+    only if they are submitted concurrently from lots of tasks; but for
+    sequential I/O, most of times they can be hit from page cache, so
+    concurrent submissions often introduce unnecessary context switch
+    and can't improve throughput much. There was such discussion[1]
+    to use non-blocking I/O to improve the problem for application.
+    - with direct I/O and AIO, concurrent submissions can be
+    avoided and random read throughput can't be affected meantime
+    
+    xfstests(-g auto, ext4) is basically passed when running with
+    direct I/O(aio), one exception is generic/232, but it failed in
+    loop buffered I/O(4.2-rc6-next-20150814) too.
+    
+    Follows the fio test result for performance purpose:
+        4 jobs fio test inside ext4 file system over loop block
+    
+    1) How to run
+        - KVM: 4 VCPUs, 2G RAM
+        - linux kernel: 4.2-rc6-next-20150814(base) with the patchset
+        - the loop block is over one image on SSD.
+        - linux psync, 4 jobs, size 1500M, ext4 over loop block
+        - test result: IOPS from fio output
+    
+    2) Throughput(IOPS) becomes a bit better with direct I/O(aio)
+            -------------------------------------------------------------
+            test cases          |randread   |read   |randwrite  |write  |
+            -------------------------------------------------------------
+            base                |8015       |113811 |67442      |106978
+            -------------------------------------------------------------
+            base+loop aio       |8136       |125040 |67811      |111376
+            -------------------------------------------------------------
+    
+    - somehow, it should be caused by more page cache avaiable for
+    application or one extra page copy is avoided in case of direct I/O
+    
+    3) context switch
+            - context switch decreased by ~50% with loop direct I/O(aio)
+        compared with loop buffered I/O(4.2-rc6-next-20150814)
+    
+    4) memory usage from /proc/meminfo
+            -------------------------------------------------------------
+                                       | Buffers       | Cached
+            -------------------------------------------------------------
+            base                       | > 760MB       | ~950MB
+            -------------------------------------------------------------
+            base+loop direct I/O(aio)  | < 5MB         | ~1.6GB
+            -------------------------------------------------------------
+    
+    - so there are much more page caches available for application with
+    direct I/O
+    
+    [1] https://lwn.net/Articles/612483/
+    
+    Signed-off-by: Ming Lei <ming.lei@canonical.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+</pre>
+After that, we get following diagram.
+<pre>
+    /dev/loopX            > /home/ubuntu-16.04.4-desktop-amd64.iso
+         |               /         |
+         v              /          v
+    +-------------+    /       +-------+
+    | vfs cache|  |   /        |  DIO  |
+    +-------------+  /         +-------+
+         |          /              |
+         v         /               v
+    +-------------C-----------------------------+
+    | block layer  |                            |
+    +-------------C-----------------------------+
+         |         |               |
+         v         |               v
+        blk-loop driver        SCSI layer
+</pre>
+
+</font>
+</p>
+
+
+
+
+<h3><a name="blk-stats">blk-stats</a></h3>
+<p>
+<font size="2">
+Before look into the implementations of blk-stat in kernel, let's first look at
+how to utilize the information provided by blk-stats, iostat.<br/>
+<pre>
+#iostat -c -d -x /dev/sda2 2 100
+Linux 4.16.0-rc3+ (will-ThinkPad-L470)     03/20/2018     _x86_64_    (4 CPU)
+
+avg-cpu:  %user   %nice %system %iowait  %steal   %idle
+          12.61    0.03    2.23    0.82    0.00   84.31
+
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sda2              0.20     5.86    2.46    4.04    23.54    56.83    24.72     0.14   20.56    6.17   29.31   5.67   3.69
+
+
+rrqm/s      The number of read requests merged per second queued to the device.
+wrqm/s      The number of write requests merged per second queued to the device.
+r/s         The number of read requests issued to the device per second.
+w/s         The number of write requests issued to the device per second.
+avgrq-sz    The average size (in sectors) of the requests issued to the device.
+avgqu-sz    The average queue length of the requests issued to the device.
+await       The average time (milliseconds) for I/O requests issued to the device to be served.
+            This includes the time spent by the requests in queue and the time spent servicing them.
+r_await     The average time (in milliseconds) for read requests issued to the device to be served.
+            This includes the time spent by the requests in queue and the time spent servicing them.
+w_await     The average time (in milliseconds) for write requests issued to the device to be served.
+            This includes the time spent by the requests in queue and the time spent servicing them.
+svctm       The average service time (in milliseconds) for I/O requests issued to the device.
+            Warning! Do not trust this field; it will be removed in a future version of sysstat.
+%util       Percentage of CPU time during which I/O requests were issued to the device (bandwidth utilization for the device).
+            Device saturation occurs when this values is close to 100%.
+</pre>
+How to calculate them ?
+
+
+Based on <a href="#write_ext_stat">write_ext_stat</a>
+<pre>
+ioj, ioi     two samples, j = i + 1
+itv          interval of two samples
+
+rrqm/s    (ioj->rd_merges, ioi->rd_merges)/itv   
+wrqm/s    (ioj->wr_merges, ioi->wr_merges)/itv   
+r/s       (ioj->rd_ios, ioi->rd_ios)/itv
+w/s       (ioj->wr_ios, ioi->wr_ios)/itv
+avgrq-sz  ((ioj->rd_sect - ioi->rd_sect) + (ioj->wr_sect - ioi->wr_sect))/
+          (ioj->nr_ios - ioi->nr_ios)
+avgqu-sz  (ioj->rq_ticks, ioi->rq_ticks)/itv
+await     ((ioj->rd_ticks - ioi->rd_ticks) + (ioj->wr_ticks + ioj->wr_ticks))/
+          (ioj->nr_ios - ioi->nr_ios)
+         
+r_await    similar with await
+w_await    similar with await
+         
+%util      (ioj->tot_ticks - ioi->tot_ticks)/itv
+</pre>
+We could refer <a href="#read_diskstats_stat">read_diskstats_stat</a> to know where does these 
+data come from.<br/>
+<br/>
+Next, let's find out how to generate this statistics data in kernel.<br/>
+Based on <a href="#diskstats_show">diskstats_show</a>
+There are following members in hd_struct.dkstats ( a percpu variable)
+<ul>
+<li> ios       r/w
+<pre>
+__blk_mq_end_request
+  -> blk_account_io_done
+    -> part_stat_inc(cpu, part, ios[rw]);
+</pre>
+<li> merges    r/w
+<pre>
+bio_attempt_back/font/disacard_merge
+  -> blk_account_io_start // new_io == false
+    -> part_stat_inc(cpu, part, merges[rw]);
+</pre>
+<li> sectors   r/w
+<pre>
+blk_mq_end_request
+  -> blk_update_request
+    -> blk_account_io_completion
+      ->  part_stat_add(cpu, part, sectors[rw], bytes >> 9);
+</pre>
+<li> ticks     r/w
+<pre>
+__blk_mq_end_request
+  -> blk_account_io_done
+    -> part_stat_add(cpu, part, ticks[rw], <font color="red">(jiffies - req->start_time)</font>);
+rq->start_time is set in blk_mq_rq_ctx_init and will inherit the smaller start_time of the merged rqs
+<font color="red">
+What if the duration here is smaller than 1 jiffies ?
+This could be possible on a machine that has a high-speed storage device and low HZ
+</font>
+</pre>
+<li> io_ticks
+<li> time_in_queue
+<pre>
+blk_account_io_start/merge/done diskstats_show/part_stat_show
+  -> part_round_stats
+    -> part_in_flight // f299b7c (blk-mq: provide internal in-flight variant)
+      -> blk_mq_in_flight
+    -> part_round_stats_single
+
+static void part_round_stats_single(struct request_queue *q, int cpu,
+                    struct hd_struct *part, unsigned long now,
+                    unsigned int inflight)
+{
+    if (inflight) {
+        __part_stat_add(cpu, part, time_in_queue,
+                inflight * (now - part->stamp));
+        __part_stat_add(cpu, part, io_ticks, (now - part->stamp));
+    }
+    part->stamp = now;
+}
+io_ticks here means the time when there is in-flight IO in request queue.
+</pre>
+</ul>
+
+
+
+<strong>Reference</strong><br/>
+<a name="read_diskstats_stat">read_diskstats_stat</a>
+<pre>
+void read_diskstats_stat(int curr)
+{
+    ...
+    if ((fp = fopen(DISKSTATS, "r")) == NULL) <font color="green">//  proc/diskstats</font>
+        return;
+
+    while (fgets(line, 256, fp) != NULL) {
+
+        <font color="green">/* major minor name rio rmerge rsect ruse wio wmerge wsect wuse running use aveq */</font>
+        i = sscanf(line, "%u %u %s %lu %lu %lu %lu %lu %lu %lu %u %u %u %u",
+               &major, &minor, dev_name,
+               &rd_ios, &rd_merges_or_rd_sec, &rd_sec_or_wr_ios, &rd_ticks_or_wr_sec,
+               &wr_ios, &wr_merges, &wr_sec, &wr_ticks, &ios_pgr, &tot_ticks, &rq_ticks);
+
+        if (i == 14) {
+            /* Device or partition */
+            if (!dlist_idx && !DISPLAY_PARTITIONS(flags) &&
+                !is_device(dev_name, ACCEPT_VIRTUAL_DEVICES))
+                continue;
+            sdev.rd_ios     = rd_ios;
+            sdev.rd_merges  = rd_merges_or_rd_sec;
+            sdev.rd_sectors = rd_sec_or_wr_ios;
+            sdev.rd_ticks   = (unsigned int) rd_ticks_or_wr_sec;
+            sdev.wr_ios     = wr_ios;
+            sdev.wr_merges  = wr_merges;
+            sdev.wr_sectors = wr_sec;
+            sdev.wr_ticks   = wr_ticks;
+            sdev.ios_pgr    = ios_pgr;
+            sdev.tot_ticks  = tot_ticks;
+            sdev.rq_ticks   = rq_ticks;
+        }
+        ...
+        save_stats(dev_name, curr, &sdev, iodev_nr, st_hdr_iodev);
+    }
+    ...
+}
+</pre>
+
+<a name="diskstats_show">diskstats_show</a>
+<pre>
+static int diskstats_show(struct seq_file *seqf, void *v)
+{
+    struct gendisk *gp = v;
+    struct disk_part_iter piter;
+    struct hd_struct *hd;
+    char buf[BDEVNAME_SIZE];
+    unsigned int inflight[2];
+    int cpu;
+
+    /*
+    if (&disk_to_dev(gp)->kobj.entry == block_class.devices.next)
+        seq_puts(seqf,    "major minor name"
+                "     rio rmerge rsect ruse wio wmerge "
+                "wsect wuse running use aveq"
+                "\n\n");
+    */
+
+    disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+    while ((hd = disk_part_iter_next(&piter))) {
+        cpu = part_stat_lock();
+        part_round_stats(gp->queue, cpu, hd);
+        part_stat_unlock();
+        part_in_flight(gp->queue, hd, inflight);
+        seq_printf(seqf, "%4d %7d %s %lu %lu %lu "
+               "%u %lu %lu %lu %u %u %u %u\n",
+               MAJOR(part_devt(hd)), MINOR(part_devt(hd)),
+               disk_name(gp, hd->partno, buf),
+               part_stat_read(hd, ios[READ]),
+               part_stat_read(hd, merges[READ]),
+               part_stat_read(hd, sectors[READ]),
+               jiffies_to_msecs(part_stat_read(hd, ticks[READ])),
+               part_stat_read(hd, ios[WRITE]),
+               part_stat_read(hd, merges[WRITE]),
+               part_stat_read(hd, sectors[WRITE]),
+               jiffies_to_msecs(part_stat_read(hd, ticks[WRITE])),
+               inflight[0],
+               jiffies_to_msecs(part_stat_read(hd, io_ticks)),
+               jiffies_to_msecs(part_stat_read(hd, time_in_queue))
+            );
+    }
+    disk_part_iter_exit(&piter);
+
+    return 0;
+}
+</pre>
+
+<a name="write_ext_stat">write_ext_stat</a>
+<pre>
+void write_ext_stat(int curr, unsigned long long itv, int fctr,
+            struct io_hdr_stats *shi, struct io_stats *ioi,
+            struct io_stats *ioj)
+{
+    char *devname = NULL;
+    struct stats_disk sdc, sdp;
+    struct ext_disk_stats xds;
+    double r_await, w_await;
+    
+    /*
+     * Counters overflows are possible, but don't need to be handled in
+     * a special way: The difference is still properly calculated if the
+     * result is of the same type as the two values.
+     * Exception is field rq_ticks which is incremented by the number of
+     * I/O in progress times the number of milliseconds spent doing I/O.
+     * But the number of I/O in progress (field ios_pgr) happens to be
+     * sometimes negative...
+     */
+    sdc.nr_ios    = ioi->rd_ios + ioi->wr_ios;
+    sdp.nr_ios    = ioj->rd_ios + ioj->wr_ios;
+
+    sdc.tot_ticks = ioi->tot_ticks;
+    sdp.tot_ticks = ioj->tot_ticks;
+
+    sdc.rd_ticks  = ioi->rd_ticks;
+    sdp.rd_ticks  = ioj->rd_ticks;
+    sdc.wr_ticks  = ioi->wr_ticks;
+    sdp.wr_ticks  = ioj->wr_ticks;
+
+    sdc.rd_sect   = ioi->rd_sectors;
+    sdp.rd_sect   = ioj->rd_sectors;
+    sdc.wr_sect   = ioi->wr_sectors;
+    sdp.wr_sect   = ioj->wr_sectors;
+    
+    compute_ext_disk_stats(&sdc, &sdp, itv, &xds);
+    
+    r_await = (ioi->rd_ios - ioj->rd_ios) ?
+          (ioi->rd_ticks - ioj->rd_ticks) /
+          ((double) (ioi->rd_ios - ioj->rd_ios)) : 0.0;
+    w_await = (ioi->wr_ios - ioj->wr_ios) ?
+          (ioi->wr_ticks - ioj->wr_ticks) /
+          ((double) (ioi->wr_ios - ioj->wr_ios)) : 0.0;
+
+    /* Print device name */
+    if (DISPLAY_PERSIST_NAME_I(flags)) {
+        devname = get_persistent_name_from_pretty(shi->name);
+    }
+    if (!devname) {
+        devname = shi->name;
+    }
+    if (DISPLAY_HUMAN_READ(flags)) {
+        printf("%s\n%13s", devname, "");
+    }
+    else {
+        printf("%-13s", devname);
+    }
+
+    /*       rrq/s wrq/s   r/s   w/s  rsec  wsec  rqsz  qusz await r_await w_await svctm %util */
+    printf(" %8.2f %8.2f %7.2f %7.2f %8.2f %8.2f %8.2f %8.2f %7.2f %7.2f %7.2f %6.2f %6.2f\n",
+           S_VALUE(ioj->rd_merges, ioi->rd_merges, itv),
+           S_VALUE(ioj->wr_merges, ioi->wr_merges, itv),
+           S_VALUE(ioj->rd_ios, ioi->rd_ios, itv),
+           S_VALUE(ioj->wr_ios, ioi->wr_ios, itv),
+           ll_s_value(ioj->rd_sectors, ioi->rd_sectors, itv) / fctr,
+           ll_s_value(ioj->wr_sectors, ioi->wr_sectors, itv) / fctr,
+           xds.arqsz,
+           S_VALUE(ioj->rq_ticks, ioi->rq_ticks, itv) / 1000.0,
+           xds.await,
+           r_await,
+           w_await,
+           /* The ticks output is biased to output 1000 ticks per second */
+           xds.svctm,
+           /*
+            * Again: Ticks in milliseconds.
+        * In the case of a device group (option -g), shi->used is the number of
+        * devices in the group. Else shi->used equals 1.
+        */
+           shi->used ? xds.util / 10.0 / (double) shi->used
+                     : xds.util / 10.0);    /* shi->used should never be null here */
+}
+
+</pre>
+</font>
+</p>
+
 
 </body>
 </html>

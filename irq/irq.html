@@ -13,6 +13,7 @@
 <a href="#Framework">Framework</a>
 <ul>
 <li><a href="#IRQ_Domain">IRQ Domain</a>
+<li><a href="#IRQ_Affinity">IRQ Affinity</a>
 </ul>
 </font>
 </p>
@@ -119,9 +120,174 @@ domain:  INTEL-IR-MSI-1-2
 </font>
 </p>
 
+<h2><a name="IRQ_Affinity">IRQ Affinity</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;"/>
 
+<p>
+<font size="2">
 
+Before look into the irq affinity, let's look at something about the cpumask.
+<pre>
+The following particular system cpumasks and operations manage
+possible, present, active and online cpus.
 
+cpu_possible_mask- has bit ‘cpu’ set iff cpu is populatable
+cpu_present_mask – has bit ‘cpu’ set iff cpu is populated
+cpu_online_mask – has bit ‘cpu’ set iff cpu available to scheduler
+cpu_active_mask – has bit ‘cpu’ set iff cpu available to migration
+
+If !CONFIG_HOTPLUG_CPU, present == possible, and active == online.
+
+The cpu_possible_mask is fixed at boot time, as the set of CPU id’s
+that it is possible might ever be plugged in at anytime during the
+life of that system boot. The cpu_present_mask is dynamic(*),
+representing which CPUs are currently plugged in. And
+cpu_online_mask is the dynamic subset of cpu_present_mask,
+indicating those CPUs available for scheduling.
+
+If HOTPLUG is enabled, then cpu_possible_mask is forced to have
+all NR_CPUS bits set, otherwise it is just the set of CPUs that
+ACPI reports present at boot.
+
+If HOTPLUG is enabled, then cpu_present_mask varies dynamically,
+depending on what ACPI reports as currently plugged in, otherwise
+cpu_present_mask is just a copy of cpu_possible_mask.
+
+(*) Well, cpu_present_mask is dynamic in the hotplug case. If not
+hotplug, it’s a copy of cpu_possible_mask, hence fixed at boot.
+</pre>
+
+<br/>
+<br/>
+<br/>
+
+The path to generate the irq affinity masks.
+<pre>
+ prev       affinity spreading     post
+ |- - - | - - - - - - - - - - - - | - - - -|
+ 
+ resv = prev + post
+
+pci_alloc_irq_vectors_affinity
+  -> __pci_enable_msix_range
+    -> irq_calc_affinity_vectors
+    --
+    ret = min_t(int, cpumask_weight(cpu_possible_mask), vecs) + resv;
+    <font color="red">by default, we prefer one-to-one mapping between hw queue and cpu</font>
+    --
+    -> __pci_enable_msix
+      -> msix_setup_entries
+        -> irq_create_affinity_masks
+</pre>
+
+Take an example here.
+<pre>
+
+4 irq vectors v0,v1,v2,v3.
+
+cpu topology
+
+               Node0                              Node1
+{ [core0, core2], [core1, core3]}  { [core0, core2], [core1, core3]}
+
+[] -> siblings
+
+</pre>
+There are two stages to spread the irqs.
+<ul>
+<li> spread the irq vectors across the NUMA nodes
+<pre>
+     every node will get two irq vectors
+     v0,v1  ->  Node0
+     v2,v3  ->  Node1
+</pre>
+<li> spread the irq vectors that have been assigned to a node across the cpus in
+     that node
+<pre>
+     v0  ->  Node0-core0,core2
+     v1  ->  Node0-core1,core3
+</pre>
+</ul>
+
+Before commit 84676c1f21 ("genirq/affinity: assign vectors to all possible CPUs") <br/>
+the irq vectors will be spread across the present cpus. So we may get following
+scenarios.
+
+<pre>
+               Node0                              Node1
+{ [core0, core2], [core1, core3]}  { [core0, core2], [core1, core3]}
+                                                        X      X
+[] -> siblings
+X  -> not present
+
+At most, 6 irq vectors could be allocated due to irq_calc_affinity_vectors
+v0,v1,v2,v3,v4,v5
+
+</pre>
+
+Let's look at how will the irq vectors be spread.
+<pre>
+    for_each_node_mask(n, nodemsk) {
+        int ncpus, v, vecs_to_assign, vecs_per_node;
+
+        /* Spread the vectors per node */
+        vecs_per_node = (affv - (curvec - affd->pre_vectors)) / nodes;
+        <font color="red">2 nodes, 6 vectors, vecs_per_node is 3 </font>
+        /* Get the cpus on this node which are in the mask */
+        cpumask_and(nmsk, cpu_present_mask, node_to_present_cpumask[n]);
+
+        /* Calculate the number of cpus per vector */
+        ncpus = cpumask_weight(nmsk);
+        <font color="red">node0 has 4 cpus</font>
+        vecs_to_assign = min(vecs_per_node, ncpus);
+        <font color="red">vecs_to_assign will be 3 here</font>
+        /* Account for rounding errors */
+        extra_vecs = ncpus - vecs_to_assign * (ncpus / vecs_to_assign);
+        <font color="red">extra_vecs is 1</font>
+        
+        
+        for (v = 0; curvec < last_affv && v < vecs_to_assign;
+             curvec++, v++) {
+            cpus_per_vec = ncpus / vecs_to_assign;
+            <font color="red">cpus_per_vec is 1</font>
+            /* Account for extra vectors to compensate rounding errors */
+            if (extra_vecs) {
+                cpus_per_vec++;
+                --extra_vecs;
+            }
+            <font color="red">node0 has 4 cpus, but 3 vectors are assigned to
+                it. so 1 vector will have 2 cpu assigned</font>
+            
+            irq_spread_init_one(masks + curvec, nmsk, cpus_per_vec);
+        }
+
+        if (curvec >= last_affv)
+            break;
+        --nodes;
+        <font color="red">
+        There are 3 vectors left, but node1 just have 2 cpu present.
+        
+        vecs_to_assign = min(vecs_per_node, ncpus);
+
+        Just 2 vectors could be assigned with cpu.
+        The left one's masks will get irq_default_affinity.
+        </font>
+
+    }
+done:
+    put_online_cpus();
+
+    /* Fill out vectors at the end that don't need affinity */
+    for (; curvec < nvecs; curvec++)
+        cpumask_copy(masks + curvec, irq_default_affinity);
+    free_node_to_possible_cpumask(node_to_possible_cpumask);
+out:
+    free_cpumask_var(nmsk);
+    return masks
+
+</pre>
+</font>
+</p
 
 </body>
 </html>

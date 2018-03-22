@@ -13,14 +13,166 @@
 <a href="#Concepts">Concepts</a><br/>
 <a href="#Implementation">Implementation</a>
 <ul>
+<li><a href="#LUN_Probe">LUN Probe</a>
 <li><a href="#Completion">Completion</a>
 <li><a href="#EH">Error Handler</a>
 </ul>
 </font>
 </p>
 
+<h2><a name="Concepts">Concepts</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+
+<strong>SCSI Model</strong>
+<pre>
+
+ Initiator                                Target
+ +------+                            +-------------------+
+ |      |                            |            +----+ |
+ |      |                            |         ,->| LU | |
+ |      |                            |        /   +----+ |
+ |   +-----+---+   Connecting    +---+ +---+ /    +----+ |
+ |   | HBA | P |- - - - - - - - -| P |-| R |- - ->| LU | |
+ |   +-----+---+                 +---+ +---+      +----+ |
+ |      |                            |             / \   |
+ +------+                            +------------/   \--+
+                                                /       \ 
+                                              /           \
+                                            /               \
+                                          /                   \
+                                         +---------------------+
+                                         |    Task Manager     |
+                                    [T]  |    +------------+   |
+                                  - - - - - ->| [T]        |   |
+                                         |    | [T]        |   |
+                                         |    | [T] [T] [T]|   | 
+                                         |    +------------+   |
+                                         |    Device Server    |
+                                         |    +------------+   |
+                                         |    |            |   |
+                                         |    +------------+   |
+                                         +-----------------------
+
+ Task/T       - scsi command
+ LU           - logic unit, SCSI targets have logical units that provide the processing context for SCSI commands.
+                The work of the logical unit is split between two different functionsthe device server and the task
+                manager.
+ Task Manager - The task manager is the work scheduler for the logical unit, determining the order in which commands
+                are processed in the queue.
+ Device Server- The device server executes commands received from initiators and is responsible for detecting and
+                reporting errors that might occur
+ Connecting   - sas/fc/iscsi
+ P            - connecting port, a NIC for iscsi
+ R            - task router
+</pre>
+<strong>Nexus Object</strong><br/>
+The nexus object describes the initiator/storage communication relationship.
+<ul>
+<li> Initiator/target (an I_T nexus)
+<li> Initiator/target/LUN (an I_T_L nexus)
+<li> Initiator/target/LUN/tag (an I_T_L_Q nexus)
+</ul>
+<pre>
+The type of nexus object used determines the number of concurrent commands that can be pending at any time. An I_T
+nexus allows only a single command between an initiator and a specific target. An I_T_L nexus allows a single command
+between an initiator and a specific logical unit. An I_T_L_Q nexus allows many possible commands to be pending, as
+long as the commands are tagged.
+</pre>
+<strong>Tagged Command Queuing</strong>
+<pre>
+The most important feature of tagging in SCSI is tagged command queuing (T CQ), a mechanism that allows the logical
+unit's task manager to reorder tasks to optimize the performance of a storage device or subsystem.Tagged command queuing was developed to optimize the performance of mechanical components in disk drives,
+particularly the disk arms and actuators. The basic idea is to reorder a group of commands to reduce the overall latency
+involved in seeking tracks on disk platters.
+Assume there are 20 tagged tasks in a task set, each with a directive to read or write data across a random distribution
+of tracks on disk media. W ithout the ability to rearrange tasks, the seek time latency would be the average seek time for
+the drive. Using command queuing, the tasks could be structured so the actuator moves the minimal amount for each
+task as it moves from one task's track to the track of its nearest neighbor.
+</pre>
+<br/>
+The logical unit number (LUN) identifies a specific logical unit.<br/>
+But LUN is not in the scsi cdb. How to use it to route to specific LU ?<br/>
+This is done by <font color="red">scsi transport layer</font>.<br/>
+Take iscsi as example:
+<pre>
+/* iSCSI PDU Header */
+struct iscsi_scsi_req {
+	uint8_t opcode;
+	uint8_t flags;
+	__be16 rsvd2;
+	uint8_t hlength;
+	uint8_t dlength[3];
+	struct scsi_lun lun;
+	itt_t	 itt;	/* Initiator Task Tag */
+	__be32 data_length;
+	__be32 cmdsn;
+	__be32 exp_statsn;
+	uint8_t cdb[ISCSI_CDB_SIZE];	/* SCSI Command Block */
+	/* Additional Data (Command Dependent) */
+};
+static int iscsi_prep_scsi_cmd_pdu(struct iscsi_task *task)
+{
+	...
+	hdr->opcode = ISCSI_OP_SCSI_CMD;
+	hdr->flags = ISCSI_ATTR_SIMPLE;
+	int_to_scsilun(sc->device->lun, &hdr->lun);//<font color="red">scsi_cmnd->device->lun</font>
+	task->lun = hdr->lun;
+	...
+}
+</pre>
+</font>
+</p>
+
+
+
 <h2><a name="Implementation">Implementation</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
+
+<h3><a name="LUN_Probe">LUN Probe</a></h3>
+<p>
+<font size="2">
+<pre>
+SCSI_SCAN_MANUAL
+
+scsi_scan
+  -> scsi_scan_host_selected
+    -> scsi_scan_channel
+      -> __scsi_scan_target
+        -> scsi_probe_and_add_lun <font color="red">//Scan LUN 0, if there is some response, scan further.</font>
+            ->scsi_alloc_sdev //the sdev associated with LUN 0
+                -> sdev->request_queue = scsi_mq_alloc_queue
+                -> shost->hostt->slave_alloc
+            -> scsi_probe_lun //<font color="red">probe a single LUN using a SCSI INQUIRY</font>
+                -> scsi_execute
+                <font color="blue">There is still no sd driver loaded now, how
+                to setup the command ?
+                The req op is REQ_OP_SCSI_OUT/IN here
+                scsi_mq_prep_fn
+                  -> scsi_setup_cmnd
+                    -> scsi_setup_scsi_cmnd // blk_rq_is_scsi
+                </font>
+            -> scsi_add_lun
+              -> set state to SDEV_RUNNING
+              -> shost->hostt->slave_configure(sdev);
+                -> scsi_sysfs_add_sdev
+                ...
+                  -> really_probe
+                    -> sd_probe
+                      -> async_schedule_domain(sd_probe_async, sdkp, &scsi_sd_probe_domain)
+        -> scsi_report_lun_scan
+          -> <font color="red">send out REPORT_LUNS to LUN0</font>
+          -> scsi_probe_and_add_lun based on REPORT_LUNS's result
+
+sd_probe_async()
+  -> add_disk()
+    -> register_disk()
+      -> bdget_disk() // <font color="red">other partitions will be scanned here</font>
+</pre>
+
+</font>
+</p>
 
 <h3><a name="Completion">Completion</a></h3>
 <p>
