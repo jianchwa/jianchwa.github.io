@@ -24,6 +24,7 @@
 <a href="#Queue_state_flags">Queue state flags</a><br/>
 <a href="#WBT">WBT</a><br/>
 <a href="#DISK_and_BLKDEV">DISK and BLKDEV</a><br/>
+<a href="#request_queue_cleanup_and_release">request_queue cleanup and release</a><br/>
 <a href="#blk_integrity">blk_integrity</a><br/>
 <a href="#blk-loop">blk loop</a>
 <ul>
@@ -32,7 +33,18 @@
 <li><a href="#DIO_AIO_on_backing_file">DIO & AIO on backing file</a>
 
 </ul>
-<a href="#blk-stats">blk-stats</a>
+<a href="#blk-stats">blk-stats</a><br/>
+<a href="#blk-timeout">blk-timeout</a><br/>
+<a href="#Bio_Stacked_Layer">Bio Stacked Layer</a>
+<ul>
+<li><a href="#Bio_based_DM">Bio based DM</a>
+<li><a href="#MD">MD</a>
+</ul>
+<a href="#blk-throttle">blk-throttle</a>
+<ul>
+<li><a href="#Basis">Basis</a></h4>
+<li><a href="#low_limit">low limit</a>
+</ul>
 </font>
 </p>
 
@@ -1049,6 +1061,87 @@ mount_bdev
 </font>
 </p>
 
+<h2><a name="request_queue_cleanup_and_release">request_queue cleanup and release</a></h2>
+<p>
+<font size="2">
+The first thing what blk_cleanup_queue need to do is to prevent others from
+entering blk path again. This is achieved by invoking blk_set_queue_dying.
+
+<pre>
+void blk_set_queue_dying(struct request_queue *q)
+{
+    blk_queue_flag_set(<font color="red">QUEUE_FLAG_DYING</font>, q);
+
+    /*
+     * When queue DYING flag is set, we need to block new req
+     * entering queue, so we call blk_freeze_queue_start() to
+     * prevent I/O from crossing blk_queue_enter().
+     */
+    blk_freeze_queue_start(q);
+
+    if (q->mq_ops)
+        blk_mq_wake_waiters(q);
+<font color="blue">
+    wake up the tag waiters.
+    the hw queues will be run.
+    DYING flag is not same with QUIESCED, the post one will prevent requests from
+    entering into lldd.
+</font>
+    else {
+    ...
+    }
+<font color="blue">
+    /* Make blk_queue_enter() reexamine the DYING flag. */
+</font>
+    wake_up_all(&q->mq_freeze_wq);
+}
+</pre>
+blk_queue_dying and blk_queue_enter will gate the other contexts out of blk
+path.<br/>
+<pre>
+blk_queue_dying gates:
+<ul>
+<li> sysfs interface
+<li> blk_execute_rq_nowait (looks like blk-mq doesn't do this)
+</ul>
+</pre>
+<br/>
+Then blk_cleanup_queue will invoke blk_freeze_queue. It will defense any new
+requests and also drained all the requests, no matter pending or outstanding.
+<br/>
+Even if all we have drained the queue, but there could be still contexts that
+will access the request_queue resources. such as blk-mq run work, requeue work
+<font color="red">blk_sync_queue</font> is used to flush them.<br/>
+<pre>
+void blk_sync_queue(struct request_queue *q)
+{
+    del_timer_sync(&q->timeout);
+    cancel_work_sync(&q->timeout_work);
+
+    if (q->mq_ops) {
+        struct blk_mq_hw_ctx *hctx;
+        int i;
+
+        cancel_delayed_work_sync(&q->requeue_work);
+        queue_for_each_hw_ctx(q, hctx, i)
+            cancel_delayed_work_sync(&hctx->run_work);
+    } else {
+        cancel_delayed_work_sync(&q->delay_work);
+    }
+}
+</pre>
+
+Finally, blk_put_queue put a reference of q->kobj.<br/>
+When the reference reaches zero, blk_queue_ktype.blk_release_queue will be invoked.
+It queue the __blk_release_queue which will do the final release. <br/>
+<br/>
+What need to be noted is the gendisk will take an extra ref on its request_queue
+in __device_add_disk and put it in disk_release. So the request_queue will sticks around as long as
+gendisk.<br/>
+</pre>
+</font>
+</p>
+
 
 <h2><a name="blk_integrity">blk_integrity</a></h2>
 <p>
@@ -1861,6 +1954,969 @@ void write_ext_stat(int curr, unsigned long long itv, int fctr,
 </font>
 </p>
 
+<h2><a name="blk-timeout">blk-timeout</a></h2>
+<p>
+<font size="2">
+There is a timer per request_queue to defense blk device no response.<br/>
+<pre>
+The timer is armed by blk_add_timer.
+The timer is request_queue.timeout and timeout fn is blk_rq_timed_out_timer.
+static void blk_rq_timed_out_timer(struct timer_list *t)
+{
+    struct request_queue *q = from_timer(q, t, timeout);
 
+    kblockd_schedule_work(&q->timeout_work);
+}
+</pre>
+The main stuff of timeout is executed in kworker context.<br/>
+There is a difference between blk-legacy and blk-mq.
+<pre>
+In blk-legacy, when arm the timer, the request will be added on request_queue.timeout_list.
+And when the request is completed, the request will be dequeued from it.
+blk_requeue_request/blk_finish_request
+  -> blk_delete_timer
+The blk_timeout_work will check the requests on request_queue.timeout_list.
+
+In blk-mq, the request_queue.timeout_list is not used any more, instead, it
+employ the blk_mq_queue_tag_busy_iter. It use the <font color="red">occupied
+driver tag</font> to track the requests.
+
+static bool bt_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+{
+    struct bt_iter_data *iter_data = data;
+    struct blk_mq_hw_ctx *hctx = iter_data->hctx;
+<font color="red">
+    struct blk_mq_tags *tags = hctx->tags;
+</font>
+    bool reserved = iter_data->reserved;
+    struct request *rq;
+
+    if (!reserved)
+        bitnr += tags->nr_reserved_tags;
+    rq = tags->rqs[bitnr];
+
+    /*
+     * We can hit rq == NULL here, because the tagging functions
+     * test and set the bit before assining ->rqs[].
+     */
+    if (rq && rq->q == hctx->queue)
+        iter_data->fn(hctx, rq, iter_data->data, reserved);
+    return true;
+}
+</pre>
+<font size="1" color="red">
+When there is no io scheduler, the request will always occupy a driver tag.
+If the lldd prevent new requests from entering through blk_mq_quiesce_queue or
+other ways, and the request_queue.timeout has been armed, will the requests in
+blk-mq queues be expired ?
+</font>
+<br/>
+So when a request is completed, we don't see blk_delete_timer in __blk_mq_complete_request
+or __blk_mq_end_request.
+<br/>
+<br/>
+Another difference is the method to handle <strong>Race between timeout
+completion and regular completion</strong><br/>
+blk-legacy employs blk_mark_rq_complete.
+<pre>
+void blk_complete_request(struct request *req)
+{
+    if (unlikely(blk_should_fake_timeout(req->q)))
+        return;
+    if (!blk_mark_rq_complete(req))
+        __blk_complete_request(req);
+}
+static void blk_rq_check_expired(struct request *rq, unsigned long *next_timeout,
+              unsigned int *next_set)
+{
+    const unsigned long deadline = blk_rq_deadline(rq);
+
+    if (time_after_eq(jiffies, deadline)) {
+        list_del_init(&rq->timeout_list);
+
+        /*
+         * Check if we raced with end io completion
+         */
+        if (!blk_mark_rq_complete(rq))
+            blk_rq_timed_out(rq);
+    } else if (!*next_set || time_after(*next_timeout, deadline)) {
+        *next_timeout = deadline;
+        *next_set = 1;
+    }
+}
+</pre>
+In blk-mq, after tejun's blk-mq: reimplement timeout handling
+(https://lkml.org/lkml/2018/1/9/761), blk_mark_rq_complete has been discarded. <br/>
+rcu/srcu is employed to synchronize between timeout path and regular completion
+path instead of atomic operations. In addition, it could avoid the following
+scenario below.
+<pre>
+blk_mq_check_expired
+---
+    deadline = READ_ONCE(rq->deadline);
+<font color="red">
+A delay introduced here by preempt or interrupt or other, during this, the rq is
+completed and freed, then got and reinitialized again by others.
+And we could timeout a new instance here.
+</font>
+    if (time_after_eq(jiffies, deadline)) {
+        if (!blk_mark_rq_complete(rq)) {
+            blk_mq_rq_timed_out(rq, reserved);
+        }
+---
+
+After tejun's commit, things become this:
+blk_mq_check_expired
+---
+    /* read coherent snapshots of @rq->state_gen and @rq->deadline */
+    while (true) {
+        start = read_seqcount_begin(&rq->gstate_seq);
+        gstate = READ_ONCE(rq->gstate);
+        deadline = blk_rq_deadline(rq);
+        if (!read_seqcount_retry(&rq->gstate_seq, start))
+            break;
+        cond_resched();
+    }
+<font color="red">
+A delay introduced here by preempt or interrupt or other, during this, the rq is
+completed and freed, then got and reinitialized again by others.
+</font>
+    /* if in-flight && overdue, mark for abortion */
+    if ((gstate & MQ_RQ_STATE_MASK) == MQ_RQ_IN_FLIGHT &&
+        time_after_eq(jiffies, deadline)) {
+        blk_mq_rq_update_aborted_gstate(rq, gstate);
+        data->nr_expired++;
+        hctx->nr_expired++;
+    } 
+---
+static void blk_mq_terminate_expired(struct blk_mq_hw_ctx *hctx,
+        struct request *rq, void *priv, bool reserved)
+{
+<font color="blue">
+    /*
+     * We marked @rq->aborted_gstate and waited for RCU.  If there were
+     * completions that we lost to, they would have finished and
+     * updated @rq->gstate by now; otherwise, the completion path is
+     * now guaranteed to see @rq->aborted_gstate and yield.  If
+     * @rq->aborted_gstate still matches @rq->gstate, @rq is ours.
+     */
+Note: the rcu/srcu synchronize is between blk_mq_check_expired and
+blk_mq_terminate_expired.
+</font>
+    if (!(rq->rq_flags & RQF_MQ_TIMEOUT_EXPIRED) &&
+        READ_ONCE(rq->gstate) == rq->aborted_gstate)
+<font color="red">
+There two parts of the gstate, generation and state.
+When we save the gstate to aborted_gstate, its state was MQ_RQ_IN_FLIGHT.
+If the recycle new instance has not been started, the state will not match,
+because it is MQ_RQ_IDLE, if started, the generation will not match, because the
+generation part of gstate will be increased when state switches to
+MQ_RQ_IN_FLIGHT.
+</font>
+        blk_mq_rq_timed_out(rq, reserved);
+}
+</pre>
+
+</font>
+</p>
+<h2><a name="Bio_Stacked_Layer">Bio Stacked Layer</a></h2>
+<p>
+<font size="2">
+It is bio-based dm and md where the generic_make_request mavbe invoked
+<strong>recursively</strong>. At the moment when generic_make_request is invoked
+recursively, the current->bio_list is not NULL, then the bio will be add on the
+tail of the list. However, there will be dependency issue in this case.
+<pre>
+
+current->bio_list Head <- bio0 <- bio1 <- bio2
+      |
+      v
+q->make_request_fn
+      |
+      v
+current->bio_list Head <- bio1 <- bio2 <font color="red"><- bio0a <- bio0b</font>
+
+What if the target driver must wait the bio0 to be compeleted before it handle
+bio1 ?
+(I cannot give a actual example here, but it should exist in the md or dm target
+ drivers.)
+
+And the correct scenario should be as following:
+
+current->bio_list Head <- bio0 <- bio1 <- bio2
+      |
+      v
+q->make_request_fn
+      |
+      v
+current->bio_list Head <font color="red"><- bio0a <- bio0b </font><- bio1 <- bio2
+
+Then bio0a and bio0b which come from bio0 could be handled prior to bio1 and bio2.
+This is excepted.
+
+</pre>
+<strong>How to achieve this ?</strong><br/>
+Look at generic_make_request.
+<pre>
+<font color="blue">
+bio_list_on_stack[0] contains bios submitted by the current make_request_fn.
+bio_list_on_stack[1] contains bios that were submitted before the current
+make_request_fn, but that haven't been processed yet.
+</font>
+    if (current->bio_list) {
+        bio_list_add(&current->bio_list[0], bio);
+        goto out;
+    }
+
+    BUG_ON(bio->bi_next);
+    bio_list_init(&bio_list_on_stack[0]);
+    current->bio_list = bio_list_on_stack;
+    do {
+        struct request_queue *q = bio->bi_disk->queue;
+        blk_mq_req_flags_t flags = bio->bi_opf & REQ_NOWAIT ?
+            BLK_MQ_REQ_NOWAIT : 0;
+
+        if (likely(blk_queue_enter(q, flags) == 0)) {
+            struct bio_list lower, same;
+
+            bio_list_on_stack[1] = bio_list_on_stack[0];
+            bio_list_init(&bio_list_on_stack[0]);
+            <font color="blue">Hand over the bios on list[0] to list[1], the
+                list[0] here is used to save the new bios generated during .make_request_fn</font>
+            ret = q->make_request_fn(q, bio);
+
+            blk_queue_exit(q);
+
+            /* sort new bios into those for a lower level
+             * and those for the same level
+             */
+            bio_list_init(&lower);
+            bio_list_init(&same);
+            while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+                if (q == bio->bi_disk->queue)
+                    bio_list_add(&same, bio);
+                else
+                    bio_list_add(&lower, bio);
+            <font color="red">
+            /* now assemble so we handle the lowest level first */
+            bio_list_merge(&bio_list_on_stack[0], &lower);
+            bio_list_merge(&bio_list_on_stack[0], &same);
+            bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+            </font>
+        } else {
+            if (unlikely(!blk_queue_dying(q) &&
+                    (bio->bi_opf & REQ_NOWAIT)))
+                bio_wouldblock_error(bio);
+            else
+                bio_io_error(bio);
+        }
+        bio = bio_list_pop(&bio_list_on_stack[0]); //<font color="blue">Get
+        request from the head of the list[0]</font>
+    } while (bio);
+    current->bio_list = NULL; /* deactivate */
+</pre>
+
+</font>
+</p>
+<h3><a name="Bio_based_DM">Bio based DM</a></h3>
+<p>
+<font size="2">
+<strong>dm_target or ti</strong>
+<pre>
+    /* target limits */
+    sector_t begin;
+    sector_t len;
+
+    /* If non-zero, maximum size of I/O submitted to a target. */
+    uint32_t max_io_len;
+    <font color="blue">
+    Why we need this ?
+    Consider the dm-stripe, if the stripe is 128K, the max_io_len here
+    is 128k. Or we can say the dm_target is stripped by this max_io_len.
+    </font>
+      ti.begin                           ti.begin + ti.len
+            | _ _ _ | _ _ _ | _ _ _ | _ _ _ |
+                    \_ _ _ _/
+                        v
+                  ti.max_io_len
+</pre>
+<strong>max_io_len()</strong> will return the max io length that could be issued
+from specific sector. It will guarantee:
+<ul>
+<li> no io is bigger than ti.max_io_len
+<li> no io stretches over two blocks aligned with ti.max_io_len
+</ul>
+__split_and_process_bio will split the bio based on max_io_len.
+<pre>
+dm_make_request
+  -> __dm_make_request
+    -> __split_and_process_bio
+    --
+        while (ci.sector_count && !error) {
+            error = __split_and_process_non_flush(&ci);
+                     -> __clone_and_map_data_bio
+                       -> __map_bio
+                         -> generic_make_request
+                     -> ci->sector += len
+                     -> ci->sector_count -= len
+            ...
+        }
+    --
+</pre>
+<br/>
+<strong>cloned bio</strong>
+<pre>
+              dm_io
+             +------+
+             |      | -> md  (dm device)
+             |      | -> io_count (count of cloned bio)
+             |      | -> orig_bio
+             +------+- - - +-----+
+             |  tio |      |     | -> io (father dm_io)
+             +------+,     |     | -> ti
+                      \    |     | -> inside_dm_io (true for embedded tio)
+                       \   +-----+
+                        \  |clone| (embedded cloned bio)
+                         '-+-----+
+
+Note: most of time, there will be only one cloned bio
+      then the embedded tio will be use. otherwise, new
+      tio will be allocated, its father dm_io.io_count
+      will be increased to count this.
+
+</pre>
+cloned bios share the same original bio's biovec, but they will point to
+different part. this is done in clone_bio.
+<pre>
+static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+             sector_t sector, unsigned len)
+{
+    struct bio *clone = &tio->clone;
+
+    __bio_clone_fast(clone, bio);
+
+    ...
+
+    if (bio_op(bio) != REQ_OP_ZONE_REPORT)
+        <font color="red">bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));</font>
+    clone->bi_iter.bi_size = to_bytes(len);
+    ...
+    return 0;
+}
+</pre>
+other other hand, cloned bios may point to different disk.
+this is done by ti->type->map() callback. <br/>
+<strong><font color="red">the original bio will stay in dm layer, the cloned bio
+will be issued to do the real io on behalf of original bio. when all the cloned
+bio are completed, the original bio could be able to be completed.</font></strong>
+<pre>
+Before submit the clone bio, __map_bio will assign it a bi_end_io, clone_endio.
+clone_endio
+  -> dec_pending
+ --
+     if (atomic_dec_and_test(&io->io_count)) {
+        ...
+        io_error = io->status;
+        bio = io->orig_bio;
+        end_io_acct(io);
+        free_io(md, io);
+
+        if (io_error == BLK_STS_DM_REQUEUE)
+            return;
+
+        if ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size) {
+            /*
+             * Preflush done for flush with data, reissue
+             * without REQ_PREFLUSH.
+             */
+            bio->bi_opf &= ~REQ_PREFLUSH;
+            queue_io(md, bio);
+        } else {
+            /* done with normal IO or empty flush */
+            if (io_error)
+                bio->bi_status = io_error;
+            bio_endio(bio);
+        }
+    }
+
+ --
+</pre>
+</font>
+</p>
+<h3><a name="MD">MD</a></h3>
+
+
+<h3><a name="blk-throttle">blk-throttle</a></h3>
+
+<h4><a name="Basis">Basis</a></h4>
+<p>
+<font size="2">
+
+<pre>
+                               generic_make_request
+                                       |
+                                       V
+   tg_A->sq->queued (qn_A_r_self (bio, bio, bio))    tg_B->sq->queued (qn_B_r_self (bio, bio, bio))
+                                       |   
+                                       V
+                 tg_ABg->sq->queued (qn_ABg_r_self(bio, bio) qn_A_r_parent (bio), qn_B_r_parent (bio bio))
+                                        |
+                                        V
+                             td->sq->queued (qn_ABg_r_parent(bio))
+                                        | 
+                                        V                                 
+                                generic_make_request (td->dispatch_work context)
+
+                                bio (w/ BIO_THROTTLED) will not pass
+                                through blk-throttle again.
+
+qn  per-tg, contains throttled bios.
+    when dispatch bios, qn by qn, rather than bio by bio, otherwise, one tg could
+    fill up the budget and starve others. (throtl_pop_queued)
+    There are two dimensions of qn.
+    r/w , when dispatch, 75% read, 25% write (throtl_dispatch_tg)
+    self/parent, during dispatching, some bios maybe queued upwards to parent's
+    sq, some others not. At the moment, parent qn is used to contained ther bios
+    queued to parent's sq, self qn contains others.
+
+sq  throtl_service_queue, per-tg or td
+    construct the hierarchy, td->sq is the root node
+    queued throl_qnode
+    first_pending_disptime
+    pending_timer, dispatch bios upwards to parent sq until td->sq, queue td dispatch_work
+
+tg  throtl_grp, per (blk-throt cgroup - request_queue)
+    bps,iops limits, bytes, ios dispatched number
+
+td  throtl_data, per-request_queue
+    queued[r/w] qn list, only the bios that has reached here could be issued.
+    dispatch_work, generic_make_request
+    limit_index (LOW/MAX)
+</per>
+
+
+How to account the bps and iops ? <br/>
+<pre>
+                            current
+                               |
+ tg->slice_start               v         tg->slice_end
+          |-------|------|-------|------| ....
+          |< - - - -   - - - - ->|
+                     V
+                elapsed_rnd
+
+
+          limit = tg_bps/iops_limit(tg, rw) * elapsed_rnd
+
+
+
+| - - - |  td->throtl_slice
+Refer to tg_with_in_tg/iops_limit
+</pre>
+When the tg->bytes/io_disp is over the limit:
+<pre>
+blk_throtl_bio
+  -> throtl_add_bio_tg
+    -> set THROTL_TG_WAS_EMPTY when sq->nr_queued == 0
+    -> throtl_qnode_add_bio(bio, qn, &sq->queued[rw]);
+      -> add bio to qn, add qn to sq
+      -> blkg_get(tg_to_blkg(qn->tg))
+         <font color="red">throttled bio dispatching is an asynchronous event,
+         we need a reference of blkg to prevent it to be freed
+         </font>
+    -> add tg to parent sq pending rb tree with tg->disptime as key
+  if THROTL_TG_WAS_EMPTY is set
+  -> tg_update_disptime
+  <font color="blue">
+  next dispatch time will be calculated here through tg_may_dispatch
+  </font>
+  -> throtl_schedule_next_dispatch(<font color="red">tg->service_queue.parent_sq</font>, true);
+    -> update_min_dispatch_time
+      -> pick up the leftest node from the parent sq pending rb tree
+         and update parent_sq->first_pending_disptime
+      -> throtl_schedule_pending_timer
+        -> schedule parent_sq pending_timer on first_pending_disptime
+</pre>
+
+Think of a case here:<br/>
+A bio is throttled and its dispatch time is 5 jiffies. What if a new bio comes
+in with a 3 jiffies dispatch time ?
+<pre>
+Why does every tg need a dispatch time ?
+
+bio size
+        ^
+        |  o - bio
+        |
+        |                o2
+        |                |     o3
+        |  o0   o1       |     |
+        |   |   |        |     |
+        +-----------------------------------------> time
+                t0       t1
+if we issue the o2 on t0, the bps limit will be reached, we have to delay it to
+t1, then bps limit could be complied.
+
+
+Howeve, what if the following case:
+
+bio size
+        ^
+        |  o - bio
+        |
+        |                o2 (planed)
+        |                |     
+        |  o0   o1o3     |    
+        |   |   | |      |     
+        +-----------------------------------------> time
+                t0       t1
+
+We have schedule the parent_sq pending timer to t1 to dispatch o2, when we have
+a o3 on t0, the pending_timer need to expire ahead to disaptch o3, otherwise, o3
+is delayed. How to handle this case in blk-throtl ?
+
+No such kind of issue
+Except for o3 has a higher priority than o2. What does blk-throl do here is to
+limit the bps.
+In fact, blk-throtl maintain the rq_list of read and write separately, so write
+bios will not block read bios. And blk-throtl will try to dispatch 75% READS and
+25% WRITES, refer to throtl_dispatch_tg.
+</pre>
+
+We have illustrated the hierarchy structure of blk-throtl. Let's walk through
+the source code here.
+<pre>
+submit path
+generic_make_request
+  -> generic_make_request_checks
+    -> blkcg_bio_issue_check
+      -> blk_throtl_bio
+---
+    while (true) {
+        if (tg->last_low_overflow_time[rw] == 0)
+            tg->last_low_overflow_time[rw] = jiffies;
+        throtl_downgrade_check(tg);
+        throtl_upgrade_check(tg);
+<font color="red">/* throtl is FIFO - if bios are already queued, should queue */</font>
+        if (sq->nr_queued[rw])
+            break;
+
+        /* if above limits, break to queue */
+        if (!tg_may_dispatch(tg, bio, NULL)) {
+            tg->last_low_overflow_time[rw] = jiffies;
+            if (throtl_can_upgrade(td, tg)) {
+                throtl_upgrade_state(td);
+                goto again;
+            }
+            break;
+        }
+
+        /* within limits, let's charge and dispatch directly */
+        throtl_charge_bio(tg, bio);
+
+<font color="blue">        /*
+         * We need to trim slice even when bios are not being queued
+         * otherwise it might happen that a bio is not queued for
+         * a long time and slice keeps on extending and trim is not
+         * called for a long time. Now if limits are reduced suddenly
+         * we take into account all the IO dispatched so far at new
+         * low rate and * newly queued IO gets a really long dispatch
+         * time.
+         *
+         * So keep on trimming slice even if bio is not queued.
+         */ </font>
+        throtl_trim_slice(tg, rw);
+
+        /*
+         * @bio passed through this layer without being throttled.
+         * Climb up the ladder.  If we''re already at the top, it
+         * can be executed directly.
+         */
+        qn = &tg->qnode_on_parent[rw];
+        sq = sq->parent_sq;    // <font color="red">check limit upward</font>
+        tg = sq_to_tg(sq);
+        if (!tg)
+            goto out_unlock;
+    }
+---
+
+Dispatch path:
+
+static void throtl_pending_timer_fn(struct timer_list *t)
+{
+    ...
+again:
+    parent_sq = sq->parent_sq;
+    dispatched = false;
+
+    while (true) {
+        throtl_log(sq, "dispatch nr_queued=%u read=%u write=%u",
+               sq->nr_queued[READ] + sq->nr_queued[WRITE],
+               sq->nr_queued[READ], sq->nr_queued[WRITE]);
+
+        ret = throtl_select_dispatch(sq);
+          -> throtl_dispatch_tg // if tg_may_dispatch
+            -> tg_dispatch_one_bio
+              -> throtl_pop_queued
+              -> throtl_charge_bio
+              -> <font color="red">add to sq of parent tg or td</font>
+        if (ret) {
+            throtl_log(sq, "bios disp=%u", ret);
+            dispatched = true;
+        }
+
+        <font color="green">there maybe still queued bio in the tg</font>
+        if (throtl_schedule_next_dispatch(sq, false))
+            break;
+
+        /* this dispatch windows is still open, relax and repeat */
+        spin_unlock_irq(q->queue_lock);
+        cpu_relax(); //<font color="red">give some others chances to get in.
+        queued spinlock will ensure the waiters to get this lock in turn.</font>
+        spin_lock_irq(q->queue_lock);
+    }
+
+    if (!dispatched)
+        goto out_unlock;
+
+    if (parent_sq) {
+        /* @parent_sq is another throl_grp, propagate dispatch */
+        if (tg->flags & THROTL_TG_WAS_EMPTY) {
+            tg_update_disptime(tg);
+            if (!throtl_schedule_next_dispatch(parent_sq, false)) {
+                /* window is already open, repeat dispatching */
+                sq = parent_sq;
+                tg = sq_to_tg(sq);
+                goto again;
+            }
+        }
+    } else {
+        <font color="red">/* reached the top-level, queue issueing */</font>
+        queue_work(kthrotld_workqueue, &td->dispatch_work);
+    }
+out_unlock:
+    spin_unlock_irq(q->queue_lock);
+}
+
+
+</pre>
+<br/>
+<br/>
+</p>
+</font>
+
+
+<h4><a name="low_limit">low limit</a></h4>
+<p>
+<font size="2">
+io.low limit is only available in cgroup2. cgroup with a io.max limit will never
+dispatch more IO than its max limit, but it cannot ensure the cgroup always has
+a appropriate bps or iops. For example:
+<pre>
+tasks in cgroup_read have very high read workload, and tasks in cgroup_write
+have very high write workload. They both issues requests on a same disk with wbt
+enabled. The writes operations will be limitted due to wbt and IO performance in
+cgroup_write will be very pool when cgroup_read always issues read operations.
+
+These two cgroup both don't exceed the io.max, but cgroup_write has a very pool
+performance. This is not fair for cgroup_write.
+
+Or another example from https://lwn.net/Articles/709474/
+
+An example usage is we have a high prio cgroup with high 'low' limit and a low
+prio cgroup with low 'low' limit. If the high prio cgroup isn't running, the low
+prio can run above its 'low' limit, so we don't waste the bandwidth. When the
+high prio cgroup runs and is below its 'low' limit, low prio cgroup will run
+under its 'low' limit. This will protect high prio cgroup to get more
+resources.
+</pre>
+The final destination is to limit the bps/iops between io.low ~ io.max.<br/>
+
+There are two questions that need to be figured out.<br/>
+
+
+
+
+<strong>When to switch to io.low limit</strong>
+<pre>
+Related varaibles in tg
+<ul>
+<li> last_check_time
+<li> last_bytes/io_disp[R/W] (throtl_charge_bio)
+<li> last_low_overflow_time[R/W] 
+</ul>
+Check the bps or iops through last_bytes/io_disp/(jiffies - last_check_time)
+If the result > io.low limit, set last_low_overflow_time, which means the
+bps/iops is higher than io.low during the last period.
+
+If jiffies >= tg->last_low_overflow_time + td->throtl_slice, we say the io.low
+limit is reached.
+
+This is done by throtl_downgrade_check.
+
+throtl_downgrade_state switches the limit to LOW.
+
+static void throtl_downgrade_state(struct throtl_data *td, int new)
+{
+    td->scale /= 2;
+
+    throtl_log(&td->service_queue, "downgrade, scale %d", td->scale);
+    if (td->scale) {
+        td->low_upgrade_time = jiffies - td->scale * td->throtl_slice;
+        return;
+    }
+
+    td->limit_index = new;
+    td->low_downgrade_time = jiffies;
+}
+</pre>
+
+<strong>After switch to io.low limit, when to get back to io.max ?</strong>
+<pre>
+When swith to io.low limit,
+blk_throtl_bio -> tg_may_dispatch -> tg_with_in_bps_limit -> tg_bps_limit will
+return the io.low limit through tg->bps[rw][td->limit_index]
+then more bios will be throttled and queued.
+
+
+last_low_overflow_time ( bps/iops is higher than limit) is updated in following
+
+              if limit_index == MAX
+ ^                throttled and queued,   blk_throtl_bio updates last_low_overflow_time
+ |                
+ |           ----------------------------------------------   LIMIT_MAX
+ |
+ |           if limit_index == MAX
+ |              charge and dispatch,    throtl_downgrade_check updates last_low_overflow_time
+ |disp       if limit_index == LOW
+ |bps/          throttled and queue,    blk_throtl_bio updates last_low_overflow_time
+ |iops       
+ |
+ |
+ |            ----------------------------------------------  LIMIT_LOW
+ |             if limit_index == MAX && time_after(now, last_low_overflow_time + throtl_slice)
+ |               downgrade
+ |             if limit_index == LOW
+ |                 charge and dispatch
+ |             if limit_index == LOW && time_after(now, last_low_overflow_time + throtl_slice)
+                upgrade
+position:
+<li> throtl_downgrade_check ( only make sense when LIMIT_MAX)
+<li> tg_may_dispatch return returns false, which indicates bps/iops is above no
+matter MAX or LOW
+<li> before queue throttled bio, tg_may_dispatch maybe skipped due to
+sq->nr_queued > 0
+
+<font color="red">
+Are the 2nd and 3rd cases necessary ?
+last_low_overflow_time indicates the bps/iops is above low limit during the past
+period of time. For 2nd and 3rd cases, if the limit_index is MAX, beyond
+question, bps/iops is above the low limit, because the blk-throtl pending time
+will ensure the dispatching bps/iops is equal max limit. However, if the
+limit_index is LOW, when the bio is throtled and queued, it indicates the submit
+bps/iops is above low limit, not dispatch, which one will be ensured to be equal
+to low limit.
+</font>
+<font color="red">
+   submit bps/iops is                             dispatch bps/iops 
+   above limit                                    is equal to limit
+</font>
+   vfs                   push               pop   sq->pending_timer
+   blk_throtl_bio       ---->  sq->queued[] ---->    throtl_dispatch_tg
+     sq->nr_queued > 0                                tg_dispatch_one_bio (charge, queue up, trim)
+       throtl_add_bio_tg
+
+
+
+The condition to switch to MAX
+throtl_upgrade_check
+--
+    if (time_after(tg->last_check_time + tg->td->throtl_slice, now))
+        return;
+
+    tg->last_check_time = now;
+--
+  ...
+  -> throtl_tg_can_upgrade
+    -> time_after_eq(jiffies, tg_last_low_overflow_time(tg) + tg->td->throtl_slice)
+       && throtl_tg_is_idle(tg))
+      ^^^^
+      Should it be a '||' ?
+
+
+
+throtl_upgrade_state does the real work.
+static void throtl_upgrade_state(struct throtl_data *td)
+{
+    struct cgroup_subsys_state *pos_css;
+    struct blkcg_gq *blkg;
+
+    throtl_log(&td->service_queue, "upgrade to max");
+    td->limit_index = LIMIT_MAX;
+    td->low_upgrade_time = jiffies;
+    td->scale = 0;
+    rcu_read_lock();
+    blkg_for_each_descendant_post(blkg, pos_css, td->queue->root_blkg) {
+        struct throtl_grp *tg = blkg_to_tg(blkg);
+        struct throtl_service_queue *sq = &tg->service_queue;
+
+        tg->disptime = jiffies - 1; //<font color="blue">force this tg to be dispatched </font>
+        throtl_select_dispatch(sq); //<font color="blue">Move the bios of child tgs upward</font>
+        throtl_schedule_next_dispatch(sq, true);
+    }
+    rcu_read_unlock();
+    //<font color="blue">Dispatch !!! </font>
+    throtl_select_dispatch(&td->service_queue);
+    throtl_schedule_next_dispatch(&td->service_queue, true);
+    queue_work(kthrotld_workqueue, &td->dispatch_work);
+}
+
+After the the io limit upgrades, blk-throtl tries to dispatch the bios more
+smoothly.
+
+Let's look at tg_bps_limit and throtl_adjusted_limit.
+---
+if (td->limit_index == LIMIT_MAX && tg->bps[rw][LIMIT_LOW] &&
+        tg->bps[rw][LIMIT_LOW] != tg->bps[rw][LIMIT_MAX]) {
+        uint64_t adjusted;
+
+        adjusted = throtl_adjusted_limit(tg->bps[rw][LIMIT_LOW], td);
+        ret = min(tg->bps[rw][LIMIT_MAX], adjusted);
+    }
+
+---
+static uint64_t throtl_adjusted_limit(uint64_t low, struct throtl_data *td)
+{
+    /* arbitrary value to avoid too big scale */
+    if (td->scale < 4096 && time_after_eq(jiffies,
+        td->low_upgrade_time + td->scale * td->throtl_slice))
+        td->scale = (jiffies - td->low_upgrade_time) / td->throtl_slice;
+
+    return low + (low >> 1) * td->scale;
+}
+throtl_adjusted_limit will re-balance the bandwidth between tgs.
+
+throtl_upgrade_state has updated td->scale and td->low_upgrade_time.
+
+so the limit will not reach to io.max immediately after
+throtl_upgrade_state. The actual limit is:
+
+limit = low + (low >> 1) * (now - td->low_upgrade_time)/td->throtl_slice
+
+<font color="red"> The tg that has higher low limit will get more bandwidth because it has
+higher growing limit, so this should be the core idea of io.low</font>
+</pre>
+
+
+
+<strong>When the cgroup is free even idle, it indeed stay below the io.low limit,
+    but it should not count. How to tell this ? </strong>
+<pre>
+Quote from comment of throtl_tg_is_idle:
+<font color="blue">
+cgroup is idle if:
+- single idle is too long, longer than a fixed value (in case user
+  configure a too big threshold) or 4 times of idletime threshold
+- average think time is more than threshold
+- IO latency is largely below threshold
+</font>
+
+<strong>Think time</strong><br/>
+The interval between the completion of previous IO and submitting of next IO.
+blk_throtl_bio_endio will record the time of completion in tg->last_finish_time.
+Then in blk_throtl_bio -> blk_throtl_update_idletime, the average think time
+will be calculated.
+
+static void blk_throtl_update_idletime(struct throtl_grp *tg)
+{
+    unsigned long now = ktime_get_ns() >> 10;
+    unsigned long last_finish_time = tg->last_finish_time;
+
+    if (now <= last_finish_time || last_finish_time == 0 ||
+        last_finish_time == tg->checked_last_finish_time)
+        return;
+
+    tg->avg_idletime = (tg->avg_idletime * 7 + now - last_finish_time) >> 3;
+    tg->checked_last_finish_time = last_finish_time;
+}
+
+<strong>Latency</strong><br/>
+The latency here is the interval between issuing request to device and completion of the request.
+This is based on the processing capability of the storage device.
+If a cgroup's IO latency is blow the IO latency threshold, it means this cgroup
+is handled by device fairly.
+<font color="red">My question is: if one cgroup is below the low limit, but its
+IO latency is acceptable, we could say this cgroup is served by device fairly,
+but not served fairly by block layer, right ?</font>
+
+commit comment of b9147dd (blk-throttle: add a mechanism to estimate IO latency)
+
+User configures latency target, but the latency threshold for each
+request size isn't fixed. <font color="red">For a SSD, the IO latency highly depends on
+request size. To calculate latency threshold, we sample some data, eg,
+average latency for request size 4k, 8k, 16k, 32k .. 1M.</font> The latency
+threshold of each request size will be the sample latency (I'll call it
+base latency) plus latency target. For example, the base latency for
+request size 4k is 80us and user configures latency target 60us. The 4k
+latency threshold will be 80 + 60 = 140us.
+
+To sample data, we calculate the order base 2 of rounded up IO sectors.
+If the IO size is bigger than 1M, it will be accounted as 1M. Since the
+calculation does round up, the base latency will be slightly smaller
+than actual value. Also if there isn't any IO dispatched for a specific
+IO size, we will use the base latency of smaller IO size for this IO
+size.
+
+But we shouldn't sample data at any time. <font color="red">The base latency is supposed
+to be latency where disk isn't congested</font>, because we use latency
+threshold to schedule IOs between cgroups. If disk is congested, the
+latency is higher, using it for scheduling is meaningless. Hence we only
+do the sampling when block throttling is in the LOW limit, with
+assumption disk isn't congested in such state. If the assumption isn't
+true, eg, low limit is too high, calculated latency threshold will be
+higher.
+
+Hard disk is completely different. Latency depends on spindle seek
+instead of request size. <font color="red">Currently this feature is SSD
+only,</font> we probably
+can use a fixed threshold like 4ms for hard disk though.
+
+td will have average latency for echo size separately, every tg has its own
+latency_target, ITOW, a tolerance.
+<font color="red">For SSD, when the td's average latency is low, we could say the device is
+relatively relaxed.</font>
+This explains why it is '&&' throtl_tg_is_idle, which means the device fall into
+idle.
+
+The samples collection is hooked in blk_stat_add.
+blk_stat_add //the latency here is the interval between blk_mq_start_request and __blk_mq_complete_request
+  -> blk_throtl_stat_add
+    -> throtl_track_latency
+static void throtl_track_latency(struct throtl_data *td, sector_t size,
+    int op, unsigned long time)
+{
+    struct latency_bucket *latency;
+    int index;
+
+    if (!td || td->limit_index != LIMIT_LOW ||
+        !(op == REQ_OP_READ || op == REQ_OP_WRITE) ||
+        !blk_queue_nonrot(td->queue))
+        //<font color="blue">We assume there is no congestion when LIMIT_LOW,
+        //and the latency make sense only when there is no congestion in device</font>
+        return;
+
+    index = request_bucket_index(size);
+
+    latency = get_cpu_ptr(td->latency_buckets[op]);
+    latency[index].total_latency += time;
+    latency[index].samples++;
+    put_cpu_ptr(td->latency_buckets[op]);
+}
+
+</pre>
+
+
+</font>
+</p>
 </body>
 </html>

@@ -286,6 +286,58 @@ out:
     return masks
 
 </pre>
+
+Here is one case that a patch I sent to upstream causes a big bug when block layer maintainer tested it. <br/>
+<pre>
+This is the patch https://lkml.org/lkml/2018/3/13/227
+What is the issue ?
+It employs "pre_vector=1" when allocate irq vectors, and  assign separate irq vectors for adminq and ioq1.
+So nvme io queues will get a irq vector <font color="red">which is equal to its qid</font>. But I missed 
+the blk_mq_pci_map_queues() which still thinks the <font color="red">irq vector is equal to qid-1</font>.
+
+To reproduce this issue we must add "possible_cpus=16" on the kernel commandline  and boot it on my machine with
+8 cores. Then we will get following irq affinity result.
+nvme0q1   nvme0q2   nvme0q3    nvme0q4    nvme0q5    nvme0q6     nvme0q7    nvme0q8
+0,4       1,5       2,6        3,7        8-9        10-11       12-13      14-15
+We could see irqs of nvme0q5~nvme0q8 are set affinity to not present cpu.
+This is due to 84676c1f21 ("genirq/affinity: assign vectors to all possible CPUs")
+Leiming has submitted a series patch to fix it.
+genirq/affinity: irq vector spread among online CPUs as far as possible
+
+Let's return to our issue.
+int blk_mq_pci_map_queues(struct blk_mq_tag_set *set, struct pci_dev *pdev)
+{
+    const struct cpumask *mask;
+    unsigned int queue, cpu;
+    /*<font color="red">0 based here, the mask for vector 0 contains all the possible cpus.
+    so it will do a wrong mapping between ctxs and hctxs.
+    </font>*/
+    for (queue = 0; queue < set->nr_hw_queues; queue++) {
+            mask = pci_irq_get_affinity(pdev, queue);
+            if (!mask)
+                goto fallback;
+
+        for_each_cpu(cpu, mask)
+            set->mq_map[cpu] = queue;
+    }
+
+	return 0;
+...
+}
+We get a mapping as following:                             |
+                                                           V
+ctxs            14,15     0,4       1,5        2,6        3,7        8,9         10,11      12,13
+                hctx0     hctx1     hctx2      hctx3      hctx4      hctx5       hctx6      hctx7
+                nvme0q1   nvme0q2   nvme0q3    nvme0q4    nvme0q5    nvme0q6     nvme0q7    nvme0q8
+cpu affinitys   0,4       1,5       2,6        3,7        8-9        10-11       12-13      14-15
+
+The issue is:
+if we submit IO on cpu3 or cpu7, hctx4/nvme0q5 will handle it. After completion, the irq will be sent to 8,9 which are
+not present on my machine.
+taskset -c 3 dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1
+And get following log in dmesg
+[  350.800366] nvme nvme0: I/O 253 QID 5 timeout, completion polled
+</pre>
 </font>
 </p
 

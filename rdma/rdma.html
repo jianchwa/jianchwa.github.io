@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RDMA</title>
+</head>
+<body>
+<div>
+    <h1>RDMA</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Concepts">Concepts</a><br/><br/>
+<a href="#A_Transfer_Example">A Transfer Example</a><br/>
+<a href="#Software_ROCE">Software ROCE</a><br/>
+<ul>
+<li><a href="#components_of_rxe">component of rxe</a>
+<ul>
+<li><a href="#rxe_task">rxe_task</a>
+<li><a href="#rxe_udp_tunnel">rxe udp tunnel</a>
+</ul>
+<li><a href="#rxe_framework">rxe framework</a>
+</ul>
+
+</font>
+</p>
+
+
+<h2><a name="Concepts">Concepts</a></h2>
+<p>
+<font size="2">
+<pre>
+Upper Level Protocols:
+Categorize ULPs into different categories:
+Network
+• IPoIB (IP over IB)
+• SDP (Socket Direct Protocol)
+• WSD (Winsock Direct for windows)
+Storage
+• NFS over RDMA
+• SCSI RDMA Protocol (SRP)
+• iSCSI Extensions for RDMA (iSER)
+Computing – Clustering
+• MPI (Message Passing Interface)
+</pre>
+<strong>IB Software Transport Interface</strong><br/>
+<pre>
+<strong>Channel Interface (CI)</strong>
+A combination of hardware, firmware, and software which provides services to the host
+
+<strong>Verbs</strong>
+Operations which a CI is expected to perform
+
+<strong>Queue Pair (QP)</strong>
+Represents communications endpoint, like a socket
+Consists of a SEND Queue and a RECEIVE Queue
+<ul>
+<li> Create
+<li> Modify
+<li> Query
+<li> Destroy
+</ul>
+
+<strong>Work Request Element (WQE)</strong>
+requests communications operation
+<ul>
+<li> Post Send
+<li> Post Receive
+</ul>
+
+<strong>Completion Queue (CQ)</strong>
+provides completed operation status
+<ul>
+<li> Create
+<li> Query
+<li> Resize
+<li> Destroy
+<li> Poll for Completion
+<li> Request Completion
+<li> Notification
+<li> Set Completion Event Handler
+</ul>
+
+Memory Regions: system memory is “registered” to allow access to local and remote channel 
+adapters to source/sink communications data
+
+
+</pre>
+</font>
+</p>
+
+<h2><a name="A_Transfer_Example">A Transfer Example</a></h2>
+<p>
+<font size="2">
+<pre>
+requester QP's SQ Logic (L) in CA X will read a 5KB message from its local memory and send it to the target responder QP's RQ Logic (Q) in CA Y.
+                           CQ                   CQ
+                           SQ                   RQ 
+                           QP                   QP
+                         CA  X       ---      CA  Y
+
+upon receipt of the message data, the responder QP's RQ Logic will use the top entry of (WQE) posted to its RQ to determine where to write
+the incomming data in its CA's local memory.
+
+<strong>Step 1</strong></front>Posting the Message Receive Request<br/>
+the software application in CA Y has posted a WR prior to the receipt of the first request packet of the Send operation
+this WR is supplied to the CA Y's QP SQ by executing <font color="red">Post Receive Request</font> Verb call. It need following parameter:
+<ul>
+<li> QP handle (identify whose RQ the WR is to be posted)
+<li> A unique 64-bit WR ID (it will be deposited in the completion entry that is created on the RQ's CQ once all of the data has been written to
+the CA Y's local memory)
+<li> the operation type
+<li> scatter buffer list (identify the memory buffer where the inbound message will be written to)
+</ul>
+                           CQ                   CQ
+                           SQ                   RQ -> WRE (Receive)
+                           QP                   QP
+                         CA  X       ---      CA  Y
+
+<strong>Step 2</strong></front>Posting the Message Send Request<br/>
+the software application in the CA X post a WR on the QP's SQ through <font color="red">Post Send Request</font> Verb call
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+                           QP                   QP
+                         CA  X       ---      CA  Y
+
+<strong>Step 3</strong></front>'Send first' Request Packet Send<br/>
+Construct the packet based on the PMTU and the scatter buffer list in WRE. Send to CA Y through underlayer port.
+
+             PMTU 2KB
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+             PSN 101                            ePSN 100
+                           QP                   QP
+                         CA  X       --->     CA  Y
+                           Send First 2KB PSN==100
+
+Upon the QP RQ in CA Y receive this Send, it will check whether there is a WRE on RQ, if not, it will send a RNR ACK to the CA X's QP SQ.
+Send a positive ACK.
+Write the data in the send first packet based on the WRE on the RQ to the CA Y's local memory.
+
+<strong>Step 4</strong></front>First ACK Packet returned<br/>
+             PMTU 2KB
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+             PSN 101                            ePSN 101
+                           QP                   QP
+                         CA  X      <---      CA  Y
+                            First ACK PSN==100
+
+<strong>Step 5</strong></front>"Send Middle" Request Packet Sent and Ack returned<br/>
+<font color="red">
+Noted: the SQ's logci doesn't wait for the ACK for the just issued request packet to arrive before it launches the next request into fabrics.
+</font>
+             PMTU 2KB
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+             PSN 102                            ePSN 101
+                           QP                   QP
+                         CA  X      --->      CA  Y
+                            Send Middle 2KB PSN==101
+Once the CA Y receives the send middle packet:
+if the packet's PSN is greater than the ePSN, send back a PSN Sequence Error NAK
+if the packets' PSN fall within the range of the PSNs for the request packets that were previously received, the RQ logic doesn't rewrite the
+packet data payload to memory, but it does send back a positive ACK
+             PMTU 2KB
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+             PSN 102                            ePSN 102
+                           QP                   QP
+                         CA  X      <---      CA  Y
+                                 ACK PSN==101
+<strong>Step 6</strong></front>"Send Last" Request Packet Sent<br/>
+             PMTU 2KB
+                           CQ                   CQ
+             WRE (Send) <- SQ                   RQ -> WRE (Receive)
+             PSN 103                            ePSN 102
+                           QP                   QP
+                           CA  X      --->      CA  Y
+                            Send Last 1KB PSN==102
+All packets of the message send operation have now been received and written to CA Y's local memory.
+The RQ update the ePSN and wait for the arrival of first request packet of next message transfer operation.
+The top WQE of the RQ is retired and a CQE is posted on the CQ assocaited with the RQ (an intterrupt could be triggered at the moment)
+Send a positive ACK
+             PMTU 2KB
+                           CQ                   CQ -> CQE
+             WRE (Send) <- SQ                   RQ
+             PSN 103                            ePSN 103
+                           QP                   QP
+                           CA  X      <---      CA  Y
+                                  ACK PSN==102
+<strong>Step 7</strong></front>Final ACK returned<br/>
+             PMTU 2KB
+                    CQE <- CQ                   CQ -> CQE
+                           SQ                   RQ
+             PSN 103                            ePSN 103
+                           QP                   QP
+                           CA  X      ---       CA  Y
+</pre>
+</font>
+</p>
+
+<h2><a name="Software_ROCE">Software ROCE</a></h2>
+
+<h3><a name="components_of_rxe">component of rxe</a></h3>
+<h4><a name="rxe_task">rxe_task</a></h4>
+<p>
+<font size="2">
+<pre>
+rxe_task is an asynchronous executing machines.
+The asynchronous context is based on tasklet which is rarely used now.
+<font color="red">
+Why does use tasklet instead of workqueue ?
+</font>
+The rxe_task is initialized through rxe_init_task.
+rxe_do_task will ensure the task func to be non-reentrant.
+<font color="red">
+(between sync and async context)
+</font>
+This is achieved through the task state which is synchronized through state_lock.
+
+There are 3 task state
+<ul>
+<li> TASK_STATE_START task is idle
+<li> TASK_STATE_BUSY  task is being executing
+<li> TASK_STATE_ARMED task is needed to be executed again
+</ul>
+
+When rxe_do_task finds the task state is BUSY, it will set it to ARMED, then return.
+When BUSY instance of rxe_do_task return from the task func and finds the task
+state is ARMED, it will execute the task func again.
+</pre>
+</font>
+</p>
+
+<h4><a name="rxe_udp_tunnel">rxe udp tunnel</a></h4>
+<p>
+<font size="2">
+<pre>
+https://lwn.net/Articles/614348/
+Why UDP? Just about any network interface out there has hardware support for UDP at this
+point, handling details like checksumming. UDP adds just enough information (port numbers,
+in particular) to make the routing of encapsulated packets easy. UDP can also be made to
+work with protocols like Receive Side Scaling (RSS) and the Equal-cost multipath routing
+protocol (ECMP) to improve performance in highly connected settings. The advantages of UDP
+tunneling are enough that some developers think it's going to become nearly ubiquitous in
+the coming years.
+
+rxe udp tunnel is setup:
+rxe_module_init
+  -> rxe_net_init
+    -> rxe_net_ipv4_init
+      -> rxe_setup_udp_tunnel // port ROCE_V2_UDP_DPORT
+        -> udp_sock_create
+        -> setup_udp_tunnel_sock //encap_rcv rxe_udp_encap_recv
+
+<font color="blue">
+all the packets sent to ROCE_V2_UDP_DPORT port will be handled by this socket.
+</font>
+
+The encap_rcv callback is invoked:
+
+udp_queue_rcv_skb
+---
+    if (static_key_false(&udp_encap_needed) && up->encap_type) {
+        int (*encap_rcv)(struct sock *sk, struct sk_buff *skb);
+
+        encap_rcv = READ_ONCE(up->encap_rcv);
+        if (encap_rcv) {
+            int ret;
+
+            /* Verify checksum before giving to encap */
+            if (udp_lib_checksum_complete(skb))
+                goto csum_error;
+
+            ret = encap_rcv(sk, skb);
+            if (ret <= 0) {
+                __UDP_INC_STATS(sock_net(sk),
+                        UDP_MIB_INDATAGRAMS,
+                        is_udplite);
+                return -ret;
+            }
+        }
+
+        /* FALLTHROUGH -- it's a UDP Packet */
+    }
+---
+
+rxe_udp_encap_recv will deliver the skb to rxe core through rxe_rcv
+</pre>
+</font>
+</p>
+
+
+
+<h3><a name="rxe_framework">rxe framework</a></h3>
+<p>
+<font size="2">
+<pre>
+
+Verbs 
+               post send                      post recevie
+-------------------|------------------------------|-------
+                   v [1]                          v [1]
+                rxe_qp.sq                     rxe_qp.rq
+                   | [2]                          | [2]
+                   v                              v
+rxe_task        rxe_requester  rxe_completer   rxe_responder
+                (SQ Logic)        ^             (RQ Logic)
+                  [3]             |                ^
+                   | loopback ?   | [6]            |
+                   +---------> rxe_rcv ------------'
+                   | [4]          ^
+                   v              | [5]
+-----------------------------------------------------------
+                         ip stack
+
+
+[1]: producer, producer_addr/advance_producer under sq/rq.sq/rq_lock
+[2]: consumer, req_next_wqe
+[3]: construct <font color="red">UDP</font> packets through init_req_packet and fill_packet
+[4]: rxe_send->ip_local_out
+[5]: <a href="#rxe_udp_tunnel">rxe udp tunnel</a>
+[6]: to completer or responder, is based on whether the package is a <font color="red">request</font>
+
+
+</pre>
+</font>
+</p>
+
+</body>
+</html>

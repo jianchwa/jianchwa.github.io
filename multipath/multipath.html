@@ -12,6 +12,9 @@
 <font size="2">
 <a href="#Concepts">Concepts</a><br/>
 <a href="#Implementation">Implementation</a>
+<ul>
+<li><a href="#How_to_identify_paths_to_one_LU">How to identify pathes to one LU</a>
+</ul>
 </font>
 </p>
 
@@ -82,6 +85,149 @@ The kernal part of multipath is based on Device mapper and it is the only one <f
 </font>
 </p>
 
+<h3><a name="How_to_identify_paths_to_one_LU">How to identify pathes to one LU</a></h3>
+<p>
+<font size="2">
+<pre>
+path_discovery
+---
+    udev_iter = udev_enumerate_new(udev);
+    if (!udev_iter)
+        return -ENOMEM;
+
+    udev_enumerate_add_match_subsystem(udev_iter, "block");
+    udev_enumerate_add_match_is_initialized(udev_iter);
+    udev_enumerate_scan_devices(udev_iter);
+
+<font color="red">
+    udev_list_entry_foreach(entry,
+                udev_enumerate_get_list_entry(udev_iter)) {
+</font>
+        const char *devtype;
+        devpath = udev_list_entry_get_name(entry);
+        condlog(4, "Discover device %s", devpath);
+        udevice = udev_device_new_from_syspath(udev, devpath);
+        if (!udevice) {
+            condlog(4, "%s: no udev information", devpath);
+            continue;
+        }
+        devtype = udev_device_get_devtype(udevice);
+        if(devtype && !strncmp(devtype, "disk", 4)) {
+            total_paths++;
+            conf = get_multipath_config();
+            pthread_cleanup_push(put_multipath_config, conf);
+<font color="red">
+            if (path_discover(pathvec, conf,
+                      udevice, flag) == PATHINFO_OK)
+</font>
+                num_paths++;
+            pthread_cleanup_pop(1);
+        }
+        udev_device_unref(udevice);
+    }
+---
+
+configure
+  -> path_discover
+    -> store_pathinfo
+      -> path_info // collect information.
+        -> sysfs_pathinfo
+        -> scsi_ioctl_pathinfo
+<font color="red">
+all the paths will be collected together.
+then coalesce the paths to a same target/LU together
+a dm-mpath will be built on top of these paths.
+</font>
+  -> coalesce_paths
+    -> add_map_with_path
+      -> adopt_paths
+---
+    vector_foreach_slot (pathvec, pp, i) {
+<font color="red">
+        if (!strncmp(mpp->wwid, pp->wwid, WWID_SIZE)) {
+</font>
+            condlog(3, "%s: ownership set to %s",
+                pp->dev, mpp->alias);
+            pp->mpp = mpp;
+
+            if (!mpp->paths && !(mpp->paths = vector_alloc()))
+                return 1;
+
+            if (!find_path_by_dev(mpp->paths, pp->dev) &&
+                store_path(mpp->paths, pp))
+                    return 1;
+            conf = get_multipath_config();
+            pthread_cleanup_push(put_multipath_config, conf);
+            ret = pathinfo(pp, conf,
+                       DI_PRIO | DI_CHECKER);
+            pthread_cleanup_pop(1);
+            if (ret)
+                return 1;
+        }
+    }
+
+---
+</pre>
+The <font color="red"><strong>wwid</strong></font> is the flag that identify paths that are connecting the same target/LU.
+Where does it come form ?
+<pre>
+configure //DI_ALL
+  -> path_discover
+    -> store_pathinfo
+      -> path_info //DI_WWID
+        -> get_uid //SYSFS_BUS_SCSI
+          -> get_vpd_uid
+            -> get_vpd_sysfs //0x83
+              -> sysfs_get_vpd
+
+read /sys/block/sda/device/vpd_pg83
+<font color="red">
+vps: vital product data
+</font>
+scsi_add_lun
+  -> scsi_attach_vpd
+    -> scsi_update_vpd_page
+      -> scsi_get_vpd_buf
+        -> scsi_vpd_inquiry
+---
+<font color="red">
+    cmd[0] = INQUIRY;
+    cmd[1] = 1;        /* EVPD */
+    cmd[2] = page; //0x83
+</font>
+    cmd[3] = len >> 8;
+    cmd[4] = len & 0xff;
+    cmd[5] = 0;        /* Control byte */
+
+    /*
+     * I'm not convinced we need to try quite this hard to get VPD, but
+     * all the existing users tried this hard.
+     */
+    result = scsi_execute_req(sdev, cmd, DMA_FROM_DEVICE, buffer,
+                  len, NULL, 30 * HZ, 3, NULL);
+
+---
+SCSI_Command_Manual_Reference
+
+The application client requests the vital product data information by setting the EVPD bit to one 
+and specifying the page code of a vital product data.
+
+5.4.11 Device Identification VPD page (83h)
+Device identifiers consist of one or more of the following:
+<ul>
+<li> Logical unit names;
+<li> SCSI target port identifiers;
+<li> SCSI target port names;
+<li> SCSI target device names;
+<li> Relative target port identifiers;
+<li> SCSI target port group number; or
+<li> Logical unit group number.
+</ul>
+</pre>
+
+
+</font>
+</p>
 
 
 </body>
