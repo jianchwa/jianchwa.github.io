@@ -11,6 +11,10 @@
 <p>
 <font size="2">
 <a href="#Concepts">Concepts</a><br/>
+<ul>
+<li> <a href="#multiple_path">multiple path</a>
+<li> <a href="#a_a_a_p_alua">a/a a/p alua</a>
+</ul>
 <a href="#Implementation">Implementation</a>
 <ul>
 <li><a href="#How_to_identify_paths_to_one_LU">How to identify pathes to one LU</a>
@@ -20,9 +24,10 @@
 
 <h2><a name="Concepts">Concepts</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
+
+<h3><a name="multiple_path">multiple path</a></h3>
 <p>
 <font size="2">
-<strong>The Three Primary Functions of Storage Networking</strong><br/>
 The storage process could be broken into 3 different functional areas as following:
 <pre>
 Connecting - Provides the transmission of data between systems and storage
@@ -33,32 +38,74 @@ Filing     - Directs the placement of data objects in storage and is responsible
 </pre>
 
 For the iSCSI, the TCP/IP is _connecting_, iSCSI is the _storing_.<br/>
-For the NVMe, the NVMe is storing, the _connecting_ could be pcie, fc or rdma.
-... <br/>
+For the NVMe, the NVMe is storing, the _connecting_ could be pcie, fc or rdma.... <br/>
 Filing is commonly the filesystem.<br/>
 <br/>
-<br/>
-<br/>
-<br/>
 We could easily infer that the multipath is in <font color="red">_connecting_</font>, it depends on the redundant IO path between<br/>
-system and storage. Generally, the multipath is on the top and SCSI protocol.<br/>
-Following is an example of multipath
+system and storage.
 <pre>
-        +------+
-        | SAN  |__                             <font color="green">Mirrored</font>
-        | port0|  \  LUN0                     +-------+
-        +------+   \        +----+ <--------->| Disk  |
-                    \_ _ _ _| LU |            +-------+
-                    /       | __ |            +-------+
-        +------+   / LUN1   +----+ <--------->| Disk  |
-        | SAN  |__/                           +-------+
-        | port1|                               <font color="green">Mirrored</font>
-        +------+
+The connection from the server through the HBA to the storage controller is referred as a path. When multiple paths
+exists to a storage device(LUN) on a storage subsystem, it is referred as multipath connectivity. It is a enterprise
+level storage capability. Main purpose of multipath connectivity is to provide redundant access to the storage devices,
+i.e to have access to the storage device when one or more of the components in a path fail. Another advantage of
+multipathing is the increased throughput by way of load balancing.
 
-   Note: <font color="red">The SAN port here is _connecting_ element</pre>
+Note: Multipathing protects against the failure of path(s) and not the failure of a specific storage device.
+
+Common example of multipath is a SAN connected storage device. Usually one or more fibre channel HBAs from the host will be
+connected to the fabric switch and the storage controllers will be connected to the same switch.
+A simple example of multipath could be: 2 HBAs connected to a switch to which the storage controllers are connected. In this
+case the storage controller can be accessed from either of the HBAs and hence we have multipath connectivity.
+Following is an example of multipath
+</pre>
+<pre>
+                              +----------------------+
+                              |                      |  
+                              |        SERVER        |
+                              |                      |
+                              +-----+----------+-----+
+                              |HBA_0|          |HBA_1|
+                              +--+--+          +--+--+
+                                 |                |
+                                 |   +--------+   |
+                                 +---| SWITCH |---+ 
+                                     +-+----+-+
+                                       |    | 
+                                 +-----+    +-----+
+                                 |                |
+                             +---+---+        +---+---+
+                             |CONTRL0|        |CONTRL1|
+                             +-------+--------+-------+
+                             |       STORAGE          |
+                             +------------------------+
+ 
 </pre>
 </font>
 </p>
+
+<h3><a name="a_a_a_p_alua">a/a a/p alua</a></h3>
+<p>
+<font size="2">
+<pre>
+<a href="http://kaminario.com/company/blog/active-active-vs-active-passive-storage-controllers/">active/active vs active/passive storage controllers</a>
+<a href="http://www.govmlab.com/alua-asymmetric-logic-unit-access-alua-different-aa-ap-array/">What is alua</a>
+
+<strong>Active-Active</strong> storage controllers describe an architecture where both controllers are doing the above functions and the load
+ on the storage array is automatically distributed evenly between all the controllers.
+
+<strong>Active-Passive</strong> storage controllers refer to the approach where only one controller is doing the above functions (that’s the
+ “active” controller) and the second controller is not doing anything (you guessed it, that’s the “passive” controller).
+
+<strong>Asymmetric Logical Unit Access</strong> or ALUA refers to a hybrid approach. I know that you are thinking, “ALUA is a horrible
+ acronym.” In this approach, both controllers are at work, but Logical Unit Numbers (LUNs) have an affinity to a specific controller and
+ usually, if you access the LUN from a different controller, you’ll pay a performance price. In addition, the performance per LUN is limited to
+ that of a single controller (yes, also in a scale-out architecture). So you need to start manual load balancing of the LUNs between
+ controllers. Did I mention it’s a headache?
+</pre>
+</font>
+</p>
+
+
 
 
 <h2><a name="Implementation">Implementation</a></h2>

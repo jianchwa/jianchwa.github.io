@@ -1,0 +1,1374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MD</title>
+</head>
+<body>
+<div>
+    <h1>MD</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Common">Common</a>
+<ul>
+<li><a href="#Barriers">Barriers</a>
+<li><a href="#component_size">compoment size</a>
+<li><a href="#sync_min_max">sync_min/max</a>
+
+</ul>
+<a href="#Software-RAID1">Software RAID1</a><br/>
+<ul>
+<li><a href="#write_behind">write behind</a>
+<li><a href="#How_to_build_raid_array">How to build raid arry</a>
+<li><a href="#How_to_handle_bad_blocks">How to handle bad blocks</a>
+<li><a href="#Resyncing">Resyncing</a>
+<li><a href="#write_intent_bitmap">write-intent bitmap</a>
+<ul>
+<li> <a href="#bitmap_stores">bitmap stores</a>
+<li> <a href="#how_to_work">how to work</a>
+</ul>
+
+</ul>
+
+</font>
+</p>
+
+<h2><a name="Common">Common</a></h2>
+
+<h3><a name="Barriers">Barriers</a></h3 >
+<p>
+<font size="2">
+<pre>
+Quote from raise_barrier's comment:
+Sometimes we need to suspend IO while we do something else, either some 
+resync/recovery, or reconfigure the array.
+To do this we raise a 'barrier'.
+The 'barrier' is a counter that can be raised multiple times
+to count how many activities are happening which prevent normal IO.
+
+We can only raise the barrier if there is no pending IO. i.e. if nr_pending == 0.
+
+We choose only to raise the barrier if no-one is waiting for the
+barrier to go down.  This means that as soon as an IO request
+is ready, no other operations which require a barrier will start
+until the IO request has had a chance.
+
+
+There are three aspects here:
+<ul>
+<li> When barrier is raised, there should be no IO
+<li> When raising the barrier, there should be no in-flight IO
+<li> Prioritized IO, when the barrier has been raised, and there is someone
+     waiting for it to go down, the raiser should wait for the IO requester.
+</ul>
+
+There are 3 counters in r1conf to implement this:
+<ul>
+<li> barrier, the depth of the barrier
+<li> nr_waiting, the number of the waiters of this barrier
+<li> nr_pending, the pending IO, or the IO across wait_barrier
+</ul>
+
+raise_barrier                        _wait_barrier
+                                       -> inc nr_pending
+  -> wait nr_waiting to be 0
+  -> inc barrier
+                                       -> if barrier > 0
+  -> wait nr_pending
+                                       
+                                          inc nr_waiting
+                                          dec nr_pending
+                                          wake_up wait_barrier
+                                          wait barrier
+  then no io any more
+
+One very important thing has not been pointed out
+<font color="red">
+That is, the barrier is on sector range instead of target blkdev.
+The barrier unit size is 64MB.
+</font>
+In raid1, only raid1_write_request need to wait_barrier
+raid1_sync_request will raise_barrier.
+
+What about the read ?
+The md_rdev that has In_sync ? (read_balance)
+
+
+</pre>
+</font>
+</p>
+
+
+<h3><a name="component_size">compoment size</a></h3>
+<p>
+<font size="2">
+<pre>
+When we grow the component_size
+
+open("/sys/block/md127/md/dev-dm-1/size", O_WRONLY) = 4
+write(4, "153600", 6)                   = 6
+close(4)                                = 0
+uname({sysname="Linux", nodename="will-ThinkCentre-M910s", ...}) = 0
+open("/sys/block/md127/md/dev-dm-0/size", O_WRONLY) = 4
+write(4, "153600", 6)                   = 6
+close(4)                                = 0
+uname({sysname="Linux", nodename="will-ThinkCentre-M910s", ...}) = 0
+ioctl(3, SET_ARRAY_INFO, 0x7fff53c458e0) = 0
+ioctl(3, GET_ARRAY_INFO, 0x7fff53c458e0) = 0
+fstat(3, {st_mode=S_IFBLK|0660, st_rdev=makedev(9, 127), ...}) = 0
+open("/sys/block/md127/md/component_size", O_RDONLY) = 4
+read(4, "153600\n", 50)                 = 7
+close(4)                                = 0
+write(2, "mdadm: component size of /dev/md"..., 60mdadm: component size of /dev/md127 has been set to 153600K
+) = 60
+open("/sys/block/md127/md/metadata_version", O_RDONLY) = 4
+read(4, "0.90\n", 1024)                 = 5
+close(4)                                = 0
+open("/sys/block/md127/md//sync_action", O_WRONLY) = 4
+write(4, "idle", 4)                     = 4
+
+md_ioctl //SET_ARRAY_INFO
+  -> update_array_info
+    -> update_size
+      -> raid1_resize
+---
+    md_set_array_sectors(mddev, newsize);
+    if (sectors > mddev->dev_sectors &&
+        mddev->recovery_cp > mddev->dev_sectors) {
+<font color="red">
+        mddev->recovery_cp = mddev->dev_sectors;
+        set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+</font>
+    }
+    mddev->dev_sectors = sectors;
+    mddev->resync_max_sectors = sectors;
+---
+
+Then echo idle > sync_action will wake up raid1d kthread.
+
+raid1d
+  -> md_check_recovery
+---
+        } else if (mddev->recovery_cp < MaxSector) {
+<font color="red">
+            set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+</font>
+            clear_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
+        } 
+---
+
+a resync process will be triggered then.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="sync_min_max">sync_min/max</a></h3>
+<p>
+<font size="2">
+<pre>
+sync_min, sync_max
+The two values, given as numbers of sectors, indicate a range within the array
+where check/repair will operate. Must be a multiple of chunk_size. When it 
+reaches sync_max it will <font color="red">pause, rather than complete</font>.
+You can use select or poll on sync_completed to wait for that number to reach 
+sync_max. Then you can either increase sync_max, or can write idle to sync_action.
+
+The value of max for sync_max effectively disables the limit. When a resync is 
+active, the value can only ever be increased, never decreased. The value of 0 is 
+the minimum for sync_min.
+
+</pre>
+Let's look at the source code to find out how does it work.
+<pre>
+md_do_sync
+---
+    if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery)) {
+        /* resync follows the size requested by the personality,
+         * which defaults to physical size, but can be virtual size
+         */
+        max_sectors = mddev->resync_max_sectors;
+        atomic64_set(&mddev->resync_mismatches, 0);
+        /* we don't use the checkpoint if there's a bitmap */
+        if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+<font color="red">
+            j = mddev->resync_min;
+</font>
+        else if (!mddev->bitmap)
+            j = mddev->recovery_cp;
+
+    }
+...
+    blk_start_plug(&plug);
+    while (j < max_sectors) {
+        sector_t sectors;
+
+        skipped = 0;
+        ...
+        while (j >= mddev->resync_max &&
+               !test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+            /* As this condition is controlled by user-space,
+             * we can block indefinitely, so use '_interruptible'
+             * to avoid triggering warnings.
+             */
+            flush_signals(current); /* just in case */
+            wait_event_interruptible(mddev->recovery_wait,
+                         mddev->resync_max > j
+                         || test_bit(MD_RECOVERY_INTR,
+                                 &mddev->recovery));
+        }
+
+        if (test_bit(MD_RECOVERY_INTR, &mddev->recovery))
+            break;
+
+        sectors = mddev->pers->sync_request(mddev, j, &skipped);
+        ...
+    }
+    ...
+    spin_lock(&mddev->lock);
+    if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+        /* We completed so min/max setting can be forgotten if used. */
+        if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+            mddev->resync_min = 0;
+        mddev->resync_max = MaxSector;
+    } else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+        mddev->resync_min = mddev->curr_resync_completed;
+    set_bit(MD_RECOVERY_DONE, &mddev->recovery);
+    mddev->curr_resync = 0;
+    spin_unlock(&mddev->lock);
+---
+
+When we echo 'idle' > sync_action
+action_store
+---
+    if (cmd_match(page, "idle") || cmd_match(page, "frozen")) {
+        if (cmd_match(page, "frozen"))
+            set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+        else
+            clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+        if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
+            mddev_lock(mddev) == 0) {
+            flush_workqueue(md_misc_wq);
+            if (mddev->sync_thread) {
+<font color="red">
+                set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+</font>
+                md_reap_sync_thread(mddev);
+                -> md_unregister_thread
+                  -> kthread_stop <font color="blue">//wake up the kthread and
+                  wait it to exit</font>
+            }
+            mddev_unlock(mddev);
+        }
+        ...
+    }
+    ...
+    set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+    md_wakeup_thread(mddev->thread);
+    sysfs_notify_dirent_safe(mddev->sysfs_action);
+    }
+---
+raid1d->md_check_recovery will do nothing for it.
+
+
+select/poll on sync_completed and check whether your resync_max has been
+reached.
+
+md_do_sync
+---
+when update curr_resync_completed, it will wake up the poll waiter on it.
+<font color="red">
+    mddev->curr_resync_completed = j;
+</font>
+    sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+<font color="blue">
+    /*
+       -> kernfs_notify
+         -> schedule work kernfs_notify_work
+        kernfs_notify_workfn
+        kernfs_fop_poll
+     */
+</font>
+    md_new_event(mddev);
+    update_time = jiffies;
+
+    blk_start_plug(&plug);
+    while (j < max_sectors) {
+        sector_t sectors;
+
+        skipped = 0;
+
+        if (!test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+            ((mddev->curr_resync > mddev->curr_resync_completed &&
+              (mddev->curr_resync - mddev->curr_resync_completed)
+              > (max_sectors >> 4)) ||
+             time_after_eq(jiffies, update_time + UPDATE_FREQUENCY) ||
+             (j - mddev->curr_resync_completed)*2
+             >= mddev->resync_max - mddev->curr_resync_completed ||
+             mddev->curr_resync_completed > mddev->resync_max
+                )) {
+            /* time to update curr_resync_completed */
+            wait_event(mddev->recovery_wait,
+                   atomic_read(&mddev->recovery_active) == 0);
+            mddev->curr_resync_completed = j;
+            if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
+                j > mddev->recovery_cp)
+                mddev->recovery_cp = j;
+            update_time = jiffies;
+            set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
+            sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+        }
+
+        while (j >= mddev->resync_max &&
+               !test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+            /* As this condition is controlled by user-space,
+             * we can block indefinitely, so use '_interruptible'
+             * to avoid triggering warnings.
+             */
+            flush_signals(current); /* just in case */
+            wait_event_interruptible(mddev->recovery_wait,
+                         mddev->resync_max > j
+                         || test_bit(MD_RECOVERY_INTR,
+                                 &mddev->recovery));
+        }
+
+
+---
+</pre>
+</font>
+</p>
+
+
+<h2><a name="Software-RAID1">Software RAID1</a></h2 >
+<p>
+<font size="2">
+RAID1 consists of extra copy (mirror) of a set of data on two or more disks.
+A classical RAID1 mirrored pairs contains two disks.
+<pre>
+            RAID1
+           /    \
+         +--+  +--+
+         |A1|  |A1|
+         +--+  +--+
+         |B1|  |B1|
+         +--+  +--+
+         |C1|  |C1|
+         +--+  +--+
+         |  |  |  |
+         |  |  |  |
+         +--+  +--+
+        disk0  disk1
+
+
+</pre>
+
+</font>
+</p>
+
+<h3><a name="write_behind">write behind</a></h3>
+<p>
+<font size="2">
+<pre>
+On the other hand, we could setup the RAID1 with a SSD and a HHD which has a
+trade-off between cost and performance.
+            RAID1
+           /     \
+         +--+   +--+
+         |A1|   |A1|
+         +--+   +--+
+         |B1|   |B1|
+         +--+   +--+
+         |C1|   |C1|
+         +--+   +--+
+         |  |   |  |
+         |  |   |  |
+         +--+   +--+
+         SSD    HDD
+                Write-mostly mode
+                Write-behind enabled
+
+At the moment, we need to mark the HDD in Write-mostly mode along with
+Write-behind enabled. Then the write requests will be acknowledged as completed
+to the caller when all the non-Write-mostly devices have finished the writes, a
+internal bitmap will record that the write on Write-mostly device have not been
+completed.
+
+With this feature, we could get both write and read performance at SSD level.
+
+raid1_write_request
+---
+    rcu_read_lock();
+    max_sectors = r1_bio->sectors;
+    for (i = 0;  i < disks; i++) {
+        struct md_rdev *rdev = rcu_dereference(conf->mirrors[i].rdev);
+        ...
+        atomic_inc(&rdev->nr_pending);
+        ...
+        r1_bio->bios[i] = bio;
+    }
+    rcu_read_unlock();
+    ...
+    for (i = 0; i < disks; i++) {
+        struct bio *mbio = NULL;
+        if (!r1_bio->bios[i])
+            continue;
+
+
+        if (first_clone) {
+            /* do behind I/O ?
+             * Not if there are too many, or cannot
+             * allocate memory, or a reader on WriteMostly
+             * is waiting for behind writes to flush */
+            if (bitmap &&
+                (atomic_read(&bitmap->behind_writes)
+                 < mddev->bitmap_info.max_write_behind) &&
+                !waitqueue_active(&bitmap->behind_wait)) {
+                alloc_behind_master_bio(r1_bio, bio);
+<font color="blue">
+            // alloc new bio, new pages, copy the original bio.
+               then this standlone bio could be independent with the original
+               bio
+</font>
+            }
+
+            bitmap_startwrite(bitmap, r1_bio->sector,
+                      r1_bio->sectors,
+                      test_bit(R1BIO_BehindIO,
+                           &r1_bio->state));
+<font color="blue">
+            inc the bitmap->write_behind
+            based on this, the readers could wait for the behind writing to be
+            completed.
+            raid1_read_request
+            ---
+            wait_event(bitmap->behind_wait,
+               atomic_read(&bitmap->behind_writes) == 0);
+
+            ---
+</font>
+            first_clone = 0;
+        }
+
+        if (r1_bio->behind_master_bio)
+            mbio = bio_clone_fast(r1_bio->behind_master_bio,
+                          GFP_NOIO, mddev->bio_set);
+        else
+            mbio = bio_clone_fast(bio, GFP_NOIO, mddev->bio_set);
+
+        if (r1_bio->behind_master_bio) {
+            if (test_bit(WriteMostly, &conf->mirrors[i].rdev->flags))
+<font color="red">
+                atomic_inc(&r1_bio->behind_remaining);
+</font>
+        }
+
+        r1_bio->bios[i] = mbio;
+
+        mbio->bi_iter.bi_sector    = (r1_bio->sector +
+                   conf->mirrors[i].rdev->data_offset);
+        bio_set_dev(mbio, conf->mirrors[i].rdev->bdev);
+        mbio->bi_end_io    = raid1_end_write_request;
+        mbio->bi_opf = bio_op(bio) | (bio->bi_opf & (REQ_SYNC | REQ_FUA));
+        if (test_bit(FailFast, &conf->mirrors[i].rdev->flags) &&
+            !test_bit(WriteMostly, &conf->mirrors[i].rdev->flags) &&
+            conf->raid_disks - mddev->degraded > 1)
+            mbio->bi_opf |= MD_FAILFAST;
+        mbio->bi_private = r1_bio;
+
+<font color="red">
+        atomic_inc(&r1_bio->remaining);
+</font>
+        if (mddev->gendisk)
+            trace_block_bio_remap(mbio->bi_disk->queue,
+                          mbio, disk_devt(mddev->gendisk),
+                          r1_bio->sector);
+        /* flush_pending_writes() needs access to the rdev so...*/
+        mbio->bi_disk = (void *)conf->mirrors[i].rdev;
+
+        cb = blk_check_plugged(raid1_unplug, mddev, sizeof(*plug));
+        if (cb)
+            plug = container_of(cb, struct raid1_plug_cb, cb);
+        else
+            plug = NULL;
+        if (plug) {
+            bio_list_add(&plug->pending, mbio);
+            plug->pending_cnt++;
+        } else {
+            spin_lock_irqsave(&conf->device_lock, flags);
+            bio_list_add(&conf->pending_bio_list, mbio);
+            conf->pending_count++;
+            spin_unlock_irqrestore(&conf->device_lock, flags);
+            md_wakeup_thread(mddev->thread);
+        }
+    }
+---
+
+The core point of the write behind is that <strong> the original io could be
+completed when all cloned bios to non-WriteMostly are completed, these
+non-WriteMostly devices are usually faster one, the whole raid1 array will get
+the same performance with the faster device.</strong>
+To implementation this, we have seen that a standlone behind_master_bio is
+allocated and copied, it is totally independent with the original one, so that
+we could complete the original bio before the behind_master_bio is completed.
+
+static void raid1_end_write_request(struct bio *bio)
+{
+    ...
+    if (bio->bi_status && !discard_error) {
+        ...
+    } else {
+        ...
+        r1_bio->bios[mirror] = NULL;
+        to_put = bio;
+        if (test_bit(In_sync, &rdev->flags) &&
+            !test_bit(Faulty, &rdev->flags))
+            set_bit(R1BIO_Uptodate, &r1_bio->state);
+        ...
+    }
+
+    if (behind) {
+        if (test_bit(WriteMostly, &rdev->flags))
+            atomic_dec(&r1_bio->behind_remaining);
+<font color="blue">
+        /*
+         * In behind mode, we ACK the master bio once the I/O
+         * has safely reached all non-writemostly
+         * disks. Setting the Returned bit ensures that this
+         * gets done only once -- we don't ever want to return
+         * -EIO here, instead we'll wait
+         */
+</font>
+        if (atomic_read(&r1_bio->behind_remaining) >= (atomic_read(&r1_bio->remaining)-1) &&
+            test_bit(R1BIO_Uptodate, &r1_bio->state)) {
+            /* Maybe we can return now */
+            if (!test_and_set_bit(R1BIO_Returned, &r1_bio->state)) {
+                struct bio *mbio = r1_bio->master_bio;
+                pr_debug("raid1: behind end write sectors"
+                     " %llu-%llu\n",
+                     (unsigned long long) mbio->bi_iter.bi_sector,
+                     (unsigned long long) bio_end_sector(mbio) - 1);
+                call_bio_endio(r1_bio);
+            }
+        }
+    }
+    if (r1_bio->bios[mirror] == NULL)
+        rdev_dec_pending(rdev, conf->mddev);
+
+    /*
+     * Let's see if all mirrored write operations have finished
+     * already.
+     */
+    r1_bio_write_done(r1_bio);
+
+    if (to_put)
+        bio_put(to_put);
+}
+</pre>
+</font>
+</p>
+
+
+<h3><a name="How_to_build_raid_array">How to build raid arry</a></h3 >
+<p>
+<font size="2">
+We could get helpful information from md_setup_drive.
+<pre>
+1. mknod with name and MD_MAJOR and minor
+2. open it
+   the mddev could will be created during this.
+   blkdev_get
+     -> __blkdev_get
+       -> bdev_get_gendisk
+         -> get_gendisk
+           -> kobj_lookup
+             -> md_probe
+               -> md_alloc
+                 -> mddev->queue = blk_alloc_queue
+                    blk_queue_make_request(mddev->queue, md_make_request)
+                    ...
+3. ioctl SET_ARRAY_INFO if not_persistent sb
+4. ioctl ADD_NEW_DISK
+
+add_new_disk
+  -> md_import_device
+    -> alloc md_rdev
+    -> lock_rdev
+      -> blkdev_get_by_dev //<font color="red">FMODE_EXCL</font>
+    -> super_type[type].load_super()
+  -> bind_rdev_to_array
+</pre>
+</font>
+</p>
+
+
+
+<h3><a name="How_to_handle_bad_blocks">How to handle bad blocks</a></h3 >
+<p>
+<font size="2">
+<pre>
+              RAID1 array
+
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |  |  |
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |  |xx|
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |  |  |
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |  |  |
+         |  |  |  |  |  |  |  |
+         +--+  +--+  +--+  +--+
+
+
+If there are known/acknowledged bad blocks on any device on
+which we have seen a write error, we want to avoid writing those
+blocks. This potentially requires several writes to write around
+the bad blocks.
+                       write bio
+                        ____^____
+                       |         |   
+         | - - - - x x x x x - - - - - -|
+                       |_ _|
+                         v
+                    max_sectors
+
+         r1_bio->bios[i] is NULL
+
+              write bio             
+               ____^____            
+              |         |            
+         | - - - - x x x x x - - - - - -|
+              |_ _|
+                 v
+            max_sectors
+         
+         r1_bio->bios[i] = bio
+
+The other part of the bio after max_sectors will be submitted separatedly.
+
+    if (max_sectors < bio_sectors(bio)) {
+        struct bio *split = bio_split(bio, max_sectors,
+                          GFP_NOIO, conf->bio_split);
+        bio_chain(split, bio);
+        generic_make_request(bio);
+        bio = split;
+        r1_bio->master_bio = bio;
+        r1_bio->sectors = max_sectors;
+    }
+
+And we will not write on the bad blocks, due to r1_bio->bios[i] is NULL.
+</pre>
+<strong>But what does the 'known/acknowledged' mean ?</strong>
+<br/>
+There is bblog in the md sb, which records the badblocks information and can be
+loaded from the sb.
+<pre>
+mdp_superblock_1.bblog_offset saves the sector offset from superblock to bblog.
+</pre>
+
+rdev_set_badblocks will be employed to mark the badblocks in a raid array.
+It will mark the badblocks with <font color="red">unacknowledged</font> and mark
+mddev->sb_flags MD_SB_CHANGE_CLEAN and MD_SB_CHANGE_PENDING. The backblocks
+changes will be synced to disk in md_update_sb, maybe in following path.
+<pre>
+raid1d
+  -> md_check_recovery
+    -> md_update_sb
+--
+    rdev_for_each(rdev, mddev) {
+        char b[BDEVNAME_SIZE];
+
+        if (rdev->sb_loaded != 1)
+            continue; /* no noise on spare devices */
+
+        if (!test_bit(Faulty, &rdev->flags)) {
+            md_super_write(mddev,rdev,
+                       rdev->sb_start, rdev->sb_size,
+                       rdev->sb_page);
+            rdev->sb_events = mddev->events;
+            if (rdev->badblocks.size) {
+<font color="red">
+                md_super_write(mddev, rdev,
+                           rdev->badblocks.sector,
+                           rdev->badblocks.size << 9,
+                           rdev->bb_page);
+                rdev->badblocks.size = 0;
+</font>
+            }
+
+        } 
+        if (mddev->level == LEVEL_MULTIPATH)
+            /* only need to write one superblock... */
+            break;
+    }
+...
+    rdev_for_each(rdev, mddev) {
+        if (test_and_clear_bit(FaultRecorded, &rdev->flags))
+            clear_bit(Blocked, &rdev->flags);
+
+        if (any_badblocks_changed)
+<font color="red">
+            ack_all_badblocks(&rdev->badblocks);
+</font>
+        clear_bit(BlockedBadBlocks, &rdev->flags);
+        wake_up(&rdev->blocked_wait);
+    }
+--
+</pre>
+
+<strong>So we know, the 'known/acknowledged' means the badblocks information has
+been synced into sb bblog</strong><br/>
+
+On the other hand, the raid1_write_request will wait until the unacknowledged
+backblocks are acknowledged.
+</font>
+</p>
+
+
+<h3><a name="Resyncing">Resyncing</a></h3 >
+<p>
+<font size="2">
+<pre>
+When a device is hot-added to a raid array, the data on that device will not be 
+synchronised with the other devices. The kernel begins to scan the original devices
+and writes the correct blocks to the new device. This process is known as resyncing.
+
+              RAID1 array        I'm new !
+                                 /
+         +--+  +--+  +--+  +--+ /
+         |  |  |  |  |  |->|  |
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |->|  |
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |->|  |
+         +--+  +--+  +--+  +--+
+         |  |  |  |  |  |->|  |
+         |  |  |  |  |  |->|  |
+         +--+  +--+  +--+  +--+
+
+Normally the kernel will throttle the resync activity (c.f. nice) to avoid impacting
+the raid device performance.
+
+There are times when you may want to control how much I/O bandwidth is allocated
+to the resync and this is done by writing values to
+
+/proc/sys/dev/raid/speed_limit_max
+/proc/sys/dev/raid/speed_limit_min
+So to limit the maximum speed at which RAID reconstruction is performed to 5 Mb/s:
+
+echo 5000 > /proc/sys/dev/raid/speed_limit_max
+
+There are some concepts need to be explained here:
+<strong>In_sync</strong> device is a fully in-sync member of the array
+<strong>slot</strong>This gives the role that the device has in the array. It will either be none if the device is not active in the array
+ (i.e. is a spare or has failed) or an integer less than the raid_disks number for the array indicating which position it currently fills.
+This can only be set while assembling an array. A device for which this is set is assumed to be working.
+<strong>recovery_start</strong> When the device is not in_sync, this records the number of sectors from the start of the device which are
+known to be correct. This is normally zero, but during a recovery operation it will steadily increase, and if the recovery is interrupted,
+ restoring this value can cause recovery to avoid repeating the earlier blocks. 
+
+<strong>sync_action</strong>
+<ul>
+<li> resync, redundancy is being recalculated after unclean shutdown or creation
+<li> recover, a hot spare is being built to replace a failed/missing device
+<li> idle, nothing is happening
+<li> check, A full check of redundancy was requested and is happening. This reads all blocks and checks them. A repair may also happen
+     for some raid levels.
+<li> repair, A full check and repair is happening. This is similar to resync, but was requested by the user, and the write-intent bitmap
+     is NOT used to optimise the process.
+</ul>
+
+The resync need to read firstly from disk that has been synced, then write them
+to the un-synced one.
+
+raid1_sync_request
+
+---
+    for (i = 0; i < conf->raid_disks * 2; i++) {
+        struct md_rdev *rdev;
+        bio = r1_bio->bios[i];
+
+        rdev = rcu_dereference(conf->mirrors[i].rdev);
+        if (rdev == NULL ||
+            test_bit(Faulty, &rdev->flags)) {
+            ...
+        } else if (!test_bit(In_sync, &rdev->flags)) {
+<font color="red">
+            bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+            bio->bi_end_io = end_sync_write;
+<strong>
+            //the In_sync here should mean this target device has been
+            syned with array.
+</strong>
+</font>
+            write_targets ++;
+        } else {
+            /* may need to read from here */
+            sector_t first_bad = MaxSector;
+            int bad_sectors;
+
+            if (sector_nr < first_bad) {
+                ...
+<font color="red">
+                bio_set_op_attrs(bio, REQ_OP_READ, 0);
+                bio->bi_end_io = end_sync_read;
+</font>
+                read_targets++;
+            }...
+        }
+        if (bio->bi_end_io) {
+            atomic_inc(&rdev->nr_pending);
+            bio->bi_iter.bi_sector = sector_nr + rdev->data_offset;
+<font color="blue">
+            The sector_nr here is sectors that has been synced.
+</font>
+            bio_set_dev(bio, rdev->bdev);
+            if (test_bit(FailFast, &rdev->flags))
+                bio->bi_opf |= MD_FAILFAST;
+        }
+    }
+    rcu_read_unlock();
+
+
+<font color="blue">
+Fill the page vec of the bio
+</font>
+    do {
+        struct page *page;
+        int len = PAGE_SIZE;
+        ...
+        for (i = 0 ; i < conf->raid_disks * 2; i++) {
+            struct resync_pages *rp;
+
+            bio = r1_bio->bios[i];
+            rp = get_resync_pages(bio);
+            if (bio->bi_end_io) {
+                page = resync_fetch_page(rp, page_idx);
+                bio_add_page(bio, page, len, 0);
+            }
+        }
+        nr_sectors += len>>9;
+        sector_nr += len>>9;
+        sync_blocks -= (len>>9);
+    } while (++page_idx < RESYNC_PAGES);
+
+The pages is allocated here.
+
+r1buf_pool_alloc
+  -> resync_alloc_pages
+
+#define RESYNC_BLOCK_SIZE (64*1024)
+#define RESYNC_PAGES ((RESYNC_BLOCK_SIZE + PAGE_SIZE-1) / PAGE_SIZE)
+
+So we know that data that could be synced one time is 16k.
+<font color="red">
+But note: every r1bio has these pages.
+</font>
+submit the read one:
+---
+<font color="red">
+        atomic_set(&r1_bio->remaining, 1);
+</font>
+        bio = r1_bio->bios[r1_bio->read_disk];
+        md_sync_acct_bio(bio, nr_sectors);
+        if (read_targets == 1)
+            bio->bi_opf &= ~MD_FAILFAST;
+        generic_make_request(bio);
+---
+
+Then
+
+static void end_sync_read(struct bio *bio)
+{
+    struct r1bio *r1_bio = get_resync_r1bio(bio);
+
+    update_head_pos(r1_bio->read_disk, r1_bio);
+<font color="blue">
+    conf->mirrors[disk].head_position =
+        r1_bio->sector + (r1_bio->sectors);
+    This is optimization for the read_balance()
+</font>
+    if (!bio->bi_status)
+        set_bit(R1BIO_Uptodate, &r1_bio->state);
+
+    if (atomic_dec_and_test(&r1_bio->remaining))
+        reschedule_retry(r1_bio);
+}
+
+Hand over the r1_bio to raid1d kthread.
+
+        if (test_bit(R1BIO_IsSync, &r1_bio->state)) {
+<font color="red">
+        //set by raid1_sync_request
+</font>
+            if (test_bit(R1BIO_MadeGood, &r1_bio->state) ||
+                test_bit(R1BIO_WriteError, &r1_bio->state))
+                handle_sync_write_finished(conf, r1_bio);
+            else
+                sync_request_write(mddev, r1_bio);
+        } 
+Start the write procedure.
+
+static void sync_request_write(struct mddev *mddev, struct r1bio *r1_bio)
+{
+    struct r1conf *conf = mddev->private;
+    int i;
+    int disks = conf->raid_disks * 2;
+    struct bio *wbio;
+
+    if (!test_bit(R1BIO_Uptodate, &r1_bio->state)) // set by end_sync_read
+        /* ouch - failed to read all of that. */
+        if (!fix_sync_read_error(r1_bio))
+            return;
+
+    if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+        process_checks(r1_bio);
+
+    /*
+     * schedule writes
+     */
+<font color="red">
+    atomic_set(&r1_bio->remaining, 1);
+</font>
+    for (i = 0; i < disks ; i++) {
+        wbio = r1_bio->bios[i];
+        ...
+        bio_set_op_attrs(wbio, REQ_OP_WRITE, 0);
+        if (test_bit(FailFast, &conf->mirrors[i].rdev->flags))
+            wbio->bi_opf |= MD_FAILFAST;
+
+        wbio->bi_end_io = end_sync_write;
+<font color="red">
+        atomic_inc(&r1_bio->remaining);
+</font>
+        md_sync_acct(conf->mirrors[i].rdev->bdev, bio_sectors(wbio));
+        generic_make_request(wbio);
+    }
+    ...
+}
+
+When all the write completes
+
+end_sync_write
+  -> put_buf
+    -> lower_barrier
+  -> md_done_sync
+---
+    /* another "blocks" (512byte) blocks have been synced */
+    atomic_sub(blocks, &mddev->recovery_active);
+    wake_up(&mddev->recovery_wait);
+<font color="blue">
+    mddev->recovery_active is used to account the in-flight resync requests.
+    md_do_sync will do speed limit based on it.
+</font>
+---
+
+The code path above is the most common case.
+Let's look at some specical case.
+
+<strong>All is in In_sync</strong>
+When a raid1 array is created initially, all the targets seems to be In_sync
+(Still need to be investigated), raid1_sync_request will select the first target
+as the read_target and the others will be write targets.
+<font color="red">
+Note: It seems that, most of time, the targets are in In_sync state.
+      A target maybe not In_sync state when it is a newly added or activated
+      spare one.
+</font>
+raid1_sync_request
+---
+<font color="blue">
+There will be multiple read_targets but 0 write_targets
+</font>
+    if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) && read_targets > 0)
+        /* extra read targets are also write targets */
+        write_targets += read_targets-1;
+---
+raid1d
+  -> sync_request_write
+---
+    for (i = 0; i < disks ; i++) {
+        wbio = r1_bio->bios[i];
+        if (wbio->bi_end_io == NULL ||
+            (wbio->bi_end_io == end_sync_read &&
+             (i == r1_bio->read_disk ||
+              !test_bit(MD_RECOVERY_SYNC, &mddev->recovery))))
+            continue;
+        if (test_bit(Faulty, &conf->mirrors[i].rdev->flags))
+            continue;
+<font color="red">
+    The original read bio is changed to write one
+</font>
+        bio_set_op_attrs(wbio, REQ_OP_WRITE, 0);
+        if (test_bit(FailFast, &conf->mirrors[i].rdev->flags))
+            wbio->bi_opf |= MD_FAILFAST;
+
+        wbio->bi_end_io = end_sync_write;
+        atomic_inc(&r1_bio->remaining);
+        md_sync_acct(conf->mirrors[i].rdev->bdev, bio_sectors(wbio));
+
+        generic_make_request(wbio);
+    }
+
+---
+
+
+<strong>raid check</strong>
+when we write 'check' into sync_action,
+action_store
+---
+else {
+        if (cmd_match(page, "check"))
+            set_bit(MD_RECOVERY_CHECK, &mddev->recovery);
+        else if (!cmd_match(page, "repair"))
+            return -EINVAL;
+        clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+        set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+        set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+    }
+    if (mddev->ro == 2) {
+        /* A write to sync_action is enough to justify
+         * canceling read-auto mode
+         */
+        mddev->ro = 0;
+        md_wakeup_thread(mddev->sync_thread);
+    }
+    set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+    md_wakeup_thread(mddev->thread);
+    sysfs_notify_dirent_safe(mddev->sysfs_action);
+---
+
+We will get MD_RECOVERY_CHECK/REQUESTED/SYNC/NEEDED flag.
+
+raid1d
+  -> md_check_recovery
+    -> queue md_start_sync
+
+In normal case, we will just submit one read bio. But when MD_RECOVERY_REQUESTED
+is set, all the read bios will be submited.
+raid1_sync_request
+---
+    /* For a user-requested sync, we read all readable devices and do a
+     * compare
+     */
+    if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+        atomic_set(&r1_bio->remaining, read_targets);
+        for (i = 0; i < conf->raid_disks * 2 && read_targets; i++) {
+            bio = r1_bio->bios[i];
+            if (bio->bi_end_io == end_sync_read) {
+                read_targets--;
+                md_sync_acct_bio(bio, nr_sectors);
+                if (read_targets == 1)
+                    bio->bi_opf &= ~MD_FAILFAST;
+                generic_make_request(bio);
+            }
+        }
+    } 
+---
+When all these read bios are completed.
+raid1d
+  -> sync_request_write // if MD_RECOVERY_REQUESTED
+    -> process_checks
+---
+    for (primary = 0; primary < conf->raid_disks * 2; primary++)
+        if (r1_bio->bios[primary]->bi_end_io == end_sync_read &&
+            !r1_bio->bios[primary]->bi_status) {
+            r1_bio->bios[primary]->bi_end_io = NULL;
+            rdev_dec_pending(conf->mirrors[primary].rdev, mddev);
+            break;
+        }
+<font color="red">
+The primary is the first correct read bio....
+</font>
+    r1_bio->read_disk = primary;
+    for (i = 0; i < conf->raid_disks * 2; i++) {
+        int j;
+        struct bio *pbio = r1_bio->bios[primary];
+        struct bio *sbio = r1_bio->bios[i];
+        blk_status_t status = sbio->bi_status;
+        struct page **ppages = get_resync_pages(pbio)->pages;
+        struct page **spages = get_resync_pages(sbio)->pages;
+        struct bio_vec *bi;
+        int page_len[RESYNC_PAGES] = { 0 };
+
+        if (sbio->bi_end_io != end_sync_read)
+            continue;
+        /* Now we can 'fixup' the error value */
+        sbio->bi_status = 0;
+
+        bio_for_each_segment_all(bi, sbio, j)
+            page_len[j] = bi->bv_len;
+
+        if (!status) {
+            for (j = vcnt; j-- ; ) {
+                if (memcmp(page_address(ppages[j]),
+                       page_address(spages[j]),
+                       page_len[j]))
+                    break;
+            }
+        } else
+            j = 0;
+        if (j >= 0)
+            atomic64_add(r1_bio->sectors, &mddev->resync_mismatches);
+        if (j < 0 || (test_bit(MD_RECOVERY_CHECK, &mddev->recovery)
+                  && !status)) {
+<font color="red">
+            /* No need to write to this device. */
+</font>
+            sbio->bi_end_io = NULL;
+            rdev_dec_pending(conf->mirrors[i].rdev, mddev);
+            continue;
+        }
+
+        ....
+        bio_copy_data(sbio, pbio);
+---
+
+Then schedule writes.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="write_intent_bitmap">write-intent bitmap</a></h3>
+<p>
+<font size="2">
+<pre>
+https://raid.wiki.kernel.org/index.php/Write-intent_bitmap
+When an array has a write-intent bitmap, a spindle (a device, often a hard drive) can be removed and re-added, then only blocks 
+changes since the removal (as recorded in the bitmap) will be resynced.
+
+Therefore a write-intent bitmap reduces rebuild/recovery (md sync) time if:
+<ul>
+<li> the machine crashes (unclean shutdown)
+<li> one spindle is disconnected, then reconnected
+</ul>
+If one spindle fails and has to be replaced, a bitmap makes no difference.
+
+A write-intent bitmap may cause a degradation in write performance, it varies upon:
+<ul>
+<li> the size of the chunk data (on the RAID device) mapped to each bit in the bitmap, as expressed by cat /proc/mdstat. The ratio
+(bitmap size / RAID device size )
+<li> workload profile (long sequences of writes are more impacted, as spindle heads go back and forth between the data zone and the 
+bitmap zone) can be removed/added at any time
+Write-intent bitmap support is only available for RAID geometries causing data redundancy. For example: as RAID0 has no redundancy 
+it cannot be inconsistent, so there is nothing to record in such a bitmap.
+
+</pre>
+
+</font>
+</p>
+<h4><a name="bitmap_stores">bitmap stores</a></h4>
+<p>
+<font size="2">
+<pre>
+There are two types of bitmap log.
+<ul>
+<li> a file stored on a separate device, mddev->bitmap_info.file points to the file
+<li> internal with superblock, mddev->bitmap_info.offset indicates the offset
+     from superblock of the start of bitmap. it could be negative, but not 0
+</ul>
+
+bitmap_storage_alloc is used to allocate the pages that stores the bitmap in memory.
+
+bitmap_storage.sb_page      // cached copy of the bitmap file superblock
+              .filemap[]    // pages that store the bitmaps
+              .filemap_attr // 4 bits per page
+enum bitmap_page_attr {
+    BITMAP_PAGE_DIRTY = 0,     /* there are set bits that need to be synced */
+    BITMAP_PAGE_PENDING = 1,   /* there are bits that are being cleaned.
+                    * i.e. counter is 1 or 2. */
+    BITMAP_PAGE_NEEDWRITE = 2, /* there are cleared bits that need to be synced */
+};
+
+bitmap_file_set/clear_bit is used to operate the bitmap log.
+
+There is another bitmap conter in memory to trace the write activaties on a chunk.
+
+bitmap_load
+  -> bitmap_init_from_disk // if the bit of a chunk is set
+    -> bitmap_set_memory_bits
+---
+    spin_lock_irq(&bitmap->counts.lock);
+    bmc = bitmap_get_counter(&bitmap->counts, offset, &secs, 1);
+    if (!bmc) {
+        spin_unlock_irq(&bitmap->counts.lock);
+        return;
+    }
+    if (!*bmc) {
+        *bmc = 2;
+        bitmap_count_page(&bitmap->counts, offset, 1);
+        bitmap_set_pending(&bitmap->counts, offset);
+        bitmap->allclean = 0;
+    }
+    if (needed)
+        *bmc |= NEEDED_MASK;
+<font color="blue">
+NEEDED_MASK in the counter means this bit will counts when resync 
+</font>
+---
+
+</pre>
+</font>
+</p>
+
+
+<h4><a name="how_to_work">how to work</a></h4>
+<p>
+<font size="2">
+How does bitmap works when resync
+<pre>
+raid1_sync_request
+---
+<font color="blue">
+    //MD_RECOVERY_REQUESTED means this resync is requested by user.
+</font>
+    if (!bitmap_start_sync(mddev->bitmap, sector_nr, &sync_blocks, 1) &&
+        !conf->fullsync && !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+        /* We can skip this block, and probably several more */
+        *skipped = 1;
+        return sync_blocks;
+    }
+---
+static int __bitmap_start_sync(struct bitmap *bitmap, sector_t offset, sector_t *blocks,
+                   int degraded)
+{
+    ...
+    spin_lock_irq(&bitmap->counts.lock);
+    bmc = bitmap_get_counter(&bitmap->counts, offset, blocks, 0);
+    rv = 0;
+    if (bmc) {
+        /* locked */
+        if (RESYNC(*bmc)) // 1<<14
+            rv = 1;
+        else if (NEEDED(*bmc)) { //1<<15
+            rv = 1;
+            if (!degraded) { /* don't set/clear bits if degraded */
+                *bmc |= RESYNC_MASK;
+                *bmc &= ~NEEDED_MASK;
+            }
+        }
+    }
+    spin_unlock_irq(&bitmap->counts.lock);
+    return rv;
+}
+
+The bitmap_counter_t here is 16bits, it counts the writes on a chunk.
+Only the counter is 0, the resync could be skipped.
+When the conter could be zero ?
+
+raid1_write_request
+  -> bitmap_startwrite
+---
+        spin_lock_irq(&bitmap->counts.lock);
+        bmc = bitmap_get_counter(&bitmap->counts, offset, &blocks, 1);
+        ...
+        switch (*bmc) {
+        case 0:
+            bitmap_file_set_bit(bitmap, offset);
+<font color="blue">
+            // set the bit in the bitmap log and set dirty on the page
+</font>
+            bitmap_count_page(&bitmap->counts, offset, 1);
+            /* fall through */
+        case 1:
+            *bmc = 2;
+        }
+
+        (*bmc)++;
+
+        spin_unlock_irq(&bitmap->counts.lock);
+        ...
+    }
+---
+<font color="red">
+Before the regular bios are flushed out, the dirty bitmap log need to reach
+disk.
+</font>
+
+flush_bio_list
+  -> bitmap_unplug
+---
+    for (i = 0; i < bitmap->storage.file_pages; i++) {
+        if (!bitmap->storage.filemap)
+            return;
+        dirty = test_and_clear_page_attr(bitmap, i, BITMAP_PAGE_DIRTY);
+        need_write = test_and_clear_page_attr(bitmap, i,
+                              BITMAP_PAGE_NEEDWRITE);
+        if (dirty || need_write) {
+            if (!writing) {
+                bitmap_wait_writes(bitmap);
+                if (bitmap->mddev->queue)
+                    blk_add_trace_msg(bitmap->mddev->queue,
+                              "md bitmap_unplug");
+            }
+            clear_page_attr(bitmap, i, BITMAP_PAGE_PENDING);
+            write_page(bitmap, bitmap->storage.filemap[i], 0);
+            writing = 1;
+        }
+    }
+    if (writing)
+        bitmap_wait_writes(bitmap);
+
+---
+
+
+raid1_end_write_request
+  -> r1_bio_write_done // r1_bio->remaining is zero
+    -> close_write
+      -> bitmap_endwrite
+---
+    while (sectors) {
+        sector_t blocks;
+        unsigned long flags;
+        bitmap_counter_t *bmc;
+
+        spin_lock_irqsave(&bitmap->counts.lock, flags);
+        bmc = bitmap_get_counter(&bitmap->counts, offset, &blocks, 0);
+        ...
+        (*bmc)--;
+        if (*bmc <= 2) {
+            bitmap_set_pending(&bitmap->counts, offset);
+            bitmap->allclean = 0;
+        }
+        spin_unlock_irqrestore(&bitmap->counts.lock, flags);
+        ...
+    }
+---
+
+After data has been flushed to disk, we need to clear the bit on bitmap log and
+flush the new bitmap log into disk.
+This is done by bitmap_daemon_work. It is invoked by
+raid1d 
+  -> md_check_recovery 
+    -> bitmap_daemon_work
+need to be invoked 3 times before the bitmap log is flushed out.
+
+              writes complete
+                bmc == 2
+                   |
+                   v
+      #1        bmc = 1
+                   |
+                   v
+      #2         bmc = 0
+                clear bit and set BITMAP_PAGE_PENDING
+                   |
+                   v
+      #2        set BITMAP_PAGE_NEEDWRITE
+                write out
+---
+<font color="red">
+this could avoid frequently bitmap log update.
+</font>
+the bit is only set when the counter is 0.
+if the conter is 1 or 2, when write, the bitmap log needn't to be updated.
+</pre>
+</font>
+</p>
+
+
+
+</body>
+</html>
