@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>iscsi</title>
+</head>
+<body>
+<div>
+    <h1>iscsi</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#iscsi_framework">iscsi framework</a>
+</font>
+</p>
+
+
+<h2><a name="iscsi_framework">iscsi framework</a></h2>
+<p>
+<font size="2">
+
+The main iscsi transports:
+<ul>
+<li> iSER iscsi extensions for rdma
+<li> be2iscsi
+<li> bnx2i
+<li> cxgbi
+<li> software iscsi on tcp/ip
+<li> qedi
+<li> qla4xxx
+</ul>
+
+
+<pre>
+steps to setup iscsi:
+[1]
+iscsid  __session_login_task
+        -> iscsi_conn_connect
+          -> .ep_connect
+        [1] setup and 
+        connect socket
+        [2] ISCSI_UEVENT_TRANSPORT_EP_CONNECT
+----------------|------------------------------
+kernel          v
+        it->ep_connect
+
+[2]
+<font color="red">
+                                                                            ISCSI_INITIAL_LOGIN_STAGE
+</font>
+iscsid session_conn_poll                    
+       -> .ep_poll                          session_ipc_create              iscsi_login_req
+       [1] socket poll                      -> ipc->create_session          -> iscsi_make_login_pdu
+       [2] ISCSI_UEVENT_TRANSPORT_EP_POLL           create_conn             -> iscsi_io_send_pdu
+                 |                                  bind_conn               
+-----------------|-----------------------------------|--------------------------------------------
+kernel           v                                   v
+         it->ep_poll                         session and connection will
+                                             be setup and ready to send and
+                                             receive pdu
+
+[3]
+iscsid       
+              iscsi_recv_logout_rsp
+              ^ -> setup_full_feature_phase
+              |   -> ipc->start_conn                                    -> session_scan_host
+              |   ISCSI_UEVENT_START_CONN                                 -> iscsi_sysfs_scan_host
+--------------|----------------|--------------------------------------------------|----------------
+kernel        |                v                                                  v
+        -> iscsi_recv_pdu    iscsi_conn_start                                 scsi_scan
+      __iscsi_complete_pdu   -> session->state = ISCSI_STATE_LOGGED_IN
+                             -> iscsi_unblock_session[3]
+
+
+it iscsi_transport
+[1] sw-tcp
+[2] other transports
+[3] this is for the session reopen case
+
+Based on the rfc3720:
+an iscsi <strong>session</strong> is group of TCP connections that link an initiator with a
+target (loosely equal to a SCSI I_T nexus)
+an iscsi connection is a TCP connection. The TCP connection carry control
+messages, SCSI commands, parameters, and data within iSCSI Protocol Data Units.
+
+
+
+
+
+blk_mq_dispatch_rq_list
+blk_mq_try_issue_directly
+ --------|-------------------------------------------------------     
+         v                                                         <font color="red">scsi stack</font>
+    scsi_queue_rq
+         |
+         v
+  scsi_dispatch_cmd                          scsi_mq_done
+ --------|-----------------------------------------^-------------  
+         v [1]                                     |               <font color="red">iscsi stack</font>
+  iscsi_queuecommand                           sc->scsi_done         
+  queue iscsi_task scsi_cmnd->SCp.ptr = task iscsi_complete_task         
+                           |                       ^ iscsi_recv_pdu -> [iscsid]
+                              v enqueue               |/
+  session->leadconn->cmdqueue list       __iscsi_complete_pdu
+  (task state == ISCSI_TASK_PENDING)          ^           ^
+                           |                  |           |
+                           v dequeue          |       iscsi_tcp_recv_skb (reassemble iscsi pdu)    
+  per-connection iscsi_xmitworker             |           ^                                        
+      / iscsi_prep_scsi_cmd_pdu               |           |                                        
+      \ iscsi_xmit_task                       |           |
+----------------------------------------------|-----------|-----
+  .init_task      .xmit_task            iscsi pdu   tcp packets    <font color="red">iscsi transport</font>               
+    -> .init_pdu    -> .xmit_pdu             [2]         [3]        
+
+[1] [sw-tcp] iser be2iscsi bnx2i cxgbi qedi
+    for qla4xxx, it is qla4xxx_queuecommand
+
+[2] be2iscsi bnx2i qedi iser qla4xxx
+[3] cxgbi [sw-tcp]
+
+</pre>
+
+</font>
+</p>
+
+</body>
+</html>

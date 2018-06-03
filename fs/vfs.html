@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>VFS</title>
+</head>
+<body>
+<div>
+    <h1>VFS</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#dcache">dcache</a>
+<ul>
+<li><a href="#path_walking">path_walking</a>
+<li><a href="#locks_of_dentry">locks_of_dentry</a>
+</ul>
+<a href="#fs_misc">fs misc</a>
+<ul>
+<li><a href="#The_truth_of_page_lock">The truth of page lock</a>
+</ul>
+</font>
+</p>
+
+
+<h2><a name="dcache">dcache</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+dcache, dentry cache, directory entry cache.<br/>
+<pre>
+A dentry's core job is to represent a directory or file in filesystem and cache
+the mapping between the file/directory and the associated inode. This inode
+contains the core operations of filesystem.
+</pre>
+The dentries encode the fs tree structure, the name of files.
+The main part of a dentry is :
+<ul>
+<li> inode
+<li> name (final part of the path)
+<li> parent (the name of the containing directory)
+</ul>
+</font>
+</p>
+
+<h3><a name="path_walking">path_walking</a></h3>
+<p>
+<font size="2">
+The path walking is mainly done in link_path_walk, let's look at the skeleton of
+it.
+<pre>
+    for(;;) {
+        ...
+        hash_len = hash_name(<font color="red">nd->path.dentry, name</font>);
+<font color="blue">
+        hash_name will calculate the length and hash of the path component.
+        hash_len = len << 32 | hash
+        hash value is calculated based on pointer of parent dentry and entry name.
+</font>
+        ...
+        nd->last.hash_len = hash_len;
+        nd->last.name = name;
+        nd->last_type = type;
+<font color="blue">
+        nd->last is the name component we walking currently.
+</font>
+        name += hashlen_len(hash_len);
+        if (!*name)
+            goto OK;
+        /*
+         * If it wasn't NUL, we know it was '/'. Skip that
+         * slash, and continue until no more slashes.
+         */
+        do {
+            name++;
+        } while (unlikely(*name == '/'));
+        if (unlikely(!*name)) {
+            ...
+        } else {
+            /* not the last component */
+            err = walk_component(nd, WALK_FOLLOW | WALK_MORE);
+        }
+        ...
+    }
+walk_component will mainly do 3 things:
+1. try to get the dentry in the cache
+lookup_fast
+  -> __d_lookup(&nd->path.dentry, &nd->last)
+    -> get hash list by d_hash(name->hash)
+2. if not in cache, try to get it from fs
+lookup_slow
+  -> __lookup_slow
+    -> d_alloc_parallel // allocate dentry
+    -> inode->i_op->lookup
+<font color="blue">
+    // this will cause some io to get in the filesystem metadata of directory
+    // and inode.
+</font>
+3. follow_managed
+   mountpoint will be resolved here.
+
+</pre>
+
+</font>
+</p>
+
+<h3><a name="locks_of_dentry">locks_of_dentry</a></h3>
+<p>
+<font size="2">
+Refer to Documentation/filesystems/path-lookup.txt<br/>
+dcache is used to speed up the looking up of inode associated with a path name.
+this look up could come from multiple cores concurrently and frequently, so the
+lock mechanism is very important. Let's look into the lock of denty cache next
+and find out the how it promote the performance.
+<pre>
+In Documentation/filesystems/path-lookup.txt, it always says <font
+color="red">"would like to do path walking without taking locks or reference
+counts of intermediate dentries along the path.</font>", why ?
+
+Look into the path lookup process,
+    [0]            [2]                    [4]
+   +---+      +---------+            +-----------+
+   |   v      |         v            |           v
+/home/will/Desktop/wangjianchao/source_code/linux-stable/Makefile 
+       |      ^         |            ^           |           ^
+       +------+         +------------+           +-----------+
+          [1]                 [3]                     [5]
+
+[0]  dentry of "/", "home"
+[1]  dentry of "home", "will"
+[2]  dentry of "will", "Desktop"
+[3]  dentry of "Desktop", "wangjianchao"
+[4]  dentry of "wangjianchao", "source_code"
+[5]  dentry of "source_code", "Makefile"
+
+walk_component will be executed for [0] ~ [5], and lookup_fast will be invoked
+every time. At the moment, the component dentry's d_lock has to be locked to
+serialize the accessing to the dentry.
+__d_lookup
+---
+        spin_lock(&dentry->d_lock);
+        if (dentry->d_parent != parent)
+            goto next;
+        if (d_unhashed(dentry))
+            goto next;
+
+        if (!d_same_name(dentry, parent, name))
+            goto next;
+
+        dentry->d_lockref.count++;
+        found = dentry;
+        spin_unlock(&dentry->d_lock);
+---
+
+The contending on the lock of dentry of "home", "will" and "Desktop" should be
+very high. On the system of a lot of cores, the dentry cache could become a
+scalability problem with workload which perform lot of lookup.
+</pre>
+Currently, there are two path walking modes:
+<ul>
+<li> ref-walk
+<pre>
+ref-walk is the traditional way of performing dcache lookup using d_lock to
+serialize the concurrent modifications to the dentry and take a reference count
+on it.
+</pre>
+<li> rcu-walk
+<pre>
+rcu-walk uses seqcount based dentry lookups, and can perform lookup of intermediate
+elements <font color="red">without any stores to shared data</font> in the dentry or inode.
+</pre>
+</ul>
+The 'storing to shared data' means, in ref-walk, it need to:
+<ul>
+<li> 1. lock and unlock on spinlock d_lock
+<pre>
+    it is to serialize the modifications to dentry from rename or other
+</pre>
+<li> 2. reference counter increment of dentry
+<pre>
+    prevent the dentry to be released.
+
+    in ref-walk, we need to take a reference count when get every intermediate
+    component, and put it when step into next one.
+    walk_component
+      -> lookup_fast
+        -> __d_lookup // get the reference
+      -> step_into
+        -> path_to_nameidata
+          -> dput(nd->path.dentry) // if not LOOKUP_RCU
+</pre>
+</ul>
+
+To kill them, rcu-walk does as following:
+<ul>
+<li> Take the RCU lock for the entire path walk.
+<pre>
+path_openat/path_lookupat...
+  -> path_init
+<font color="red">
+    -> rcu_read_lock // if LOOKUP_RCU
+</font>
+  -> link_path_walk
+    -> walk_component
+      -> lookup_fast
+        -> __d_lookup_rcu
+  -> terminate_walk
+<font color="red">
+    -> rcu_read_unlock // if LOOKUP_RCU
+</font>
+So now dentry refcounts are not required for dentry persistence.
+Because the dentry free employs call_rcu.
+dput
+  -> dentry_kill
+    -> __dentry_kill
+      -> dentry_free
+        -> call_rcu(&dentry->d_u.d_rcu, __d_free);
+</pre>
+<li> Use seqlock to protect the dentry name, parent and inode.
+<pre>
+The snapshot of the dentry's name, parent and inode (for child lookup) will be
+protected by the per-dentry seqlock. dentry lookups recheck the sequence after
+the child is found in case anything changed in the parent in the path walk.
+lookup_fast
+---
+    if (nd->flags & LOOKUP_RCU) {
+        unsigned seq;
+        bool negative;
+        dentry = __d_lookup_rcu(parent, &nd->last, &seq);
+        ---
+        <pre>
+<font color="blue">
+        hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
+            unsigned seq;
+
+    seqretry:
+        /*
+         * The dentry sequence count protects us from concurrent
+         * renames, and thus protects parent and name fields.
+         *
+         * The caller must perform a seqcount check in order
+         * to do anything useful with the returned dentry.
+         */
+            seq = raw_seqcount_begin(&dentry->d_seq);
+            if (dentry->d_parent != parent)
+                continue;
+            if (d_unhashed(dentry))
+                continue;
+
+            if (unlikely(parent->d_flags & DCACHE_OP_COMPARE)) {
+                ...
+            } else {
+                if (dentry->d_name.hash_len != hashlen)
+                    continue;
+                if (dentry_cmp(dentry, str, hashlen_len(hashlen)) != 0)
+                    continue;
+            }
+            *seqp = seq;
+            return dentry;
+        }
+</font>
+       </pre>
+        ---
+        ...
+<font color="blude">
+        //This sequence count validates that the inode matches
+        //the dentry name information from lookup.
+</font>
+        *inode = d_backing_inode(dentry);
+        negative = d_is_negative(dentry);
+        if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
+            return -ECHILD;
+        ...
+<font color="blude">
+        //This sequence count validates that the parent had no
+        //changes while we did the lookup of the dentry above.
+</font>
+        if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
+            return -ECHILD;
+
+        *seqp = seq;
+        ...
+    }
+---
+
+The write_seqcount on dentry->d_seq occurs when modify the dentry, such as
+__d_move.
+</pre>
+</ul>
+
+There are two points that why seqlock is better than spinlock in almost-read
+scenario.
+<ul>
+<li> No lock contending in read scenario
+<li> No write operation in read scenario, this is good for cache.
+</ul>
+</font>
+</p>
+
+
+<h2><a name="fs_misc">fs misc</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+<h3><a name="The_truth_of_page_lock">The truth of page lock</a></h3>
+<p>
+<font size="2">
+block_read_full_page(), __block_write_full_page() and
+__block_write_full_page()_all will create buffer_heads for page.
+
+<pre>
+create_page_buffers()
+    -> create_empty_buffers()
+        -> attach_page_buffers()
+            -> SetPagePrivate()
+            -> set_page_private()
+</pre>
+
+
+The truth of the page lock and bh lock<br/>
+
+In the process of read operations
+<pre>
+do_generic_file_read()
+    -> page_cache_sync_readahead() // if page is not present
+        -> ondemand_readahead()
+            -> ra_submit()
+                -> __do_page_cache_readahead()
+                    -> read_pages()
+                        -> mapping->a_ops->readpages()
+                           ext4_mpage_readpages()
+                            -> add_to_page_cache_lru()
+                                -> __set_page_locked() // page is locked ------> Here
+                            -> block_read_full_page() // if page has buffers
+                                -> lock_buffer() // the buffer_head is locked -----> Here
+                                -> mark_buffer_async_read()
+                                    //bh->b_end_io = end_buffer_async_read
+                                -> submit_bh()
+    -> !PageUptodate() && !trylock_page() , go to page_not_up_to_date
+    -> lock_page_killable()
+    -> if PageUptodate(), unlock_page() and goto page_ok
+</pre>
+Where the page and buffer_head are unlocked ?
+<pre>
+static void end_buffer_async_read(struct buffer_head *bh, int uptodate)
+{
+    unsigned long flags;
+    struct buffer_head *first;
+    struct buffer_head *tmp;
+    struct page *page;
+    int page_uptodate = 1;
+
+    BUG_ON(!buffer_async_read(bh));
+
+    page = bh->b_page;
+    if (uptodate) {
+        set_buffer_uptodate(bh);
+    } else {
+        clear_buffer_uptodate(bh);
+        buffer_io_error(bh, ", async page read");
+        SetPageError(page);
+    }
+
+    /*
+     * Be _very_ careful from here on. Bad things can happen if
+     * two buffer heads end IO at almost the same time and both
+     * decide that the page is now completely done.
+     */
+    first = page_buffers(page);
+    local_irq_save(flags);
+    bit_spin_lock(BH_Uptodate_Lock, &first->b_state);
+    clear_buffer_async_read(bh);
+    unlock_buffer(bh);
+    tmp = bh;
+    do {
+        if (!buffer_uptodate(tmp))
+            page_uptodate = 0;
+        if (buffer_async_read(tmp)) {
+            BUG_ON(!buffer_locked(tmp)); //This could prove that the buffer_head is locked during the read process
+            goto still_busy;
+        }
+        tmp = tmp->b_this_page;
+    } while (tmp != bh);
+    bit_spin_unlock(BH_Uptodate_Lock, &first->b_state);
+    local_irq_restore(flags);
+
+    /*
+     * If none of the buffers had errors and they are all
+     * uptodate then we can set the page uptodate.
+     */
+    if (page_uptodate && !PageError(page))
+        SetPageUptodate(page);
+    unlock_page(page);
+    return;
+
+still_busy:
+    bit_spin_unlock(BH_Uptodate_Lock, &first->b_state);
+    local_irq_restore(flags);
+    return;
+}
+</pre>
+If all the buffer in that page are uptodate, the page will be set uptodate and
+unlocked.<br/>
+
+
+<strong> We could see that the page and buffer_head both are locked during the process
+of read operations. The lock ensure the page exclusive because the device need 
+write data into the page through DMA.</strong>
+
+What's about the write operations ?<br/>
+
+The write process is divided into two parts.<br/>
+
+1> write the user data into page cache
+<pre>
+generic_perform_write()
+    -> a_ops->write_begin()
+       ext4_write_begin()
+        -> grab_cache_page_write_begin()
+            -> pagecache_get_page()
+                -> find_get_entry()
+                If get 
+                -> lock_page() //page is locked
+                otherwise
+                -> add_to_page_cache_lru()
+                    -> __set_page_locked() //page is locked'
+        -> unlock_page()
+        -> ext4_journal_start() // About why does unlock_page() before the
+    ext4_journal_start(), please refer to the comment in ext4_write_begin()
+        -> lock_page() // the page is relocked
+        -> <font color="red">wait_for_stable_page()</font>
+
+    -> iov_iter_copy_from_user_atomic()
+
+    -> a_ops->write_begin()
+        -> block_write_end()
+            -> __block_commit_write()
+                -> set_buffer_uptodate()
+                -> mark_buffer_dirty()
+                -> SetPageUptodate() // if no partial
+        -> unlock_page() // page is unlocked
+</pre>
+<strong>The page lock will ensure the page exclusive from other operations when the
+user data is being copied into it.</strong>
+
+2> write back the dirty page 
+<pre>
+ext4_writepages()
+    -> blk_start_plug()
+    -> write_cache_pages() //Go here when in journal mode because this mode
+    does not support delayed allocation. We use this branch to demonstrate the
+    page and bh lock because I really didn't find the where does the lock_page
+    locate.
+        -> lock_page() -------> Here
+        -> wait_on_page_writeback() when PageWriteback() // keep the write back atomic
+        -> clear_page_dirty_for_io()
+        -> __writepage()
+            -> ext4_writepage()
+                -> ext4_bio_write_page()
+                    -> set_page_writeback() //very important
+                    -> set_buffer_async_write()
+                    -> io_submit_add_bh()
+                        -> ext4_io_submit()
+                        -> io_submit_init_bio()
+                            // set bi_end_io = ext4_end_bio()
+                    -> unlock_page() ----> Here
+                    
+    -> blk_finish_plug()
+
+
+ext4_end_bio()
+    -> ext4_finish_bio()
+        -> clear_buffer_async_write()
+        -> end_page_writeback() // !under_io
+            -> test_clear_page_writeback()
+            -> wake_up_page(page, PG_writeback);
+
+</pre>
+<strong>The page is not locked during the write operations. But the writeback flag is
+set to ensure the atomicity of the operations on the page </strong>
+</font>
+</p>
+
+
+</body>
+</html>

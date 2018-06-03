@@ -18,6 +18,10 @@
 <a href="#Implementation">Implementation</a>
 <ul>
 <li><a href="#How_to_identify_paths_to_one_LU">How to identify pathes to one LU</a>
+<li><a href="#Deliver_request">Deliver request</a>
+<li><a href="#path_select">path select</a>
+<li><a href="#path_group">path group</a>
+<li><a href="#device_handler">device handler</a>
 </ul>
 </font>
 </p>
@@ -272,9 +276,219 @@ Device identifiers consist of one or more of the following:
 </ul>
 </pre>
 
-
 </font>
 </p>
+
+<h3><a name="Deliver_request">Deliver request</a></h3>
+<p>
+<font size="2">
+<pre>
+
+  ----------------------------
+         Queue of DM
+
+   Merge, Sort, IO scheduling
+  ----------------------------
+    Path0          Path1           
+  Queue of Dev    Queue of Dev
+  -----------     ------------
+      | issue         | issue
+      v               v
+
+
+All the merge, sort and io scheduling work is done in the queue of DM device.
+The requests will only passthrough the queue of target device.
+This is done by blk_insert_cloned_request.
+
+blk_insert_cloned_request used to queue the original request to underlying
+request_queues' hctx->dispatch and run the hctx directly.
+When the underlying driver returns BLK_STS_DEV_RESOURCE/BLK_STS_RESOURCE,
+the cloned request will be queued to underlying hctx->dispatch and wait for
+the resource. And also, the original request has been issued from the top layer
+queue (dm queue) and cannot do any merge on it.
+
+A patch from leiming improve this.
+396eaf2 (blk-mq: improve DM's blk-mq IO merging via blk_insert_cloned_request feedback)
+---
+    Fix this by updating blk_insert_cloned_request() to use
+    blk_mq_request_direct_issue().  blk_mq_request_direct_issue() allows a
+    request to be issued directly to the underlying queue and returns the
+    dispatch feedback (blk_status_t).  If blk_mq_request_direct_issue()
+    returns BLK_SYS_RESOURCE the dm-rq driver will now use DM_MAPIO_REQUEUE
+    to _not_ destage the request.  Whereby preserving the opportunity to
+    merge IO.
+---
+See map_request()
+---
+    case DM_MAPIO_REMAPPED:
+        if (setup_clone(clone, rq, tio, GFP_ATOMIC)) {
+            /* -ENOMEM */
+            ti->type->release_clone_rq(clone);
+            return DM_MAPIO_REQUEUE;
+        }
+
+        /* The target has remapped the I/O so dispatch it */
+        trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
+                     blk_rq_pos(rq));
+        ret = dm_dispatch_clone_request(clone, rq);
+        if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE) {
+            blk_rq_unprep_clone(clone);
+            tio->ti->type->release_clone_rq(clone);
+            tio->clone = NULL;
+<font color="red">
+            //release the cloned request and requeue the original request.
+</font
+            if (!rq->q->mq_ops)
+                r = DM_MAPIO_DELAY_REQUEUE;
+            else
+                r = DM_MAPIO_REQUEUE;
+            goto check_again;
+        }
+        break;
+    case DM_MAPIO_REQUEUE:
+        /* The target wants to requeue the I/O */
+        break;
+    case DM_MAPIO_DELAY_REQUEUE:
+        /* The target wants to requeue the I/O after a delay */
+        dm_requeue_original_request(tio, true);
+        break;
+
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="path_select">path select</a></h3>
+<p>
+<font size="2">
+<pre>
+multipath_clone_and_map
+---
+    /* Do we need to select a new pgpath? */
+    pgpath = READ_ONCE(m->current_pgpath);
+    if (!pgpath || !test_bit(MPATHF_QUEUE_IO, &m->flags))
+        pgpath = choose_pgpath(m, nr_bytes);
+---
+We will choose path in following cases:
+<ul>
+<li> m->current_pgpath is NULL
+The typical case which will set current_pgpath to NULL is fail_path.
+When io error occurs on the path.
+dm_softirq_done
+  -> dm_done
+    -> multipath_end_io //<font color="red">blk_path_error</font>
+      -> fail_path
+When user mode message indicates that (multipathd)
+multipath_message
+<li> MPATHF_QUEUE_IO is <font color="red">not</font> set
+It is set by __switch_pg when <a href="#device_handler">device handler</a> is set
+---
+    if (m->hw_handler_name) {
+        set_bit(MPATHF_PG_INIT_REQUIRED, &m->flags);
+        set_bit(MPATHF_QUEUE_IO, &m->flags);
+    }
+---
+The PG initialization process is started by pg_init_all_paths.
+When it is completed, pg_init_done is invoked and MPATHF_QUEUE_IO is cleared.
+after pg_init_done clears MPATHF_QUEUE_IO, it will also kick the requeue list.
+as we know, when MPATHF_QUEUE_IO is set, the reqs are all requeued.
+pg_init_done
+  -> process_queued_io_list
+    -> dm_mq_kick_requeue_list.
+      -> __dm_mq_kick_requeue_list
+        -> blk_mq_delay_kick_requeue_list
+</ul>
+<br/>
+<strong>Therefore, we will select path every time!</strong><br/>
+choose_pgpath
+---
+<font color="blue">
+/* Don't change PG until it has no remaining paths */
+</font>
+check_current_pg:
+    pg = READ_ONCE(m->current_pg);
+    if (pg) {
+        pgpath = choose_path_in_pg(m, pg, nr_bytes);
+        if (!IS_ERR_OR_NULL(pgpath))
+            return pgpath;
+    }
+---
+static struct pgpath *choose_path_in_pg(struct multipath *m,
+                    struct priority_group *pg,
+                    size_t nr_bytes)
+{
+    unsigned long flags;
+    struct dm_path *path;
+    struct pgpath *pgpath;
+
+    path = pg->ps.type->select_path(&pg->ps, nr_bytes);
+    if (!path)
+        return ERR_PTR(-ENXIO);
+
+    pgpath = path_to_pgpath(path);
+
+    if (unlikely(READ_ONCE(m->current_pg) != pg)) {
+        /* Only update current_pgpath if pg changed */
+        spin_lock_irqsave(&m->lock, flags);
+        m->current_pgpath = pgpath;
+<font color="red">
+        __switch_pg(m, pg);
+</font>
+        spin_unlock_irqrestore(&m->lock, flags);
+    }
+
+    return pgpath;
+}
+Let's look at the round-robin selector:
+static struct dm_path *rr_select_path(struct path_selector *ps, size_t nr_bytes)
+{
+    unsigned long flags;
+    struct selector *s = ps->context;
+    struct path_info *pi = NULL;
+
+    spin_lock_irqsave(&s->lock, flags);
+    if (!list_empty(&s->valid_paths)) {
+<font color="blue">
+    select and move it to the back of the list
+</font>
+        pi = list_entry(s->valid_paths.next, struct path_info, list);
+        list_move_tail(&pi->list, &s->valid_paths);
+    }
+    spin_unlock_irqrestore(&s->lock, flags);
+
+    return pi ? pi->path : NULL;
+}
+
+Except for round-robin selector, there are queue-length and service-time ones
+which looks smarter.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="path_group">path group</a></h3>
+<p>
+<font size="2">
+<pre>
+http://www.linux-admins.net/2010/10/multipath-usage-guide-for-san-in-rhel.html
+Determines how the path group(s) are formed using the available paths. There are five different policies:
+<ul>
+<li> multibus: One path group is formed with all paths to a LUN. Suitable for devices that are in Active/Active mode.
+<li> failover: Each path group will have only one path.
+<li> group_by_serial: One path group per storage controller(serial). All paths that connect to the LUN through a controller are assigned to a <li> path group. Suitable for devices that are in Active/Passive mode.
+<li> group_by_prio: Paths with same priority will be assigned to a path group.
+<li> group_by_node_name: Paths with same target node name will be assigned to a path group.
+</ul>
+</pre>
+</font>
+</p>
+
+<h3><a name="device_handler">device handler</a></h3>
+<p>
+<font size="2">
+</font>
+</p>
+
 
 
 </body>

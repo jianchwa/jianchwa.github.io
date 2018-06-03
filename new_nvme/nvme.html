@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NVMe</title>
+</head>
+<body>
+<div>
+    <h1>NVMe</h1> 
+</div>
+<p>
+<font size="2">
+
+</font>
+</p>
+
+<h2><a name="nvme_topology">nvme topology</a></h2>
+<p>
+<font size="2">
+
+<pre>
+nvme subsystem
+
+   PCIe Port x   PCIe Port y
+    +------|-------------|------+
+    |   +-----+       +-----+   |
+    |   | [0] |       | [0] |   |
+    |   |ctrl0|       |ctrl1|   |
+    |   +-----+       +-----+   |
+    |nsid1 nsid2     nsid2 nsid3|
+    +--|-----|---------|-----|--+
+       v     +----v----+     v
+    +-----+    +-----+    +-----+
+    | ns0 |    | ns2 |    | ns3 |
+    +-----+    +-----+    +-----+
+
+[0] PCI Function 0
+
+</pre>
+In the view of cpu, it cannot identify the nvme subsystem but only the PCI function.
+So the the driver will create a <font color="red">nvme_ctrl</font> first. The nvme_subsystem
+is created in nvme_init_identify.
+<pre>
+We could know the Controller Multi-path I/O and Namespace Sharing Capabilities
+(CMIC) through the 76th byte of the identify data struct.
+<ul>
+<li> If bit2 is set, then the controller is associated with a SR-IOV virtual
+function, otherwise, is a PCI function.
+<li> If bit1 is set, then the subsystem maybe connected to more than one host,
+may contail two or more controllers.
+<li> if bit0 is set, the subsystem may contain more than one nvme subsytem port.
+</ul>
+The nvme subsystem is identified by the NVM subsystem NVMe Qualified Name (SUBNQN)
+nvme_init_identify
+  -> nvme_init_subsystem
+<ul>
+<li> find whether the nvme_subsystem has been in system based on SUBNQN, if not,
+create one.
+<li> the kobj name of the nvme_subsystem is nvme-subsys%d
+<li> nvme_ctrl->subsys contains the subsystem it belongs to.
+nvme_subsystem->ctrls list contains all the nvme_ctrl.
+<li> a link of the nvme_ctrl's sysfs file will be created in the
+nvme_subsystem's sysfs directoy
+</ul>
+</pre>
+<br/>
+nvme subsystem and nvme controller have different view of nvme namespaces.<br/>
+In the diagram of nvme subsystem above, the nvme subsystem sees 3 namespaces,
+but controller0/1 can only see 2 namespace. This is due to the namespace 2 is
+shared between the two controllers. There are also multiple paths from host to
+namespace 2.
+<pre>
+PCI port X -> controller 0 -> namespace 2
+PCI port Y -> controller 1 -> namespace 2
+</pre>
+Let's look at how to implement this in nvme driver.
+<pre>
+nvme_ns is the view of the namespace in controller's eye.
+they are saved in nvme_ctrl->namespaces list.
+nvme_ns is an instance that handle the ios from blk-mq layer. It contains
+request_queue and gendisk.
+
+nvme_head_ns is the view of namespace in subsystem's eye.
+they are saved in nvme_subsystem->nsheads.
+1 nvme_head_ns could corresponds to multiple nvme_ns.
+nvme_ns->head saves the nvme_head_ns.
+nvme_head_ns->list saves the name_ns
+
+nvme_head_ns also has its own gendisk which is bio based.
+it is used for nvme multipath.
+looks at its .make_request_fn
+nvme_ns_head_make_request
+---
+    srcu_idx = srcu_read_lock(&head->srcu);
+    ns = nvme_find_path(head); // nvme_ns_head->list
+    if (likely(ns)) {
+        bio->bi_disk = ns->disk;
+        bio->bi_opf |= REQ_NVME_MPATH;
+        ret = direct_make_request(bio);
+    }
+    ...
+    srcu_read_unlock(&head->srcu, srcu_idx);
+---
+
+    nvme_ns_head nvme1n1
+         | nvme_ns_head_make_request
+         V
+nvme1c1n1 nvme1c2n1
+nvme_ns   nvme_ns
+
+</pre>
+</font>
+</p>
+
+
+</body>
+</html>

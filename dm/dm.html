@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DM</title>
+</head>
+<body>
+<div>
+    <h1>DM</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Bio_Stacked_Layer">Bio Stacked Layer</a>
+<ul>
+<li><a href="#Bio_based_DM">Bio based DM</a>
+</ul>
+<a href="#dm_suspend">dm suspend</a><br/>
+<a href="#table_load">table load</a><br/>
+<a href="#snapshot">snapshot</a>
+<ul>
+<li><a href="#summary">summary</a>
+<li><a href="#implementation">implementation</a>
+<ul>
+<li><a href="#origin_bio">origin bio</a>
+<li><a href="#exception_table">exception table</a>
+</ul>
+</ul>
+</font>
+</p>
+
+<h2><a name="Bio_Stacked_Layer">Bio Stacked Layer</a></h2>
+<p>
+<font size="2">
+It is bio-based dm and md where the generic_make_request mavbe invoked
+<strong>recursively</strong>. At the moment when generic_make_request is invoked
+recursively, the current->bio_list is not NULL, then the bio will be add on the
+tail of the list. However, there will be dependency issue in this case.
+<pre>
+
+current->bio_list Head <- bio0 <- bio1 <- bio2
+      |
+      v
+q->make_request_fn
+      |
+      v
+current->bio_list Head <- bio1 <- bio2 <font color="red"><- bio0a <- bio0b</font>
+
+What if the target driver must wait the bio0 to be compeleted before it handle
+bio1 ?
+(I cannot give a actual example here, but it should exist in the md or dm target
+ drivers.)
+
+And the correct scenario should be as following:
+
+current->bio_list Head <- bio0 <- bio1 <- bio2
+      |
+      v
+q->make_request_fn
+      |
+      v
+current->bio_list Head <font color="red"><- bio0a <- bio0b </font><- bio1 <- bio2
+
+Then bio0a and bio0b which come from bio0 could be handled prior to bio1 and bio2.
+This is excepted.
+
+</pre>
+<strong>How to achieve this ?</strong><br/>
+Look at generic_make_request.
+<pre>
+<font color="blue">
+bio_list_on_stack[0] contains bios submitted by the current make_request_fn.
+bio_list_on_stack[1] contains bios that were submitted before the current
+make_request_fn, but that haven't been processed yet.
+</font>
+    if (current->bio_list) {
+        bio_list_add(&current->bio_list[0], bio);
+        goto out;
+    }
+
+    BUG_ON(bio->bi_next);
+    bio_list_init(&bio_list_on_stack[0]);
+    current->bio_list = bio_list_on_stack;
+    do {
+        struct request_queue *q = bio->bi_disk->queue;
+        blk_mq_req_flags_t flags = bio->bi_opf & REQ_NOWAIT ?
+            BLK_MQ_REQ_NOWAIT : 0;
+
+        if (likely(blk_queue_enter(q, flags) == 0)) {
+            struct bio_list lower, same;
+
+            bio_list_on_stack[1] = bio_list_on_stack[0];
+            bio_list_init(&bio_list_on_stack[0]);
+            <font color="blue">Hand over the bios on list[0] to list[1], the
+                list[0] here is used to save the new bios generated during .make_request_fn</font>
+            ret = q->make_request_fn(q, bio);
+
+            blk_queue_exit(q);
+
+            /* sort new bios into those for a lower level
+             * and those for the same level
+             */
+            bio_list_init(&lower);
+            bio_list_init(&same);
+            while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+                if (q == bio->bi_disk->queue)
+                    bio_list_add(&same, bio);
+                else
+                    bio_list_add(&lower, bio);
+            <font color="red">
+            /* now assemble so we handle the lowest level first */
+            bio_list_merge(&bio_list_on_stack[0], &lower);
+            bio_list_merge(&bio_list_on_stack[0], &same);
+            bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+            </font>
+        } else {
+            if (unlikely(!blk_queue_dying(q) &&
+                    (bio->bi_opf & REQ_NOWAIT)))
+                bio_wouldblock_error(bio);
+            else
+                bio_io_error(bio);
+        }
+        bio = bio_list_pop(&bio_list_on_stack[0]); //<font color="blue">Get
+        request from the head of the list[0]</font>
+    } while (bio);
+    current->bio_list = NULL; /* deactivate */
+</pre>
+
+</font>
+</p>
+<h3><a name="Bio_based_DM">Bio based DM</a></h3>
+<p>
+<font size="2">
+<strong>dm_target or ti</strong>
+<pre>
+    /* target limits */
+    sector_t begin;
+    sector_t len;
+
+    /* If non-zero, maximum size of I/O submitted to a target. */
+    uint32_t max_io_len;
+    <font color="blue">
+    Why we need this ?
+    Consider the dm-stripe, if the stripe is 128K, the max_io_len here
+    is 128k. Or we can say the dm_target is stripped by this max_io_len.
+    </font>
+      ti.begin                           ti.begin + ti.len
+            | _ _ _ | _ _ _ | _ _ _ | _ _ _ |
+                    \_ _ _ _/
+                        v
+                  ti.max_io_len
+</pre>
+<strong>max_io_len()</strong> will return the max io length that could be issued
+from specific sector. It will guarantee:
+<ul>
+<li> no io is bigger than ti.max_io_len
+<li> no io stretches over two blocks aligned with ti.max_io_len
+</ul>
+__split_and_process_bio will split the bio based on max_io_len.
+<pre>
+dm_make_request
+  -> __dm_make_request
+    -> __split_and_process_bio
+    --
+        while (ci.sector_count && !error) {
+            error = __split_and_process_non_flush(&ci);
+                     -> __clone_and_map_data_bio
+                       -> __map_bio
+                         -> generic_make_request
+                     -> ci->sector += len
+                     -> ci->sector_count -= len
+            ...
+        }
+    --
+</pre>
+<br/>
+<strong>cloned bio</strong>
+<pre>
+              dm_io
+             +------+
+             |      | -> md  (dm device)
+             |      | -> io_count (count of cloned bio)
+             |      | -> orig_bio
+             +------+- - - +-----+
+             |  tio |      |     | -> io (father dm_io)
+             +------+,     |     | -> ti
+                      \    |     | -> inside_dm_io (true for embedded tio)
+                       \   +-----+
+                        \  |clone| (embedded cloned bio)
+                         '-+-----+
+
+Note: most of time, there will be only one cloned bio
+      then the embedded tio will be use. otherwise, new
+      tio will be allocated, its father dm_io.io_count
+      will be increased to count this.
+
+</pre>
+cloned bios share the same original bio's biovec, but they will point to
+different part. this is done in clone_bio.
+<pre>
+static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+             sector_t sector, unsigned len)
+{
+    struct bio *clone = &tio->clone;
+
+    __bio_clone_fast(clone, bio);
+
+    ...
+
+    if (bio_op(bio) != REQ_OP_ZONE_REPORT)
+        <font color="red">bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));</font>
+    clone->bi_iter.bi_size = to_bytes(len);
+    ...
+    return 0;
+}
+</pre>
+other other hand, cloned bios may point to different disk.
+this is done by ti->type->map() callback. <br/>
+<strong><font color="red">the original bio will stay in dm layer, the cloned bio
+will be issued to do the real io on behalf of original bio. when all the cloned
+bio are completed, the original bio could be able to be completed.</font></strong>
+<pre>
+Before submit the clone bio, __map_bio will assign it a bi_end_io, clone_endio.
+clone_endio
+  -> dec_pending
+ --
+     if (atomic_dec_and_test(&io->io_count)) {
+        ...
+        io_error = io->status;
+        bio = io->orig_bio;
+        end_io_acct(io);
+        free_io(md, io);
+
+        if (io_error == BLK_STS_DM_REQUEUE)
+            return;
+
+        if ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size) {
+            /*
+             * Preflush done for flush with data, reissue
+             * without REQ_PREFLUSH.
+             */
+            bio->bi_opf &= ~REQ_PREFLUSH;
+            queue_io(md, bio);
+        } else {
+            /* done with normal IO or empty flush */
+            if (io_error)
+                bio->bi_status = io_error;
+            bio_endio(bio);
+        }
+    }
+
+ --
+</pre>
+</font>
+</p>
+
+
+<h2><a name="dm_suspend">dm suspend</a></h2>
+<p>
+<font size="2">
+The biggest target of dm suspend/resume is:
+<pre>
+  We need to be able to change a mapping table under a mounted
+  filesystem.  For example we might want to move some data in
+  the background.  Before the table can be swapped with
+  dm_bind_table, dm_suspend must be called to flush any in
+  flight bios and ensure that any further io gets deferred.
+</pre>
+How to achieve this ?
+<ul>
+<li> 1. Flush all I/Os by lock_fs() if needed.
+<li> 2. Stop new io to be dispatched, defer them
+<li> 3. Wait for all the in-flight ios to be completed or requeued.
+</ul>
+<pre>
+</pre>
+Code:__dm_suspend // under md->suspend_lock <br/>
+case 1 will be explained later, let's look at the 2nd and 3rd case next.<br/>
+
+case 2: <br/>
+For bio-based dm
+<pre>
+    set_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags);
+    if (map)
+        synchronize_srcu(&md->io_barrier);
+</pre>
+This srcu io_barrier will sync with both
+<ul>
+<li> __dm_make_request (normal)
+<pre>
+__dm_make_request
+---
+    map = dm_get_live_table(md, &srcu_idx); <font color="blue">//lock srcu md->io_barrier</font>
+
+    /* if we're suspended, we have to queue this io for later */
+    if (unlikely(test_bit(<font color="red">DMF_BLOCK_IO_FOR_SUSPEND</font>, &md->flags))) {
+        dm_put_live_table(md, srcu_idx);
+
+        if (!(bio->bi_opf & REQ_RAHEAD)) <font color="blue">//take bio of readahead as io error ?</font>
+            queue_io(md, bio);  <font color="blue">//hand the bio to dm_wq_work</font>
+        else
+            bio_io_error(bio);
+        return ret;
+    }
+
+    ret = process_bio(md, map, bio);
+
+    dm_put_live_table(md, srcu_idx); <font color="blue">//lock srcu md->io_barrier</font>
+---
+</pre>
+<li> dm_wq_work (requeue and defer)
+<pre>
+    map = dm_get_live_table(md, &srcu_idx);
+
+    while (!test_bit(<font color="red">DMF_BLOCK_IO_FOR_SUSPEND</font>, &md->flags)) {
+        spin_lock_irq(&md->deferred_lock);
+        c = bio_list_pop(&md->deferred);
+        spin_unlock_irq(&md->deferred_lock);
+
+        if (!c)
+            break;
+
+        if (dm_request_based(md))
+            generic_make_request(c);
+        else
+            __split_and_process_bio(md, map, c);
+    }
+    dm_put_live_table(md, srcu_idx);
+
+</pre>
+</ul>
+ For request based dm
+ <pre>
+    if (dm_request_based(md)) {
+        dm_stop_queue(md->queue);
+<font color="blue">
+          -> dm_stop_queue
+            -> blk_mq_quiesce_queue
+</font>
+        if (md->kworker_task)
+            kthread_flush_worker(&md->kworker);
+<font color="blue">
+    md->kworker is the task to handle the request of block legacy req-based path.
+    refer to 
+    dm_old_request_fn
+    map_tio_request
+</font>
+    }
+
+    flush_workqueue(md->wq);
+<font color="blue">
+    What is the flush_workqueue here for ?
+    the work can be queued by __dm_make_request->queue_io anytime.
+</font>
+</pre>
+<br/>
+<br/>
+case 3: <br/>
+Wait the in-flight ios to be completed or requeued
+<pre>
+    r = dm_wait_for_completion(md, task_state);
+<font color="blue">
+      -> wait !md_in_flight(md) on md->wait
+</font>
+    if (!r)
+        set_bit(dmf_suspended_flag, &md->flags);
+
+add:
+__split_and_process_bio
+  -> init_clone_info
+    -> alloc_io
+      -> start_io_acct
+dec:
+clone_endio
+  -> dec_pending
+    -> end_io_acct //dm_io->io_count reaches zero
+</pre>
+
+</font>
+</p>
+
+
+<h2><a name="table_load">table load</a></h2>
+<p>
+<font size="2">
+A bit explaining about the hash_cell in dm code.
+<pre>
+struct hash_cell {
+    struct list_head name_list;
+    struct list_head uuid_list;
+
+    char *name;
+    char *uuid;
+    struct mapped_device *md;
+    struct dm_table *new_map;
+};
+
+There are two hash list in dm code with name or uuid of md as hash key separately.
+</pre>
+The parameters structure of a dm table.
+<pre>
+             --        dm_ioctl {
+             |             __u32 version[3];
+             |             __u32 data_size;  /* total size of data passed in
+             |             __u32 data_start; <font color="blue">/* offset to start of data relative to 
+             |                              start of this struct */</font>
+             |             __u32 target_count;    /* in/out */
+ data_start <             ...
+             |             char name[DM_NAME_LEN];
+             |             char uuid[DM_UUID_LEN];
+             |             char data[7];
+             |         }
+             |         ...
+             --        struct dm_target_spec {
+             --            __u64 sector_start;
+             |             __u64 length;
+             |             __s32 status;        /* used when reading from kernel only */
+      next  <         
+             |             __u32 next; <font color="red">//Location of the next dm_target_spec.</font>
+             |         
+             |              char target_type[DM_MAX_TYPE_NAME];
+             |         };
+             |         other target parameters
+             --         struct dm_target_spec {
+                           __u64 sector_start;
+                           __u64 length;
+                           __s32 status;        /* used when reading from kernel only */
+                     
+                          __u32 next; <font color="red">//Location of the next dm_target_spec.</font>
+                     
+                         char target_type[DM_MAX_TYPE_NAME];
+                      };
+                      other target parameters
+</pre>
+populate_table will parse the parameters.
+<pre>
+populate_table
+ -> dm_table_add_target(table,
+                        spec->target_type,
+                        spec->sector_start,
+                        spec->length,
+                        target_params);
+   -> dm_get_target_type
+   -> type->ctr
+</pre>
+
+table_load will not install the new table, but just save it into the hash_cell.
+<pre>
+    down_write(&_hash_lock);
+    hc = dm_get_mdptr(md);
+    ...
+    if (hc->new_map)
+        old_map = hc->new_map;
+    hc->new_map = t;
+    up_write(&_hash_lock);
+
+</pre>
+<strong>the new table will be installed in do_resume</strong>
+<pre>
+    down_write(&_hash_lock);
+
+    hc = __find_device_hash_cell(param);
+    ...
+    md = hc->md;
+
+    new_map = hc->new_map;
+    hc->new_map = NULL;
+    param->flags &= ~DM_INACTIVE_PRESENT_FLAG;
+
+    up_write(&_hash_lock);
+
+    /* Do we need to load a new map ? */
+    if (new_map) {
+        /* Suspend if it isn't already suspended */
+        if (param->flags & DM_SKIP_LOCKFS_FLAG)
+            suspend_flags &= ~DM_SUSPEND_LOCKFS_FLAG;
+        if (param->flags & DM_NOFLUSH_FLAG)
+            suspend_flags |= DM_SUSPEND_NOFLUSH_FLAG;
+        if (!dm_suspended_md(md))
+<font color="red">
+            dm_suspend(md, suspend_flags);
+</font>
+        old_map = dm_swap_table(md, new_map);
+            -> __bind
+              -> rcu_assign_pointer(md->map, (void *)t)
+              -> dm_sync_table(md)
+        ...
+    }
+</pre>
+</font>
+</p>
+
+<h2><a name="snapshot">snapshot</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+
+
+<h3><a name="lvm_snapshot_demo">lvm snapshot demo</a></h3>
+<p>
+<font size="2">
+https://www.clevernetsystems.com/lvm-snapshots-explained/<br/>
+First, create a dummy device that we will initialize as a PV:
+<pre>
+# dd if=/dev/zero of=test0 bs=8192 count=131072
+# losetup /dev/loop0 test0
+# pvcreate /dev/loop0
+# pvs
+PV VG Fmt Attr PSize PFree
+/dev/loop0 lvm2 a-- 1.00g 1.00g
+</pre>
+We now have a 1GB LVM2 Physical Volume.
+<pre>
+# vgcreate vg0
+# vgs
+VG #PV #LV #SN Attr VSize VFree
+vg0 1 0 0 wz--n- 1020.00m 1020.00m
+# lvcreate -n lv0 -l 100 vg0
+# lvs
+LV VG Attr LSize Pool Origin Data% Move Log Copy% Convert
+lv0 vg0 -wi-a---- 400.00m
+</pre>
+We now have a Volume Group vg0 and a 400MB Logical Volume lv0. Let’s see what our device mapper looks like
+<pre>
+# dmsetup table
+vg0-lv0: 0 819200 linear 7:0 2048
+</pre>
+We have a single device vg0-lv0, as expected.<br/><br/>
+
+Let’s take a snapshot of our Logical Volume:
+<pre>
+# lvcreate -s -n snap1 -l 30 /dev/vg0/lv0
+# lvs
+LV VG Attr LSize Pool Origin Data% Move Log Copy% Convert
+lv0 vg0 owi-a-s-- 400.00m
+snap1 vg0 swi-a-s-- 120.00m lv0 0.00
+</pre>
+We’ve created a 30 extents (120MB) snapshot of lv0 called snap1.
+<br/><br/>
+Let’s take a look at our device mapper:
+<pre>
+# dmsetup table
+vg0-lv0-real: 0 819200 linear 7:0 2048
+vg0-snap1-cow: 0 245760 linear 7:0 821248
+vg0-lv0: 0 819200 snapshot-origin 252:2
+vg0-snap1: 0 819200 snapshot 252:2 252:3 P 8
+</pre>
+
+What can we do on the snapshot ?
+<pre>
+For example:
+ - make a fs on vg0-lv0, then touch a file with "will"
+ - make a snapshot of vg0-lv0, and also mount the fs there, we will also get the file with "will"
+ - we modify the file or even delete the file on the directory which is mounted on the vg0-lv0,
+ - then we will still cound get the file with "will" in the directory mounted on the vg0-snap1.
+   it looks like a fork.
+</pre>
+
+</font>
+</p>
+
+<h3><a name="summary">summary</a></h3>
+<p>
+<font size="2">
+Reading from the original volume
+<pre>
+The user reads from vg0-lv0. The request is forwarded and the user retrieves data from vg0-lv0-real.
+</pre>
+Writing to the original volume
+<pre>
+The user writes to vg0-lv0. The original data is first copied from vg0-lv0-real to vg0-snap1-cow (This
+is why it’s called COW, Copy On Write). Then the new data is written to vg0-lv0-real. If the user writes
+again to vg0-lv0, modifying data that has already been copied to vg0-snap1-cow, the data from vg0-lv0-real
+is simply overwritten. The data on vg0-snap1-cow remains the data that was valid at the time of the creation
+of the snapshot.
+</pre>
+Reading from the snapshot
+<pre>
+When the user reads data from vg0-snap1, a lookup is done on vg0-snap1-cow to see if that particular piece of
+data has been copied from vg0-lv0-real to vg0-snap1-cow. If that is the case, the value from vg0-snap1-cow is
+returned. Otherwise, the data from vg0-lv0-real is returned. The user effectively sees the data that was valid
+at the time of creation of the snapshot.
+</pre>
+A few important things to note:
+<pre>
+<ul>
+<li> The snapshot is empty at creation, whatever size it is. This means that the creation of a snapshot is immediate
+     and invisible to the user.
+<li> The snapshot will hold a copy of the original data, as the original data is modified. This means that the snapshot
+     will grow over time. Therefore, it is not necessary to make a snapshot as big as the original volume. The snapshot
+     should be big enough to hold the amount of data that is expected to be modified over the time of existence of the
+     snapshot. Creating a snapshot bigger than the original volume is useless and creating a snapshot as big as the
+      original volume will ensure that all data on the original volume can be copied over to the snapshot. If a snapshot
+     is not big enough to hold all the modified data of the original volume, the snapshot is removed and suddenly disappears
+     from the system, with all the consequences of removing a mounted device from a live system.
+<li> A volume that has one or more snapshots will provide much less I/O performance. Remove the snapshot as soon as you’re
+     done with it.
+</ul>
+</pre>
+</font>
+</p>
+
+
+<h3><a name="implementation">implementation</a></h3>
+<p>
+<font size="2">
+<pre>
+
+Time 0:
+
+      Origin     Snap0
+      +--+       +--+
+      |A0|       |  |
+      +--+       +--+
+      |B0|       |  |
+      +--+       +--+
+      |C0|       |  |
+      +--+       +--+
+      |D0|       |  |
+      +--+       +--+
+
+Time 1:
+
+      Origin     Snap0      Snap1
+      +--+       +--+       +--+
+      |A0|       |  |       |  |
+      +--+       +--+       +--+
+      |B1|       |B0|       |  |      B0 is copied to Snap0
+      +--+       +--+       +--+
+      |C0|       |  |       |  |
+      +--+       +--+       +--+
+      |D0|       |  |       |  |
+      +--+       +--+       +--+
+
+Time 2:
+
+      Origin     Snap0      Snap1
+      +--+       +--+       +--+
+      |A0|       |  |       |  |
+      +--+       +--+       +--+
+      |B1|       |B0|       |  |     C0 is copied to Snap0/1
+      +--+       +--+       +--+
+      |C2|       |C0|       |C0|
+      +--+       +--+       +--+
+      |D0|       |  |       |  |
+      +--+       +--+       +--+
+
+Time 3:
+
+      Origin     Snap0      Snap1
+      +--+       +--+       +--+
+      |A0|       |  |       |  |
+      +--+       +--+       +--+
+      |B3|       |B0|       |B1|      B1 is copied to Snap1
+      +--+       +--+       +--+
+      |C2|       |C0|       |C0|
+      +--+       +--+       +--+
+      |D0|       |  |       |  |
+      +--+       +--+       +--+
+</pre>
+</font>
+</p>
+
+
+<h4><a name="exception_table">exception table</a></h4>
+<p>
+<font size="2">
+There are two points need to be noted first.
+<ul>
+<li> <strong>snapshot is only used to preserve the content of the time point when the
+snapshot is created.</strong>
+<li> When a chunk is written on the origin device, the original chunk will be
+copied to the snapshot device prio to the new data reaches origin device.
+</ul>
+Look at the exception table entry, dm_exception
+<pre>
+struct dm_exception {
+    struct list_head hash_list;
+
+    chunk_t old_chunk;
+    chunk_t new_chunk;
+};
+</pre>
+<ul>
+<li> old_chunk, the chunk number on the <font color="red">origin device</font>
+<li> new_chunk, the chunk number where the data is stored on the <font color="red">snapshot
+     device</font>
+<li> hash_list, there are two hash list on one dm_snapshot, complete and pending.
+     the complete hash list contains the dm_exception of which copy has been completed.
+     the pending hash list contains the dm_exception of which copy has not been
+     completed.
+</ul>
+
+Look at the source code:
+<ul>
+<li> io to origin device
+<pre>
+origin_map
+---
+    bio_set_dev(bio, o->dev->bdev);
+
+    if (unlikely(bio->bi_opf & REQ_PREFLUSH))
+        return DM_MAPIO_REMAPPED;
+
+    if (bio_data_dir(bio) != WRITE)
+        return DM_MAPIO_REMAPPED;
+    ...
+<font color="blue">
+    /* Only tell snapshots if this is a write */
+</font>
+    return do_origin(o->dev, bio);
+      -> __origin_write
+---
+__origin_write
+---
+<font color="blue">
+Yes, tell every snapshot
+</font>
+    list_for_each_entry (snap, snapshots, list) {
+        ...
+        mutex_lock(&snap->lock);
+        ...
+        chunk = sector_to_chunk(snap->store, sector);
+
+<font color="blue">
+        //Check exception table to see if block is already remapped in
+        //this snapshot and trigger an exception if not.
+</font>
+        e = dm_lookup_exception(&snap->complete, chunk);
+        if (e)
+            goto next_snapshot;
+
+<font color="blue">
+        //Is there a pending one ?
+</font>
+        pe = __lookup_pending_exception(snap, chunk);
+        if (!pe) {
+            mutex_unlock(&snap->lock);
+            pe = alloc_pending_exception(snap);
+            mutex_lock(&snap->lock);
+
+            if (!snap->valid) {
+                free_pending_exception(pe);
+                goto next_snapshot;
+            }
+<font color="blue">
+            // we released the snap->lock above, things maybe changed after that.
+</font>
+            e = dm_lookup_exception(&snap->complete, chunk);
+            if (e) {
+                free_pending_exception(pe);
+                goto next_snapshot;
+            }
+
+            pe = __find_pending_exception(snap, pe, chunk);
+            if (!pe) {
+                __invalidate_snapshot(snap, -ENOMEM);
+                goto next_snapshot;
+            }
+        }
+
+<font color="blue">
+        //dm will do nothing for the original bio
+</font>
+        r = DM_MAPIO_SUBMITTED;
+
+        /*
+         * If an origin bio was supplied, queue it to wait for the
+         * completion of this exception, and start this one last,
+         * at the end of the function.
+         */
+        if (bio) {
+            bio_list_add(&pe->origin_bios, bio);
+            bio = NULL;
+
+            if (!pe->started) {
+                pe->started = 1;
+                pe_to_start_last = pe;
+            }
+        }
+
+        if (!pe->started) {
+            pe->started = 1;
+            pe_to_start_now = pe;
+        }
+
+next_snapshot:
+        mutex_unlock(&snap->lock);
+
+        if (pe_to_start_now) {
+            start_copy(pe_to_start_now);
+            pe_to_start_now = NULL;
+        }
+    }
+    ...
+---
+</pre>
+<li> io to snapshot device
+<pre>
+snapshot_map
+---
+    if (bio->bi_opf & REQ_PREFLUSH) {
+        bio_set_dev(bio, s->cow->bdev);
+        return DM_MAPIO_REMAPPED;
+    }
+
+    chunk = sector_to_chunk(s->store, bio->bi_iter.bi_sector);
+    ...
+    mutex_lock(&s->lock);
+    ...
+<font color="blue">
+    //If the block is already remapped - use that, else remap it
+</font>
+    e = dm_lookup_exception(&s->complete, chunk);
+    if (e) {
+        remap_exception(s, e, bio, chunk);
+        goto out_unlock;
+    }
+
+    if (bio_data_dir(bio) == WRITE) {
+<font color="blue">
+    //Not talk about write on snapshot device temporarily.
+</font>
+    } else {
+<font color="blue">
+    //If not remapped, the data on origin device has not been modified after
+    //snapshot is created.
+</font>
+        bio_set_dev(bio, s->origin->bdev);
+        track_chunk(s, bio, chunk);
+    }
+
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="origin_bio">origin bio</a></h4>
+<p>
+<font size="2">
+In start_copy, the copy_callback is hooked in the copy job.<br/>
+After the copy is completed, copy_callback is invoked.
+<pre>
+copy_callback
+  -> complete_exception
+    -> persistent_commit_exception
+      -> pending_complete
+---
+    /* Submit any pending write bios */
+    if (error) {
+        if (full_bio)
+            bio_io_error(full_bio);
+        error_bios(snapshot_bios);
+    } else {
+        if (full_bio)
+            bio_endio(full_bio);
+        flush_bios(snapshot_bios);
+    }
+
+    retry_origin_bios(s, origin_bios);
+
+    free_pending_exception(pe);
+
+---
+</pre>
+</font>
+</p>
+
+
+
+
+</body>
+</html>
