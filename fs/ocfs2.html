@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>OCFS2</title>
+</head>
+<body>
+<div>
+    <h1>OCFS2</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#DLM">DLM</a><br/>
+<ul>
+<li><a href="#dlmlock_API">dlmlock API</a>
+<li><a href="#Lock_MC">Lock Mode Compatibility</a>
+<li><a href="#Lock_Resource">Lock Resource</a>
+<li><a href="#Interaction">Interaction</a>
+<li><a href="#AST_BAST">AST/BAST</a>
+</ul>
+
+<a href="#OCFS2">OCFS2</a><br/>
+<ul>
+<li><a href="#Cache_consistency">cache consistency</a>
+
+</ul>
+</font>
+</p>
+
+<h2><a name="DLM">DLM</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<a href="http://opendlm.sourceforge.net/cvsmirror/opendlm/docs/dlmbook_final.pdf">DLM book</a>
+</font>
+</p>
+
+<h3><a name="dlmlock_API">dlmlock API</a></h3>
+<p>
+<font size="2">
+<pre>
+status = dlmlock( LKM_CRMODE,   /* mode */
+                       &lksb,   /* addr of lock status block */
+                  LKM_VALBLK,   /* flags */
+                     "RES-A",   /* name */
+                           5,   /* namelen */
+                    ast_func,   /* ast routine triggered */
+                           0,   /* astargs */
+                          0);   /* bast */
+</pre>
+</font>
+</p>
+
+<h3><a name="Lock_MC">Lock Mode Compatibility</a></h3>
+<p>
+<font size="2">
+<pre>
+     NL   CR   CW   PR   PW   EX
+NL   Yes  Yes  Yes  Yes  Yes  Yes
+CR   Yes  Yes  Yes  Yes  Yes  No
+CW   Yes  Yes  Yes  No   No   No
+PR   Yes  Yes  No   Yes  No   No
+PW   Yes  Yes  No   No   No   No
+EX   Yes  No   No   No   No   No
+</pre>
+</font>
+</p>
+
+<h3><a name="Lock_Resource">Lock Resource</a></h3>
+<p>
+<font size="2">
+<pre>
+A lock resource has the following components:
+<ul>
+<li> A name, which is a string of no more than 31 characters
+<li> A lock value block
+<li> A set of lock queues
+</ul>
+Lock Resource Queues
+<ul>
+<li> Grant Queue
+<pre>
+     The grant queue contains all locks granted by the lock manager on the lock resource, except those locks
+     converting to a mode incompatible with the mode of a granted lock.
+</pre>
+<li> Convert Queue
+<pre>
+    The convert queue contains all <U>granted</U> locks that have attempted to convert to a mode <U>incompatible</U> with the
+    mode of the most restrictive currently granted lock. The locks on the convert queue are still granted at the same
+    mode as before the conversion request. The lock manager processes the locks on the convert queue in "first-in,
+    first-out" (FIFO) order.
+</pre>
+<li> Wait Queue
+<pre>
+    The wait queue contains all new lock requests not yet granted because their mode is incompatible with the mode
+    of the most restrictive currently granted lock. The lock manager processes the locks on the wait queue in FIFO
+    order.
+</pre>
+</ul>
+</pre>
+</font>
+</p>
+
+<h3><a name="Interaction">Interaction</a></h3>
+<p>
+<font size="2">
+
+The conversion can promote a lock from a less restrictive to a more restrictive mode, called an up-conversion,<br/>
+or demote a lock from a more restrictive to a less restrictive mode, called a down-conversion.<br/>
+<U>Only granted locks can be converted</U>. It is not possible to convert a lock already in the process of
+converting or a request that is blocked on the wait queue.
+Look at following scenario.
+<pre>
+        G_Q - L1-CR - L2-CR - L3-CR
+[RES-A] C_Q
+        B_Q
+
+If L3 want to convert to CW, Lock manager can grant the request.
+Because
+<ul>
+<li> CW is compatible with the most restrictive granted currently
+<li> C_Q is empty
+</ul>
+        G_Q - L1-CR - L2-CR - L3-CW
+[RES-A] C_Q
+        B_Q
+
+If L1 want to convert to EX, Lock manager will not grant this request,
+because EX is not incompatible with CW. It will move the L1 to C_Q.
+        G_Q - L2-CR - L3-CW
+[RES-A] C_Q - L1-EX
+        B_Q
+
+If L2 want to convert to CW, Lock manager will not grant this requset,
+because C_Q is not empty, it will be queued at the tail of C_Q.
+
+        G_Q - L3-CW
+[RES-A] C_Q - L1-EX - L2-CW 
+        B_Q
+
+
+The lock manager grants all down-conversion requests in-place; that is, the lock is converted to the new mode
+without being moved to the convert queue, even if there are other lock requests on the convert queue. The lock
+manager grants all down-conversions because they are compatible with the most restrictive locks on the grant queue
+(the lock was already granted at a more restrictive mode)
+
+        G_Q - L3-CW
+[RES-A] C_Q - L1-EX - L2-CW 
+        B_Q
+
+If L3 want to convert to NL, it will be granted by Lock manager.
+And then, L1 will be granted and moved to G_Q
+
+        G_Q - L3-NL - L1-EX
+[RES-A] C_Q - L2-CW 
+        B_Q
+
+</pre>
+
+If you request a lock and the mode is incompatible with the most restrictive granted lock, your request is blocked.<br/>
+It will be granted:<br/>
+<pre>
+The lock request becomes compatible with the mode of the most restrictive lock currently granted on the lock
+resource, and there are no converting locks or blocked locks queued ahead of the lock request. The lock manager
+processes the wait queue in FIFO order, after processing the convert queue. No blocked request can be unblocked
+by the release of a granted lock, regardless of the compatibility of its mode, <U>until all blocked requests on the
+convert queue and all blocked requests ahead of it on the wait queue have been granted</U>.
+</pre>
+
+</font>
+</p>
+
+<h3><a name="AST_BAST">AST/BAST</a></h3>
+<p>
+<font size="2">
+<pre>
+Unlike user-space clients, the DLM can directly execute callback routines when asynchronous lock requests are
+satisfied (AST delivery), or in the case <U>a kernel-space client is holding that blocks another lock request (BAST
+delivery)</U>.
+When a kernel-space client’s lock request is satisfied, whether successfully (lock granted) or unsuccessfully (for
+example, request timed out) the client will be notified via an AST.
+
+</pre>
+</font>
+</p>
+
+<h2><a name="OCFS2">OCFS2</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+
+<h3><a name="Cache_consistency">cache consistency</a></h3>
+<p>
+<font size="2">
+OCFS2 caches file data and metadata in memory. Changes on one node are seen on other nodes in a
+cluster. How to achieve this ?<br/>
+<B>
+In one word, take cluster inode lock will force other nodes drop cache
+</B>
+<br/>
+The usage of the lock:
+<pre>
+ocfs2_readpage
+  -> ocfs2_inode_lock_full //<font color="red">DLM_LOCK_PR</font>
+  -> block_read_full_page
+  -> ocfs2_inode_unlock    // ex == false
+
+ocfs2_write_begin
+  -> ocfs2_inode_lock //<font color="red">DLM_LOCK_EX</font>
+ocfs2_write_end
+  -> ocfs2_inode_unlock // ex == true
+
+ocfs2_writepage
+  -> no inode lock
+</pre>
+
+The most important point is ocfs2_inode_unlock will not drop the dlmlock.
+<pre>
+ocfs2_inode_unlock
+  -> ocfs2_cluster_unlock
+    -> __ocfs2_cluster_unlock
+      -> ocfs2_dec_holders // only the DLM_LOCK_EX/DLM_LOCK_PR will be handled.
+                           // this also indicates that only EX/PR is used in ocfs2
+                           // <font color="red">Decrement
+                           // lockres->l_ex_holders/l_ro_holders</font>
+      -> ocfs2_downconvert_on_unlock
+---
+<font color="blue">
+    // someone is waiting for our lock
+    // refer to ocfs2_generic_handle_bast
+</font>
+    if (lockres->l_flags & OCFS2_LOCK_BLOCKED) {
+        switch(lockres->l_blocking) {
+        case DLM_LOCK_EX:
+<font color="blue">
+            // EX is not compatible with both EX and PR
+</font>
+            if (!lockres->l_ex_holders && !lockres->l_ro_holders)
+                kick = 1;
+            break;
+        case DLM_LOCK_PR:
+<font color="blue">
+            // PR is not compatible with EX, but PR
+</font>
+            if (!lockres->l_ex_holders)
+                kick = 1;
+            break;
+        default:
+            BUG();
+        }
+    }
+
+    if (kick)
+        ocfs2_wake_downconvert_thread(osb);
+---
+</pre>
+We could see that, the ocfs2_inode_unlock <U>doesn't unlock, but just update
+holders.</U>
+<pre>
+Think of following scenario:
+
+Node 0                       Node 1
+
+write
+lock inode with EX
+                             read
+                             try to lock inode with PR
+                             blocked
+BAST is triggered
+</pre>
+<br/>
+Look at what does BAST do:
+<pre>
+o2cb_dlm_lock
+---
+    status = dlmlock(conn->cc_lockspace, o2dlm_mode, &lksb->lksb_o2dlm,
+             o2dlm_flags, name, namelen,
+             o2dlm_lock_ast_wrapper, lksb,
+             o2dlm_blocking_ast_wrapper);
+---
+
+o2dlm_blocking_ast_wrapper
+  -> lksb->lksb_conn->cc_proto->lp_blocking_ast(lksb, level);
+
+ocfs2_blocking_ast
+  -> ocfs2_generic_handle_bast
+    -> lockres_or_flags(lockres, OCFS2_LOCK_BLOCKED) // if needs_downconvert
+  -> ocfs2_schedule_blocked_lock
+    -> lockres_or_flags(lockres, OCFS2_LOCK_QUEUED)
+    -> list_add_tail(&lockres->l_blocked_list,
+                  &osb->blocked_lock_list);
+  -> ocfs2_wake_downconvert_thread
+    -> wake up osb->dc_event
+
+ocfs2_downconvert_thread
+  -> ocfs2_downconvert_thread_do_work
+    -> iterate osb->blocked_lock_list
+       ocfs2_process_blocked_lock
+         -> ocfs2_unblock_lock
+           -> lockres->l_ops->downconvert_worker
+              ocfs2_inode_inode_lops.downconvert_worker
+              ocfs2_data_convert_worker
+
+static int ocfs2_data_convert_worker(struct ocfs2_lock_res *lockres,
+                     int blocking)
+{
+    ...
+    inode = ocfs2_lock_res_inode(lockres);
+    mapping = inode->i_mapping;
+
+<font color="blue">
+    /*
+     * <U>We need this before the filemap_fdatawrite() so that it can
+     * transfer the dirty bit from the PTE to the
+     * page</U>. Unfortunately this means that even for EX->PR
+     * downconverts, we'll lose our mappings and have to build
+     * them up again.
+     */
+</font>
+    unmap_mapping_range(mapping, 0, 0, 0);
+
+    if (filemap_fdatawrite(mapping)) {
+        mlog(ML_ERROR, "Could not sync inode %llu for downconvert!",
+             (unsigned long long)OCFS2_I(inode)->ip_blkno);
+    }
+    sync_mapping_buffers(mapping);
+    if (blocking == DLM_LOCK_EX) {
+        truncate_inode_pages(mapping, 0);
+    } else {
+        /* We only need to wait on the I/O if we're not also
+         * truncating pages because truncate_inode_pages waits
+         * for us above. We don't truncate pages if we're
+         * blocking anything < EXMODE because we want to keep
+         * them around in that case. */
+        filemap_fdatawait(mapping);
+    }
+
+    forget_all_cached_acls(inode);
+
+out:
+    return UNBLOCK_CONTINUE;
+}
+
+</pre>
+So the cache is flushed here.<br/>
+At the same time, ocfs2_unblock_lock will downconvert the lock if needed.
+<pre>
+ocfs2_unblock_lock
+  -> ocfs2_downconvert_lock
+</pre>
+</font>
+</p>
+
+
+
+</body>
+</html>

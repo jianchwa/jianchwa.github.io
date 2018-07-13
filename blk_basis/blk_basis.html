@@ -10,6 +10,7 @@
 </div>
 <p>
 <font size="2">
+<a href="#concepts">concepts</a><br/>
 <a href="#blk-mq">blk-mq</a>
 <ul>
 <li><a href="#sbitmap">sbitmap</a>
@@ -21,7 +22,14 @@
 <li><a href="#tag_allocation">tag allocation</a>
 <li><a href="#tag_sharing">tag sharing</a>
 </ul>
-
+<li><a href="#blk-mq_sched">blk-mq io scheduler</a>
+<li><a href="#hctx">hctx</a>
+<ul>
+<li><a href="#issue_directly">issue directly</a>
+<li><a href="#Where_to_run_hctx">Where to run hctx</a>
+<li><a href="#hctx_restart">hctx restart</a>
+</ul>
+<a href="#requeue">requeue</a>
 </ul>
 
 
@@ -57,8 +65,33 @@
 <li><a href="#Basis">Basis</a></h4>
 <li><a href="#low_limit">low limit</a>
 </ul>
+<a href="#bsg">bsg</a><br/>
+<a href="#direct_IO">direct_IO</a><br/>
 </font>
 </p>
+
+<h2><a name="concepts">concepts</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<strong>EIO is fatal for fs</strong>
+<pre>
+whether EIO is fatal or not depends on the component that is receiving it,
+and they behave accordingly. If a file system encounters EIO error during
+normal I/O (no metadata updates are involved), the error is bubbled back to
+user space. Here even userspace application can choose to behave differently.
+They can resubmit if possible, or crash if the I/O is related to recovery.
+
+In file systems case, if an EIO error is returned during journal
+update(metadata update) like in this case, it has 2 choices. 1) remount FS to
+read-only or 2) crash the node. If FS is in single user mode, it can take the
+FS to read-only, however if it's in clustered mode, it has to evict itself
+hoping at least other nodes can continue fine
+So avoid IO error as much as possible
+</pre>
+</font>
+</p>
+
 
 <h2><a name="blk-mq">blk-mq</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;" />
@@ -105,14 +138,14 @@ no contending when the wait entry is adding on the wait queue.
 we could check this on the /sys/kernel/debug/block/nvme0n1/hctx0/tags  (driver tag )
 wake_index=0
 ws={
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
 }
 
 </pre>
@@ -138,14 +171,14 @@ static void sbq_wake_up(struct sbitmap_queue *sbq)
 
 wake_index=0
 ws={
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},
-	{.wait_cnt=1, .wait=inactive},
-	{.wait_cnt=1, .wait=active},         <font color="red">only one wait queue will be waked up per wait_cnt</font>
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},
+    {.wait_cnt=1, .wait=inactive},
+    {.wait_cnt=1, .wait=active},         <font color="red">only one wait queue will be waked up per wait_cnt</font>
 }
 
 Does the wake_batch introduce delay on high speed device ?
@@ -433,7 +466,7 @@ blk_mq_dispatch_rq_list
 
 <h4><a name="tag_sharing">tag sharing</a></h4>
 <p>
-<font size="2"">
+<font size="2">
 On HBA could connect to multiple LU, every LU has a request queue, all of these
 request_queue share a tagset of the HBA. <br/>
 
@@ -506,7 +539,7 @@ blk_mq_rq_ctx_init
     } else {
 <font color="red">
         if (blk_mq_tag_busy(data->hctx)) {
-            rq_flags = rqf_mq_inflight;
+            rq_flags = RQF_MQ_INFLIGHT;
             atomic_inc(&data->hctx->nr_active);
         }
 </font>
@@ -526,6 +559,13 @@ blk_mq_get_driver_tag
         data.hctx->tags->rqs[rq->tag] = rq;
     }
 ---
+blk_mq_tag_busy
+  -> __blk_mq_tag_busy
+  ---
+    if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state) &&
+        !test_and_set_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+        atomic_inc(&hctx->tags->active_queues);
+  ---
 </pre>
 
 When to deactivate them ?
@@ -600,6 +640,717 @@ __blk_mq_put_driver_tag
 ---
 </pre>
 </ul>
+A interesting question:
+<pre>
+BLK-MQ
+        q of LUN0  q of LUN1   q of LUN2   q of LUN3
+                                         
+        hctx       hctx        hctx        hctx
+<font color="red">
+        active     active      active      inactive
+</font>
+                      driver tags
+------------------------------------------------------
+LLDD    
+                         HBA
+All the driver tags have been used up by the 3 active q.
+At the moment, we submit bio to an inactive q of LUN3, it cannot get driver tag
+and queue the req on the hctx->dispatch list.
+When will this hctx of LUN3 be waked up ?
+
+blk_mq_mark_tag_wait will put this hctx of LUN3 on the shared-tag's wait queue.
+When a driver tag is freed, it will wake up the waiters on the tag's wait queue
+in round-robin fashion.
+The active_queues of the shared-tags has been changed, so reqs to LUN0/1/2 have
+to wait for its budget even if hctxs of LUN0/1/2 are waked up prio to LUN3's.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="blk-mq_sched">blk-mq io scheduler</a></h3>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+Here is part of the comment about io scheduler for blk-mq from the paper
+[Linux Block IO: Introducing Multi-queue SSD Access on Multi-core Systems]
+<pre>
+While global sequential re-ordering is still possible across the multiple
+software queues, it is only necessary for HDD based devices, where the additional
+latency and locking overhead required to achieve total ordering does not hurt IOPS
+performance. It can be argued that, for many users, it is no longer necessary to
+employ advanced fairness scheduling as the speed of the devices are often
+exceeding the ability of even multiple applications to saturate their performance.
+If fairness is essential, it is possible to design a scheduler that exploits the 
+characteristics of SSDs at coarser granularity to achieve lower performance overhead.
+Whether the scheduler should reside in the block layer or on the SSD controller
+is an open issue. If the SSD is responsible for fair IO scheduling, it can leverage
+internal device parallelism, and lower latency, at the cost of additional interface
+complexity between disk and OS
+</pre>
+
+We could get following points from the comment above:
+<ul>
+<li> To make blk-mq compatible with HDD, global sequential re-ordering is still needed.
+<pre>
+blk-mq need the io scheduler to get this ability. bfq is an io scheduler for
+HDD, but looks like it have not been used widely, so if we want a stable io scheduler
+with advanced fairness scheduling, we have to go back to blk-legacy and use the
+cfq.
+</pre>
+<li> The advanced fairness scheduling is no longer necessary for fast speed
+device, but there could be a coarser granularity one
+<pre>
+So we don't need the kind of scheduler, such as cfq or bfq, for nvme device.
+Kyber is a coarser granularity and low overhead io scheduler for fast device.
+</pre>
+<li> There could be an internal io scheduler in storage device
+<pre>
+Such as nvme weighted round robin with urgent priority class arbitration.
+</pre>
+</ul>
+<br/>
+[blk-mq io scheduler framework]
+<pre>
+        [scheduler init]
+        elevator_switch_mq
+            -> blk_mq_init_sched <font color="blue">//freezed and quiesced</font>
+              -> [.init_sched]
+              -> [.init_hctx]
+
+        [bio submit]
+        blk_mq_make_request
+          -> blk_mq_sched_bio_merge
+            -> __blk_mq_sched_bio_merge
+              -> [.bio_merge]
+                -> blk_mq_sched_try_merge <font color="blue">//bfq and mq-deadline, use it to merge a bio to existing request</font>
+                  elv_merge <font color="blue">// get the merge decision and req</font>
+                    -> [.request_merge]
+                  if ELEVATOR_BACK_MERGE
+                     blk_mq_sched_allow_merge
+                       -> [.allow_merge]
+                     bio_attempt_back_merge <font color="blue">// merge the bio to the tail of req</font>
+                     attempt_back_merge <font color="blue">// the new bio may have fill the hole between req and the latter req</font>
+                       -> elv_latter_request
+                         -> [.next_request]
+                       -> attempt_merge
+                         -> [.requests_merged] <font color="blue">// notify the io  scheduler that the two reqs have been merged</font>
+                     elv_merged_request <font color="blue">// if attempt_back_merge do nothing</font>
+                       -> [.request_merged] <font color="blue">// one bio is merged into this req</font>
+                  else if ELEVATOR_FRONT_MERGE
+                     blk_mq_sched_allow_merge
+                       -> [.allow_merge]
+                     bio_attempt_front_merge <font color="blue">// merge the bio to the head of req</font>
+                     attempt_front_merge <font color="blue">// the new bio may have fill the hole between req and the former req</font>
+                       -> elv_former_request
+                         -> [.former_request]
+                       -> attempt_merge
+                         -> [.requests_merged] <font color="blue">// notify the io  scheduler that the two reqs have been merged</font>
+                     elv_merged_request <font color="blue">// if attempt_front_merge do nothing</font>
+                       -> [.request_merged]
+                -> if there is request merging happen, invoke blk_mq_free_request ot free the merged request
+                  blk_mq_free_request
+                    -> [.finish_request]
+
+        [request allocation]
+          blk_mq_get_request
+            -> [.limit_depth] <font color="blue">//update the blk_mq_alloc_data->shallow_depth</font>
+            -> blk_mq_get_tag
+              -> shallow_depth? __sbitmap_queue_get_shallow : __sbitmap_queue_get
+            -> blk_mq_rq_ctx_init
+            -> blk_mq_sched_assign_ioc
+              -> ioc_create_icq
+                -> [.init_icq] <font color="blue">// only bfq use it</font>
+            -> [.prepare_request]
+
+        [request enqueue]
+          blk_mq_sched_insert_request
+            -> [.insert_requests]
+              -> blk_mq_sched_try_merge
+                -> elv_attempt_insert_merge
+                try blk_attempt_req_merge on q->last_merge or req from elv_rqhash tree
+                  -> attempt_merge
+                    -> [.requests_merged] <font color="blue">// notify the io  scheduler that the two reqs have been merged</font>
+                  <font color="blue">//if there is request merging happen, invoke blk_mq_free_request ot free the merged request</font>
+                  -> blk_mq_free_request
+                    -> [.finish_request]
+
+        [dispatch request]
+        blk_mq_sched_dispatch_requests
+          -> blk_mq_do_dispatch_sched
+            -> [.has_work] <font color="blue">// blk_mq_sched_has_work</font>
+            -> [.dispatch_request]
+        blk_mq_start_request
+          -> blk_mq_sched_started_request
+            -> [.started_request]
+
+        [requeue request]
+        blk_mq_requeue_request
+          -> __blk_mq_requeue_request
+            -> blk_mq_put_driver_tag <font color="blue">// very important</font>
+          -> blk_mq_sched_requeue_request
+            -> [.requeue_request]
+        blk_mq_requeue_work
+          -> blk_mq_sched_insert_request
+
+<font color="blue">
+        Note: in blk-mq, a requeued request will be inserted to io scheduler
+        again, this is very different with blk-legacy. For the io scheduler of
+        blk-mq, .requeue_request is same with .finish_request (bfq and kyber)
+</font>
+        [complete request]
+        __blk_mq_complete_request
+          -> blk_mq_sched_completed_request
+            -> [.completed_request]
+        blk_mq_free_request
+          -> [.finish_request]
+<font color="blue">
+        We should notice: LLDD will not always complete a request with blk_mq_complete_request,
+        but also blk_mq_end_request. At the moment, .completed_request will not be invoked.
+</font>
+</pre>
+</font>
+</p>
+<h3><a name="hctx">hctx</a></h3>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+
+<h4><a name="issue_directly">issue directly</a></h4>
+<p>
+<font size="2">
+This is a special path for high speed device.
+<pre>
+blk_mq_make_request
+  -> blk_mq_try_issue_directly
+    -> __blk_mq_try_issue_directly
+---
+    if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(q)) {
+        run_queue = false;
+        bypass_insert = false;
+        goto insert;
+    }
+<font color="blue">
+    // No io scheduler
+</font>
+    if (q->elevator && !bypass_insert)
+        goto insert;
+<font color="blue">
+    // No .get_budget
+</font>
+    if (!blk_mq_get_dispatch_budget(hctx))
+        goto insert;
+<font color="blue">
+    // No io scheduler, so driver tag has been got
+</font>
+    if (!blk_mq_get_driver_tag(rq, NULL, false)) {
+        blk_mq_put_dispatch_budget(hctx);
+        goto insert;
+    }
+
+    return __blk_mq_issue_directly(hctx, rq, cookie);
+<font color="blue">
+    // invoke .queue_rq directly here
+</font>
+insert:
+    if (bypass_insert)
+        return BLK_STS_RESOURCE;
+<font color="blue">
+    // if io scheduler is set, fallback to normal path
+</font>
+    blk_mq_sched_insert_request(rq, false, run_queue, false);
+    return BLK_STS_OK;
+---
+
+w/o io scheduler attached, the sync io could nearly bypass the whole blk-mq stack.
+
+            submit_bio
+----------------|---------------------
+BLK-MQ          v
+            blk_mq_make_request
+                |
+            ----^---- insert to ctx
+                |
+            ----^---- run hctx
+----------------|--------------------
+LLDD            v
+            .queue_rq
+</pre>
+</font>
+</p>
+<h4><a name="Where_to_run_hctx">Where to run hctx</a></h4>
+<p>
+<font size="2">
+Where to run the hctx ? or in the other word, will be a hctx ran on the cpu
+which is not mapped to this hctx ?<br/>
+Let's see the two basic scenario that the hctx will be ran.
+<ul>
+<li> issue directly
+<pre>
+map_request
+  -> dm_dispatch_clone_request
+    -> blk_insert_cloned_request
+      -> blk_mq_request_issue_directly
+        -> __blk_mq_try_issue_directly // under hctx_lock interface
+          -> __blk_mq_issue_directly
+blk_mq_make_request
+  -> blk_mq_try_issue_directly
+    -> __blk_mq_try_issue_directly // under hctx_lock interface
+      -> __blk_mq_issue_directly
+
+There is many holes where the task will be preempted and migrated out.
+</pre>
+<li> __blk_mq_run_hw_queue <br/>
+__blk_mq_run_hw_queue could be run synchronously and asynchronously.
+<ul>
+<li> sync
+<pre>
+It will be invoked by __blk_mq_delay_run_hw_queue
+---
+    if (!async && !(hctx->flags & BLK_MQ_F_BLOCKING)) {
+        int cpu = get_cpu();<font color="red">preempt is disabled here</font>
+        if (cpumask_test_cpu(cpu, hctx->cpumask)) {
+            __blk_mq_run_hw_queue(hctx);
+            put_cpu();
+            return;
+        }
+
+        put_cpu();
+    }
+
+    kblockd_mod_delayed_work_on(blk_mq_hctx_next_cpu(hctx), &hctx->run_work,
+                    msecs_to_jiffies(msecs));
+---
+The basic condition is:
+1. parameter async is false
+2. not BLK_MQ_F_BLOCKING
+3. current cpu is mapped to the hctx
+At the same time, __blk_mq_run_hw_queue will be run with preempt disabled.
+
+So hctx will not be ran on the cpu which is not mapped on this hctx
+</pre>
+<li> async <br/>
+<pre>
+It seems more obvious here, the __blk_mq_run_hw_queue will be ran in by
+workqueue worker kthread which will be pined on its cpu. But if the only cpu
+where the hctx is mapped is offlined, the hctx will have to be run on the other
+cpu. Except for this, the hctx will not be ran on the cpu where it is not mapped
+to.
+</pre>
+</ul>
+</ul>
+
+Whether the hctx will be executed on different mapped cpus concurrently ?
+
+<pre>
+  cpu0    cpu1    cpu2    cpu3  
+   .      flush   i_d     run_work
+   .       .       .       .
+   v       .       .       v
+           v hctx0 .
+-------------------.---------------
+                   v
+             HBA
+
+i_d  issue directly
+
+</pre>
+The possible concurrent path:
+<ul>
+<li> sync path (cpu0)
+<pre>
+A common case is:
+blk_mq_make_request
+  -> blk_mq_sched_insert_request
+    -> blk_mq_run_hw_queue
+      -> __blk_mq_delay_run_hw_queue
+        -> __blk_mq_run_hw_queue
+          -> blk_mq_sched_dispatch_requests
+</pre>
+<li> flush req is inserted to hctx->dispatch directly
+<pre>
+blk_mq_sched_insert_request
+  -> blk_mq_sched_bypass_insert // RQF_FLUSH_SEQ
+</pre>
+<li> directly path (cpu2)
+<pre>
+    refer to <a href="#issue_directly">issue directly</a>
+</pre>
+<li> async path
+<pre>
+blk_mq_run_work_fn
+  -> __blk_mq_run_hw_queue
+    -> blk_mq_sched_dispatch_requests
+</pre>
+</ul>
+
+
+
+</font>
+</p>
+
+<h4><a name="hctx_restart">hctx restart</a></h4>
+<p>
+<font size="2">
+There are some cases where the requests cannot be dispatched immediately.
+<ul>
+<li> some limits in io scheduler
+<pre>
+     in this case, the io scheduler itself is responsible for dispatch the
+     deferred requests
+</pre>
+<li> driver tag is used up on when there is io scheduler
+<pre>
+     for shared tags, tag wakeup hook is in charge of this, otherwise, hctx_restart
+     blk_mq_mark_tag_wait will mark BLK_MQ_SCHED_RESTART on the hctx for non shared-tag
+     case.
+</pre>
+<li> some other limit of LLDD, such as scsi cmd-per-lun
+<pre>
+     after blk_mq_dispatch_rq_list queue the reqs on hctx->dispatch list, it will try
+     to rerun the hctx again. then the next blk_mq_sched_dispatch_requests will mark
+     restart.
+     we check the restart mark after enqueue reqs on hctx->dispatch
+     blk_mq_run_hw_queue
+       -> blk_mq_hctx_has_pending
+         -> !list_empty_carefull(&hctx->dispatch)
+</pre>
+</ul>
+<strong>hctx-restart is a supplement to tag wakeup hook, because not all dispatch
+deferring is due to lack of driver tag</strong><br/><br/>
+Let's look into the hctx restart next.<br/>
+<strong>Mark restart</strong><br/>
+Currently, blk_mq_sched_mark_restart_hctx will only be invoked by blk_mq_sched_dispatch_requests
+when there are requests in hctx->dispatch list. The requests could be inserted into
+hctx->dispatchlist in following cases
+<ul>
+<li> cpu is offlined, requests in ctx->rq_list will be inserted into hctx->dispatch directly
+<pre>
+     refer to blk_mq_hctx_notify_dead
+</pre>
+<li> .queue_rq return BLK_STS_RESOURCE/BLK_STS_DEV_RESOURCE
+<pre>
+     refer to blk_mq_dispatch_rq_list
+</pre>
+<li> there's data but flush is not necessary
+<pre>
+blk_insert_flush
+---
+    /*
+     * If there's data but flush is not necessary, the request can be
+     * processed directly without going through flush machinery.  Queue
+     * for normal execution.
+     */
+    if ((policy & REQ_FSEQ_DATA) &&
+        !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
+        if (q->mq_ops)
+            blk_mq_request_bypass_insert(rq, false);
+        else
+            list_add_tail(&rq->queuelist, &q->queue_head);
+        return;
+    }
+---
+</pre>
+<li> RQF_FLUSH_SEQ
+<pre>
+blk_mq_sched_insert_request
+  -> blk_mq_sched_bypass_insert
+  ---
+   /* dispatch flush rq directly */
+   if (rq->rq_flags & RQF_FLUSH_SEQ) {
+       spin_lock(&hctx->lock);
+       list_add(&rq->queuelist, &hctx->dispatch);
+       spin_unlock(&hctx->lock);
+       return true;
+   }
+  ---
+who will own this flag ?
+<ul>
+<li> flush req
+     blk_kick_flush
+     ---
+        flush_rq->cmd_flags = REQ_OP_FLUSH | REQ_PREFLUSH;
+        flush_rq->rq_flags |= RQF_FLUSH_SEQ;
+        flush_rq->rq_disk = first_rq->rq_disk;
+        flush_rq->end_io = flush_end_io;
+
+        return blk_flush_queue_rq(flush_rq, false);
+     ---
+<li> rq with flush and data
+     blk_insert_flush
+     ---
+        INIT_LIST_HEAD(&rq->flush.list);
+        rq->rq_flags |= RQF_FLUSH_SEQ;
+        rq->flush.saved_end_io = rq->end_io; /* Usually NULL */
+     ---
+     And req_bio_endio need RQF_FLUSH_SEQ to identify this rq and doesn't end it.
+     ---
+        /* don't actually finish bio if it's part of flush sequence */
+        if (bio->bi_iter.bi_size == 0 && !(rq->rq_flags & RQF_FLUSH_SEQ))
+            bio_endio(bio);
+     ---
+</pre>
+
+</ul>
+<pre>
+static void blk_mq_sched_mark_restart_hctx(struct blk_mq_hw_ctx *hctx)
+{
+    if (test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state))
+        return;
+
+    if (hctx->flags & BLK_MQ_F_TAG_SHARED) {
+        struct request_queue *q = hctx->queue;
+
+        if (!test_and_set_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state))
+            atomic_inc(&q->shared_hctx_restart);
+<font color="blue">
+        //if not set, increase the q->shared_hctx_restart
+        // shared_hctx_restart counts the number of hctx need to be restarted.
+</font>
+    } else
+        set_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state);
+}
+</pre>
+<br/>
+<br/>
+<strong>Restart</strong><br/>
+<pre>
+For the non-shared tag case, it is very simple, just invoke blk_mq_run_hw_queue(hctx, <font color="red">true</font>) finally.
+But for shared tag case, it is a bit complicated.
+We will do hctx restart around all the hctxs that share same tags in round-robin fashion.
+
+Why we need this ?
+
+for sharing the resource of lldd fairly 
+if we always restart the hctx which the freed request points to,
+other hctxs that share the same tagset will be starved.
+
+                    restart
+            /'---------------------------------------,
+BLK-MQ     V                                          \
+        q of LUN0  q of LUN1   q of LUN2   q of LUN3   |
+                                                       |
+        hctx       hctx        hctx        hctx        |
+                                            ^          |
+                      driver tags           | blk_mq_free_request
+------------------------------------------------------
+LLDD    
+                         HBA
+
+We needn't worry about the fairly sharing on driver tag.
+sbitmap wakeup hook and tag-sharing (hctx_may_queue) will work well.
+
+Loop every q and hctx sharing the same tagset causes a massive performance regression if you have a lot of
+shared devices. 8e8320c (blk-mq: fix performance regression with shared tags) will fix this.
+
+A atomic shared_hctx_restart is added in request_queue to mark there is hctx need to be restarted in this
+request_queue. Then blk_mq_sched_restart_hctx don't need to loop every time.
+
+There is a question here:
+The rr fashion hctx restart check would only happen:
+ - there is hctx marked as need restart
+ - there is req freed on the request_queue
+
+What if there is no other req in-flight when hctx restart is marked ?
+Who restart the hctx ?  The others sharing the same tagset will not do that, because they are not marked as
+restart in q->shared_hctx_restart.
+
+This is genernal issue no matter sharing tag or not.
+If there is no in-flight request, and .queue_rq need to requeue the request:
+ - return BLK_STS_RESOURCE
+ - LLDD rerun the hw queue itself
+
+In fact, it looks that we don't always need to restart the hctxs in rr fashion.
+ - if we fail to get driver tag, tags wakeup hook could save us
+ - if we have reqs on hctx->dispatch which is inserted directly, it doesn't matter to other hctxs
+
+</pre>
+
+There are also some special cases, look at the code segment in blk_mq_dispatch_rq_list:
+<pre>
+if (!list_empty(list)) {
+        bool needs_restart;
+<font color="blue">
+    // we reach here, because the .queue_rq returns BLK_STS_RESOURCE or BLK_STS_DEV_RESOURCE
+</font>
+        spin_lock(&hctx->lock);
+        list_splice_init(list, &hctx->dispatch);
+        spin_unlock(&hctx->lock);
+
+        needs_restart = blk_mq_sched_needs_restart(hctx);
+        if (!needs_restart ||
+            (no_tag && list_empty_careful(&hctx->dispatch_wait.entry)))
+            blk_mq_run_hw_queue(hctx, true);
+        else if (needs_restart && (ret == BLK_STS_RESOURCE))
+            blk_mq_delay_run_hw_queue(hctx, BLK_MQ_RESOURCE_DELAY);
+    }
+</pre>
+When there is request left in hctx->dispatch list, there are some cases need to be handled:
+<ul>
+<li> !needs_restart　(BLK_MQ_S_SCHED_RESTART is not set)
+<pre>
+     run hctx asynchronously, SCHED_RESTART will be marked in blk_mq_sched_dispatch_requests
+     Why not invoke blk_mq_sched_mark_restart_hctx directly?
+     
+     Look at the scenario below:
+
+     blk_mq_dispatch_rq_list                        blk_mq_free_request
+       -> .queue_rq return BLK_STS_DEV_RESOURCE       -> blk_mq_sched_restart
+       -> queue rq on hctx->dispatch                    -> blk_mq_sched_restart_hctx
+                                                          -> test BLK_MQ_S_SCHED_RESTART
+       -> blk_mq_sched_mark_restart_hctx
+
+     Think of the blk_mq_free_request is invoked for the last in-flight req, it would miss
+     the restart mark and incur io hang.
+     
+     if we run the hw queue again, we will get the resource when invoke .queue_rq, even if we
+     still don't get the resource, the restart mark will not be missed.
+       
+</pre>
+<li> no_tag && list_empty_careful(&hctx->dispatch_wait.entry))
+<pre>
+     there could be a narrow window as below:
+
+                                       blk_mq_dispatch_rq_list
+     blk_mq_dispatch_wake                -> blk_mq_mark_tag_wait
+                                           -> add_wait_queue
+       -> list_del_init(&wait->entry)
+       -> blk_mq_run_hw_queue
+         -> blk_mq_hctx_has_pending
+                                         -> list_splice_init(list, &hctx->dispatch);
+</pre>
+<li> (needs_restart && (ret == BLK_STS_RESOURCE)
+<pre>
+     lldd will return BLK_STS_DEV_RESOURCE when it is lacking in resources due to pending
+     requests, otherwise, return BLK_STS_RESOURCE.
+     When return BLK_STS_RESOURCE, it indicates there is no pending requests, so hctx-restart
+     mechanism will not work, because there will be no blk_mq_free_request to be invoked.
+     at this moment, rerun the hctx with a delay to avoid stuck.
+</pre>
+</ul>
+
+</font>
+</p>
+
+
+<h3><a name="requeue">requeue</a></h3>
+<p>
+<font size="2">
+__blk_mq_requeue_request is used to prepare for a requeue.
+<pre>
+---
+<font color="blue">
+    //w/ io scheduler attached, there will be no in-queue req that
+    //holds driver tag.
+</font>
+    blk_mq_put_driver_tag(rq);
+
+    trace_block_rq_requeue(q, rq);
+    wbt_requeue(q->rq_wb, &rq->issue_stat);
+
+    if (blk_mq_rq_state(rq) != MQ_RQ_IDLE) {
+<font color="blue">
+    // switch to IDLE state
+</font>
+        blk_mq_rq_update_state(rq, MQ_RQ_IDLE);
+    ...
+    }
+---
+</pre>
+Where will be the req requeued ?
+<ul>
+<li> hctx->dispatch list
+<pre>
+blk_mq_dispatch_rq_list
+---
+        ret = q->mq_ops->queue_rq(hctx, &bd);
+        if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE) {
+            ...
+            list_add(&rq->queuelist, list);
+<font color="red">
+            __blk_mq_requeue_request(rq);
+</font>
+            break;
+        }
+        ...
+    } while (!list_empty(list));
+
+    hctx->dispatched[queued_to_index(queued)]++;
+
+    /*
+     * Any items that need requeuing? Stuff them into hctx->dispatch,
+     * that is where we will continue on next queue run.
+     */
+    if (!list_empty(list)) {
+        bool needs_restart;
+
+<font color="red">
+        spin_lock(&hctx->lock);
+        list_splice_init(list, &hctx->dispatch);
+        spin_unlock(&hctx->lock);
+</font>
+        ...
+    }
+    ...
+---
+</pre>
+<li> io scheduler or ctx->rq_list
+<pre>
+The request is requeued through <font color="red">blk_mq_sched_insert_request</font>
+There are two paths:
+<ul>
+    <li> __blk_mq_try_issue_directly
+    ---
+        if (!blk_mq_get_dispatch_budget(hctx))
+            goto insert;
+
+        if (!blk_mq_get_driver_tag(rq, NULL, false)) {
+            blk_mq_put_dispatch_budget(hctx);
+            goto insert;
+        }
+
+        return __blk_mq_issue_directly(hctx, rq, cookie);
+            -> __blk_mq_requeue_request
+<font color="blue">
+    // if .queue_rq return BLK_STS_RESOURCE/BLK_STS_DEV_RESOURCE
+    // we invoke __blk_mq_requeue_request in __blk_mq_issue_directly because
+    // .queue_rq is invoked and also blk_mq_start_request.
+</font>
+        insert:
+        if (bypass_insert)
+            return BLK_STS_RESOURCE;
+    
+        blk_mq_sched_insert_request(rq, false, run_queue, false);
+    ---
+    <li> blk_mq_requeue_request
+    It is used by the driver to requeue a request.
+    And one difference is blk_mq_sched_requeue_request is invoked in it which will
+    invoke the io scheduler's requeue callback.
+    Finally, the request will be requeued in blk_mq_requeue_work through blk_mq_sched_insert_request.
+</ul>
+</pre>
+</ul>
+
+Question: why the blk_mq_sched_requeue_request is only invoked in blk_mq_requeue_request ?
+<pre>
+Look at the bfq and kyber, the callbacks of .requeue_request and .finish_request are the same one.
+
+For blk_mq_dispatch_rq_list, the request is not queued back to io scheduler, we can say the request
+is still being dispatched, so needn't invoke .requeue_request callback.
+
+For the __blk_mq_try_issue_directly, the direct issue path only works w/o io scheduler attached.
+
+Only the blk_mq_requeue_request case, the request is dequeued from io scheduler and will be requeued
+back to io scheduler.
+</pre>
+In fact, there is a big difference between block legacy and blk-mq in requeue.
+<pre>
+blk_requeue_request
+  -> elv_requeue_request
+    -> __elv_add_request //ELEVATOR_INSERT_REQUEUE
+      -> list_add(&rq->queuelist, &q->queue_head);
+The request is requeued to q->queue_head which is similar with hctx->dispatch.
+
+</pre>
+
 </font>
 </p>
 
@@ -696,7 +1447,7 @@ scsi_request_fn()
 
 <h2><a name="plug">plug</a></h2>
 <p>
-<font size="2"">
+<font size="2">
 There are mainly two aspects about blk plug's benifit.
 <ul>
 <li> allow merging of sequential requests into single one larger request.
@@ -819,150 +1570,150 @@ request->bio __
 Let's take the submit_bh_wbc() as example to show how to setup a bio
 <pre>
 static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
-			 enum rw_hint write_hint, struct writeback_control *wbc)
+             enum rw_hint write_hint, struct writeback_control *wbc)
 {
-	struct bio *bio;
-	>>>>
-	bio = bio_alloc(GFP_NOIO, 1); // the second parameter is the count of bvec
+    struct bio *bio;
+    >>>>
+    bio = bio_alloc(GFP_NOIO, 1); // the second parameter is the count of bvec
 
-	if (wbc) {
-		wbc_init_bio(wbc, bio);
-		wbc_account_io(wbc, bh->b_page, bh->b_size);
-	}
+    if (wbc) {
+        wbc_init_bio(wbc, bio);
+        wbc_account_io(wbc, bh->b_page, bh->b_size);
+    }
 
-	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
-	bio_set_dev(bio, bh->b_bdev);
-	//(bio)->bi_disk = (bdev)->bd_disk;
-	//(bio)->bi_partno = (bdev)->bd_partno;
-	bio->bi_write_hint = write_hint;
+    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+    bio_set_dev(bio, bh->b_bdev);
+    //(bio)->bi_disk = (bdev)->bd_disk;
+    //(bio)->bi_partno = (bdev)->bd_partno;
+    bio->bi_write_hint = write_hint;
 
-	bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
-	>>>>//Fs with blocksize smaller than pagesize, could reach here.
-		if (bio->bi_vcnt > 0) {
-			bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+    bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+    >>>>//Fs with blocksize smaller than pagesize, could reach here.
+        if (bio->bi_vcnt > 0) {
+            bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
 
-			if (page == bv->bv_page &&
-		   	 offset == bv->bv_offset + bv->bv_len) {
-				bv->bv_len += len;
-				goto done;
-			} 
-		} //merged with previous one 
+            if (page == bv->bv_page &&
+                offset == bv->bv_offset + bv->bv_len) {
+                bv->bv_len += len;
+                goto done;
+            } 
+        } //merged with previous one 
 
-		if (bio->bi_vcnt >= bio->bi_max_vecs)
-			return 0;
+        if (bio->bi_vcnt >= bio->bi_max_vecs)
+            return 0;
 
-		bv		= &bio->bi_io_vec[bio->bi_vcnt];
-		bv->bv_page	= page;
-		bv->bv_len	= len;
-		bv->bv_offset	= offset;
+        bv        = &bio->bi_io_vec[bio->bi_vcnt];
+        bv->bv_page    = page;
+        bv->bv_len    = len;
+        bv->bv_offset    = offset;
 
-		bio->bi_vcnt++;
-	done:
-		bio->bi_iter.bi_size += len;
-	>>>>
-	BUG_ON(bio->bi_iter.bi_size != bh->b_size);
+        bio->bi_vcnt++;
+    done:
+        bio->bi_iter.bi_size += len;
+    >>>>
+    BUG_ON(bio->bi_iter.bi_size != bh->b_size);
 
-	bio->bi_end_io = end_bio_bh_io_sync;
-	bio->bi_private = bh; //reverse mapping to the bh
+    bio->bi_end_io = end_bio_bh_io_sync;
+    bio->bi_private = bh; //reverse mapping to the bh
 
-	/* Take care of bh's that straddle the end of the device */
-	guard_bio_eod(op, bio);
+    /* Take care of bh's that straddle the end of the device */
+    guard_bio_eod(op, bio);
 
-	if (buffer_meta(bh))
-		op_flags |= REQ_META;
-	if (buffer_prio(bh))
-		op_flags |= REQ_PRIO;
-	bio_set_op_attrs(bio, op, op_flags);
-	
-	submit_bio(bio);
-	return 0;
+    if (buffer_meta(bh))
+        op_flags |= REQ_META;
+    if (buffer_prio(bh))
+        op_flags |= REQ_PRIO;
+    bio_set_op_attrs(bio, op, op_flags);
+    
+    submit_bio(bio);
+    return 0;
 }
 </pre>
 Most of the information to construct a bio is from the bh. If we want to dig deeper, we have to look into how to setup a bh.<br/>
 <pre>
 static int
 grow_dev_page(struct block_device *bdev, sector_t block,
-	      pgoff_t index, int size, int sizebits, gfp_t gfp)
+          pgoff_t index, int size, int sizebits, gfp_t gfp)
 {
-	>>>>
-	page = find_or_create_page(inode->i_mapping, index, gfp_mask);
-		-> pagecache_get_page()
-			-> __page_cache_alloc() //no_page case
-				-> __alloc_pages_node(n, gfp, 0);
-	/*
-	 <strong>The pages of page cache are allocated one by one</strong>. It's more flexible to
-	 map and unmap, page in and swap out. And in the past, the memory is limited, there is not
-	 enougth contiguous pages to take advantage of.
-	 */
-	BUG_ON(!PageLocked(page));
-	>>>>`
-	/*
-	 * Allocate some buffers for this page
-	 */
-	bh = alloc_page_buffers(page, size, true);
+    >>>>
+    page = find_or_create_page(inode->i_mapping, index, gfp_mask);
+        -> pagecache_get_page()
+            -> __page_cache_alloc() //no_page case
+                -> __alloc_pages_node(n, gfp, 0);
+    /*
+     <strong>The pages of page cache are allocated one by one</strong>. It's more flexible to
+     map and unmap, page in and swap out. And in the past, the memory is limited, there is not
+     enougth contiguous pages to take advantage of.
+     */
+    BUG_ON(!PageLocked(page));
+    >>>>`
+    /*
+     * Allocate some buffers for this page
+     */
+    bh = alloc_page_buffers(page, size, true);
 
-	/*
-	 * Link the page to the buffers and initialise them.  Take the
-	 * lock to be atomic wrt __find_get_block(), which does not
-	 * run under the page lock.
-	 */
-	spin_lock(&inode->i_mapping->private_lock);
-	link_dev_buffers(page, bh);
-	end_block = init_page_buffers(page, bdev, (sector_t)index << sizebits,
-			size);
-	>>>>
-	do {
-		if (!buffer_mapped(bh)) {
-			init_buffer(bh, NULL, NULL);
-			bh->b_bdev = bdev;
-			bh->b_blocknr = block;
-			if (uptodate)
-				set_buffer_uptodate(bh);
-			if (block < end_block)
-				set_buffer_mapped(bh);
-		}
-		block++;
-		bh = bh->b_this_page;
-	} while (bh != head);
-	>>>>
-	spin_unlock(&inode->i_mapping->private_lock);
+    /*
+     * Link the page to the buffers and initialise them.  Take the
+     * lock to be atomic wrt __find_get_block(), which does not
+     * run under the page lock.
+     */
+    spin_lock(&inode->i_mapping->private_lock);
+    link_dev_buffers(page, bh);
+    end_block = init_page_buffers(page, bdev, (sector_t)index << sizebits,
+            size);
+    >>>>
+    do {
+        if (!buffer_mapped(bh)) {
+            init_buffer(bh, NULL, NULL);
+            bh->b_bdev = bdev;
+            bh->b_blocknr = block;
+            if (uptodate)
+                set_buffer_uptodate(bh);
+            if (block < end_block)
+                set_buffer_mapped(bh);
+        }
+        block++;
+        bh = bh->b_this_page;
+    } while (bh != head);
+    >>>>
+    spin_unlock(&inode->i_mapping->private_lock);
 done:
-	ret = (block < end_block) ? 1 : -ENXIO;
+    ret = (block < end_block) ? 1 : -ENXIO;
 failed:
-	unlock_page(page);
-	put_page(page);
-	return ret;
+    unlock_page(page);
+    put_page(page);
+    return ret;
 }
 </pre>
 
 One page from pagecache could be broken up into several bh's based on the blocksize of the associated filesystem (sb->s_blocksize). <strong>One bh corresponds to one block in disk</strong>. Then echo bh will be used to constructed a bio and submitted to block layer. At the moment, the bio only contain one bio_vec pointing to page of the bh. This is the classical path to setup a bio. Nowadays, some filesystems would like to create bios itself, during the procedure, the bio containing multiple bio_vec maybe created. For example:
 <pre>
 static int io_submit_add_bh(struct ext4_io_submit *io,
-			    struct inode *inode,
-			    struct page *page,
-			    struct buffer_head *bh)
+                struct inode *inode,
+                struct page *page,
+                struct buffer_head *bh)
 {
-	int ret;
+    int ret;
 
-	if (io->io_bio && bh->b_blocknr != io->io_next_block) {
+    if (io->io_bio && bh->b_blocknr != io->io_next_block) {
 submit_and_retry:
-		ext4_io_submit(io);
-	}
-	if (io->io_bio == NULL) {
-		ret = io_submit_init_bio(io, bh);
-		if (ret)
-			return ret;
-		io->io_bio->bi_write_hint = inode->i_write_hint;
-	}
-	ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
-	if (ret != bh->b_size)
-		goto submit_and_retry;
-	wbc_account_io(io->io_wbc, page, bh->b_size);
-	io->io_next_block++;
-	return 0;
+        ext4_io_submit(io);
+    }
+    if (io->io_bio == NULL) {
+        ret = io_submit_init_bio(io, bh);
+        if (ret)
+            return ret;
+        io->io_bio->bi_write_hint = inode->i_write_hint;
+    }
+    ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
+    if (ret != bh->b_size)
+        goto submit_and_retry;
+    wbc_account_io(io->io_wbc, page, bh->b_size);
+    io->io_next_block++;
+    return 0;
 }
 </pre>
-We could see that: one bio_vec would correspond to part or the whole page. 	
+We could see that: one bio_vec would correspond to part or the whole page.     
 
 </font>
 </p>
@@ -3323,6 +4074,256 @@ static void throtl_track_latency(struct throtl_data *td, sector_t size,
 
 </pre>
 
+
+</font>
+</p>
+
+<h2><a name="bsg">bsg</a></h2>
+<p>
+<font size="2">
+<pre>
+The Linux sg driver is a upper level SCSI subsystem device driver that is used primarily to handle devices _not_ covered by the other upper
+level drivers: sd (disks), st (tapes) and sr (CDROMs and DVDs). The sg driver is used for <strong>enclosure management, cd writers,
+applications that read cd audio digitally and scanners</strong>. Sg can also be used for less usual tasks performed on disks, tapes and cdroms.
+Sg is a character device driver which, in some contexts, gives it advantages over block device drivers such as sd and sr. The interface of sg
+is at the level of SCSI command requests and their associated responses.
+
+From about Linux kernel 2.6.24, there is an alternate SCSI pass-through driver called "bsg" (block SCSI generic driver). The bsg driver has
+device names of the form /dev/bsg/0:1:2:3 and supports the SG_IO ioctl with the sg version 3 interface. The bsg driver also supports the sg
+version 4 interface which at this time the sg driver does not. Amongst other improvements the sg version 4 interface supports SCSI bidirectional commands.
+</pre>
+
+<strong>How does it work ?</strong>
+<ul>
+<li> setup
+<pre>
+bsg_setup_queue
+---
+<font color="blue">
+    // A new request_queue
+</font>
+    q = blk_alloc_queue(GFP_KERNEL);
+    if (!q)
+        return ERR_PTR(-ENOMEM);
+    q->cmd_size = sizeof(struct bsg_job) + dd_job_size;
+    q->init_rq_fn = bsg_init_rq;
+    q->exit_rq_fn = bsg_exit_rq;
+    q->initialize_rq_fn = bsg_initialize_rq;
+<font color="red">
+    q->request_fn = bsg_request_fn;
+</font>
+
+    ret = blk_init_allocated_queue(q);
+    if (ret)
+        goto out_cleanup_queue;
+
+    q->queuedata = dev;
+    q->bsg_job_fn = job_fn;
+    blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+    blk_queue_softirq_done(q, bsg_softirq_done);
+    blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+
+    ret = bsg_register_queue(q, dev, name, &bsg_transport_ops, release);
+---
+</pre>
+<li> issue request
+<pre>
+take write as example:
+bsg_write
+  -> __bsg_write
+    -> bsg_map_hdr
+      -> blk_get_request
+      -> q->bsg_dev.ops->fill_hdr
+      -> blk_rq_map_user //hdr->dout_xferp points to userland buffer
+        -> blk_rq_map_user_iov // userland buffer will be mapped directly for zero copy I/O
+   -> bsg_add_command
+     -> blk_execute_rq_nowait
+
+bsg_request_fn
+  -> blk_fetch_request
+    -> blk_peek_request
+    -> blk_start_request
+  -> bsg_prepare_job // kref_init(&job->kref)
+  -> q->bsg_job_fn
+</pre>
+<li> complete request
+<pre>
+bsg_softirq_done
+  -> bsg_job_put
+    -> kref_put(&job->kref, bsg_teardown_job)
+bsg_teardown_job
+  -> blk_end_request_all
+ 
+This is a very interesting method.
+Unless the job->kref reaches zero, the bsg request will not be completed.
+It will fix the race between blk-timeout and completion path.
+Look at the following code:
+fc_bsg_job_timeout
+---
+    inflight = bsg_job_get(job);
+
+    if (inflight && i->f->bsg_timeout) {
+        /* call LLDD to abort the i/o as it has timed out */
+        err = i->f->bsg_timeout(job);
+        if (err == -EAGAIN) {
+            bsg_job_put(job);
+            return BLK_EH_RESET_TIMER;
+        } else if (err)
+            printk(KERN_ERR "ERROR: FC BSG request timeout - LLD "
+                "abort failed with status %d\n", err);
+    }
+
+    /* the blk_end_sync_io() doesn't check the error */
+    if (!inflight)
+        return BLK_EH_NOT_HANDLED;
+    else
+        return BLK_EH_HANDLED;
+---
+</pre>
+</ul>
+<strong>bidi request</strong>
+<pre>
+bidi aka bidirectional commands. There will be output and input in this kind of
+command concurrently.
+Look at bsg_map_hdr
+---
+    if (hdr->dout_xfer_len && hdr->din_xfer_len) {
+        if (!test_bit(QUEUE_FLAG_BIDI, &q->queue_flags)) {
+            ret = -EOPNOTSUPP;
+            goto out;
+        }
+
+        next_rq = blk_get_request(q, REQ_OP_SCSI_IN, GFP_KERNEL);
+        if (IS_ERR(next_rq)) {
+            ret = PTR_ERR(next_rq);
+            goto out;
+        }
+<font color="red">
+        rq->next_rq = next_rq;
+</font>
+        ret = blk_rq_map_user(q, next_rq, NULL, uptr64(hdr->din_xferp),
+                       hdr->din_xfer_len, GFP_KERNEL);
+        if (ret)
+            goto out_free_nextrq;
+    }
+---
+
+</pre>
+</font>
+</p>
+
+<h3><a name="direct_IO">direct_IO</a></h3>
+<p>
+<font size="2">
+What will be done when direct IO on a block device ?
+<pre>
+blkdev_direct_IO
+  -> __blkdev_direct_IO_simple // Let's look at the simpler case.
+---
+    ...
+    struct bio_vec inline_vecs[DIO_INLINE_BIO_VECS], *vecs, *bvec;
+    ...
+    if (nr_pages <= DIO_INLINE_BIO_VECS)
+        vecs = inline_vecs;
+    else {
+        vecs = kmalloc_array(nr_pages, sizeof(struct bio_vec),
+                     GFP_KERNEL);
+        if (!vecs)
+            return -ENOMEM;
+    }
+
+    bio_init(&bio, vecs, nr_pages);
+    bio_set_dev(&bio, bdev);
+    bio.bi_iter.bi_sector = pos >> 9;
+    bio.bi_write_hint = iocb->ki_hint;
+    bio.bi_private = current;
+    bio.bi_end_io = blkdev_bio_end_io_simple;
+    bio.bi_ioprio = iocb->ki_ioprio;
+<font color="blue">
+    // The most important thing here is to fill the bi_io_vec
+                                /
+                                | bv_page
+    bio->bi_io_vec [ bio_vec ] <  bv_len
+                   [ bio_vec ]  | bv_offset
+                   [ bio_vec ]  \
+                   ...
+    bio_iov_iter_get_pages
+      -> iov_iter_get_pages
+        -> get_user_pages_fast
+    It will get and pin the pages behind the userland buffers.
+    Then these pages will be sent to block layer directly.
+    <U>So we could say this is zero-copy.</U>
+</font>
+    ret = bio_iov_iter_get_pages(&bio, iter);
+    if (unlikely(ret))
+        return ret;
+    ret = bio.bi_iter.bi_size;
+
+    if (iov_iter_rw(iter) == READ) {
+        bio.bi_opf = REQ_OP_READ;
+        if (iter_is_iovec(iter))
+            should_dirty = true;
+    } else {
+        bio.bi_opf = dio_bio_write_op(iocb);
+        task_io_account_write(ret);
+    }
+
+    qc = submit_bio(&bio);
+    for (;;) {
+        set_current_state(TASK_UNINTERRUPTIBLE);
+        if (!READ_ONCE(bio.bi_private))
+            break;
+        if (!(iocb->ki_flags & IOCB_HIPRI) ||
+            !blk_poll(bdev_get_queue(bdev), qc))
+            io_schedule();
+    }
+<font color="blue">
+    // we will sleep here to wait for the completion.
+    // the blkdev_bio_end_io_simple will wake up us.
+</font>
+    __set_current_state(TASK_RUNNING);
+
+    bio_for_each_segment_all(bvec, &bio, i) {
+        if (should_dirty && !PageCompound(bvec->bv_page))
+            set_page_dirty_lock(bvec->bv_page);
+        put_page(bvec->bv_page);
+    }
+
+    if (vecs != inline_vecs)
+        kfree(vecs);
+
+    if (unlikely(bio.bi_status))
+        ret = blk_status_to_errno(bio.bi_status);
+
+    bio_uninit(&bio);
+---
+</pre>
+But one thing need to be talked, there is also pagecache for the blockdevice,
+don't we need to care about the pagecache here ?<br/>
+<br/>
+If there is data in pagecache (Or buffer for blockdev ?), a read direct IO will
+get stale data from disk. <br/>
+
+Let's look at the do_blockdev_direct_IO which is employed by FS.
+<pre>
+---
+    if (dio->flags & DIO_LOCKING) {
+        if (iov_iter_rw(iter) == READ) {
+            struct address_space *mapping =
+                    iocb->ki_filp->f_mapping;
+
+            inode_lock(inode);
+<font color="blue">
+            // This will flush out the data in cache.
+</font>
+            retval = filemap_write_and_wait_range(mapping, offset,
+                                  end - 1);
+            ...
+        }
+    }
+
+---
+</pre>
 
 </font>
 </p>

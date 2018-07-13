@@ -10,10 +10,20 @@
 </div>
 <p>
 <font size="2">
+<a href="#BH">BH</a>
+<ul>
+<li><a href="#bh2bio">bh to bio</a>
+<li><a href="#BH_state">BH state</a>
+</ul>
 <a href="#dcache">dcache</a>
 <ul>
 <li><a href="#path_walking">path_walking</a>
 <li><a href="#locks_of_dentry">locks_of_dentry</a>
+</ul>
+<a href="#inode">inode</a><br/>
+<ul>
+<li><a href="#aops">address_space ops</a>
+<li><a href="#iops">inode ops</a>
 </ul>
 <a href="#fs_misc">fs misc</a>
 <ul>
@@ -22,6 +32,209 @@
 </font>
 </p>
 
+
+<h2><a name="BH">BH</a></h2>
+<p>
+<font size="2">
+<pre>
+Historically, a buffer_head was used to map a single block within a page, and of
+course as the unit of I/O through the filesystem and block layers.
+Nowadays the basic I/O unit is the bio, and buffer_heads are used for
+<ul>
+<li> extracting block mappings (via .get_block) 
+<pre>
+static inline void
+map_bh(struct buffer_head *bh, struct super_block *sb, sector_t block)
+{
+    set_buffer_mapped(bh);
+    bh->b_bdev = sb->s_bdev;
+    bh->b_blocknr = block;
+    bh->b_size = sb->s_blocksize;
+}
+
+A single block that a bh represents is the blocksize of filesystem, not the
+block device.
+
+In block layer, the logical block size is still 512 bytes which is the
+traditional sector size, but the real block logical size of the storage hardware
+is varaible. Look at the nvme driver code:
+nvme_setup_rw
+---
+    cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
+    cmnd->rw.nsid = cpu_to_le32(ns->head->ns_id);
+    cmnd->rw.slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
+                                  -> <font color="blue">(sector >> (ns->lba_shift - 9))</font>
+    cmnd->rw.length = cpu_to_le16((blk_rq_bytes(req) >> ns->lba_shift) - 1);
+
+---
+What if the logical block size of the device is larger than 4K ?
+
+</pre>
+<li> tracking state of block within a page cache
+<pre>
+There could be one or more bh in one page. We could see this in
+alloc_page_buffers.
+---
+    head = NULL;
+    offset = PAGE_SIZE;
+    while ((offset -= size) >= 0) { <font color="blue">// size here is blocksize of fs</font>
+        bh = alloc_buffer_head(gfp);
+        if (!bh)
+            goto no_grow;
+
+        bh->b_this_page = head;
+        bh->b_blocknr = -1;
+        head = bh;
+
+        bh->b_size = size;
+
+        /* Link the buffer to its page */
+        set_bh_page(bh, page, offset);
+    }
+    return head;
+---
+</pre>
+<li> wrapping bio submission for backward compatibility reasons (e.g. submit_bh).
+</ul>
+</pre>
+</font>
+</p>
+
+<h3><a name="bh2bio">bh to bio</a></h3>
+<p>
+<font size="2">
+Look at the submit_bh_wbc to know the basic steps:
+<pre>
+    ---
+    bio = bio_alloc(GFP_NOIO, 1);
+
+    if (wbc) {
+        wbc_init_bio(wbc, bio);
+        wbc_account_io(wbc, bh->b_page, bh->b_size);
+    }
+
+    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+    bio_set_dev(bio, bh->b_bdev);
+    bio->bi_write_hint = write_hint;
+
+    bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+    BUG_ON(bio->bi_iter.bi_size != bh->b_size);
+
+    bio->bi_end_io = end_bio_bh_io_sync;
+                      -> bh->b_end_io(bh, !bio->bi_status);
+    bio->bi_private = bh;
+
+    /* Take care of bh's that straddle the end of the device */
+    guard_bio_eod(op, bio);
+
+    if (buffer_meta(bh))
+        op_flags |= REQ_META;
+    if (buffer_prio(bh))
+        op_flags |= REQ_PRIO;
+    bio_set_op_attrs(bio, op, op_flags);
+
+    submit_bio(bio);
+    ---
+</pre>
+</font>
+</p>
+
+
+<h3><a name="BH_state">BH state</a></h3>
+<p>
+<font size="2">
+enum bh_state_bits defines the state of a bh and is contained in bh->b_state<br/>
+And there are 3 marcos to define the set, clear and test operations about this
+state. They are defined in include/linux/buffer_head.h 
+<ul>
+<li> set_buffer_##name
+<li> clear_buffer_##name
+<li> buffer_##name
+</ul>
+<br/>
+Let's look at how to use them in fs.
+<ul>
+<li> BH_Uptodate
+<pre>
+Means the bh contains valid data.
+When read/write operation is completed successfully, BH_Uptodate will be set on
+the bh, otherwise clear it.
+</pre>
+<li> BH_Lock
+<pre>
+When a bh is under io, we will lock it.
+A very classical scenario is __bread_slow:
+---
+    lock_buffer(bh);
+    if (buffer_uptodate(bh)) {
+        unlock_buffer(bh);
+        return bh;
+    } else {
+        get_bh(bh);
+        bh->b_end_io = end_buffer_read_sync;   
+        submit_bh(REQ_OP_READ, 0, bh);
+        wait_on_buffer(bh);
+        if (buffer_uptodate(bh))
+            return bh;
+    }
+    brelse(bh);
+    return NULL;
+---
+end_buffer_read_sync
+  -> __end_buffer_read_notouch
+  ---
+    if (uptodate) {
+        set_buffer_uptodate(bh);
+    } else {
+        /* This happens, due to failed read-ahead attempts. */
+        clear_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh)
+  ---
+</pre>
+<li> BH_Dirty
+<pre>
+BH_Dirty is set in mark_buffer_dirty.
+Except for setting BH_Dirty, it would also:
+ - set page dirty
+ - __mark_inode_dirty(inode, <font color="red">I_DIRTY_PAGES</font>)
+   __mark_inode_dirty will hand over this inode to writeback, then the
+   dirty data will be written to disk.
+
+The BH_Dirty is usually cleared before IO.
+For example:
+---
+    lock_buffer(bh);
+    clear_buffer_dirty(bh);
+
+    get_bh(bh); /* for end_buffer_write_sync() */
+    bh->b_end_io = end_buffer_write_sync;
+    submit_bh(REQ_OP_WRITE, 0, bh);
+
+    wait_on_buffer(bh);
+---
+</pre>
+<li> BH_Req
+<li> BH_New
+<li> BH_Uptodate_Lock
+<li> BH_Mapped
+<pre>
+Has a disk mapping, in the other word, this bh corresponds to a block on disk.
+It is usually set after get_block.
+Look at the follow combinations between Mapped and Uptodate
+Mapped Uptodate
+  No    No        "unknown" - must do get_block()
+  No    Yes       "hole" - zero-filled (no associated block on disk image)
+  Yes   No        "allocated" - allocated on disk, not read in
+  Yes   Yes       "valid" - allocated and up-to-date in memory.
+</pre>
+<li> BH_Async_Read/Write
+<pre>
+The bh->b_end_io is end_buffer_async_read/write.
+</pre>
+</ul>
+</font>
+</p>
 
 <h2><a name="dcache">dcache</a></h2>
 <hr style="height:5px;border:none;border-top:1px solid black;" />
@@ -296,6 +509,109 @@ scenario.
 </ul>
 </font>
 </p>
+
+<h2><a name="inode">inode</a></h2>
+<h3><a name="aops">address_space ops</a></h3>
+<font size="2">
+<ul>
+<li> readpage/readpages
+<pre>
+// f_ops.read_iter
+generic_file_read_iter
+  -> generic_file_buffered_read
+
+//vm_ops.fault
+filemap_fault
+  -> page_cache_read // if no_cached_page
+    -> __page_cache_alloc
+    -> a_ops->readpage
+or-> a_ops->readpage // if page_not_uptodate
+
+__do_page_cache_readahead
+  -> read_pages
+    -> a_ops->readpages // if there is readpages
+	// otherwise one by one
+    -> a_ops->readpage
+</pre>
+
+<li> writepage/writepages
+<pre>
+// start writeback on mapping dirty pages in range
+__filemap_fdatawrite_range
+  -> do_writepages
+    -> a_ops->writepages or
+	   generic_writepages
+	     -> pagevec_lookup_range_tag
+		 -> __writepage
+		   -> a_ops->writepage
+
+// memory management, on-demand
+shrink_page_list
+  -> pageout
+    -> a_ops->writepage
+
+//wb, periodic and on-demand
+wb_writeback
+  -> writeback_sb_inodes
+    -> __writeback_single_inode
+	  -> do_writepages
+</pre>
+<li> direct_IO
+<pre>
+bypass the pagecache
+
+generic_file_read_iter
+if iocb->ki_flags & IOCB_DIRECT
+  -> filemap_write_and_wait_range // we will bypass the pagecache, so have to
+                                  // write and wait the data in pagecache to disk.
+  -> a_ops->direct_IO
+
+__generic_file_write_iter
+  -> generic_file_direct_write
+    -> file_write_and_wait_range
+	-> invalidate_inode_pages2_range //invalidate page cache to ensure buffered
+	                                 //reads to go to disk to get new data.
+</pre>
+</ul>
+<li> write_begin/write_end
+<pre>
+__generic_file_write_iter
+  -> generic_perform_write
+---
+		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
+						&page, &fsdata);
+		if (unlikely(status < 0))
+			break;
+
+		if (mapping_writably_mapped(mapping))
+			flush_dcache_page(page);
+
+		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
+		flush_dcache_page(page);
+
+		status = a_ops->write_end(file, mapping, pos, bytes, copied,
+						page, fsdata);
+---
+</pre>
+</font>
+</pre>
+
+<h3><a name="iops">inode ops</a></h3>
+<pre>
+<font size="2">
+<li> lookup (just for inode of dir)
+<pre>
+walk_component
+  -> lookup_fast
+    -> __d_lookup // lookup the dentry in dentry_hashtable
+  -> lookup_slow  // if lookup_fast fails
+    -> __lookup_slow
+	  -> inode->i_op->lookup(parent_inode, dentry, flags); // dentry include the name of the child
+</pre>
+<li> 
+</font>
+</pre>
+
 
 
 <h2><a name="fs_misc">fs misc</a></h2>

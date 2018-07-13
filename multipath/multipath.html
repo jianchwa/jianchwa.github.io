@@ -22,6 +22,7 @@
 <li><a href="#path_select">path select</a>
 <li><a href="#path_group">path group</a>
 <li><a href="#device_handler">device handler</a>
+<li><a href="#retry_tick">retry_tick</a>
 </ul>
 </font>
 </p>
@@ -489,7 +490,130 @@ Determines how the path group(s) are formed using the available paths. There are
 </font>
 </p>
 
+<h3><a name="retry_tick">retry_tick</a></h3>
+<p>
+<font size="2">
+<pre>
+queue_if_no_path will not be set forever in multipath.
+Look at checkerloop()
+static void * checkerloop (void *ap)
+{
+    ...
+    while (1) {
+        ...
 
+        if (vecs->pathvec) {
+            vector_foreach_slot (vecs->pathvec, pp, i) {
+                check_path(vecs, pp);
+            }
+        }
+        if (vecs->mpvec) {
+            defered_failback_tick(vecs->mpvec);
+            retry_count_tick(vecs->mpvec);    // ----> here !
+        }
+        ...
+        sleep(1);
+    }
+    return NULL;
+}
+static void
+retry_count_tick(vector mpvec)
+{
+    struct multipath *mpp;
+    unsigned int i;
+
+    vector_foreach_slot (mpvec, mpp, i) {
+        if (mpp->retry_tick) {
+            mpp->stat_total_queueing_time++;
+            condlog(4, "%s: Retrying.. No active path", mpp->alias);
+            if(--mpp->retry_tick == 0) {
+                dm_queue_if_no_path(mpp->alias, 0);     // ----> here !
+                condlog(2, "%s: Disable queueing", mpp->alias);
+            }
+        }
+    }
+}
+
+retry_tick is set in
+
+extern void set_no_path_retry(struct multipath *mpp)
+{
+    mpp->retry_tick = 0;
+    mpp->nr_active = pathcount(mpp, PATH_UP) + pathcount(mpp, PATH_GHOST);
+    select_no_path_retry(mpp); // Usually, it will set mpp->no_path_retry based on the value 
+                                   // of 'no_path_retry' in multipath.conf
+
+    switch (mpp->no_path_retry) {
+    ...
+    default:
+        dm_queue_if_no_path(mpp->alias, 1);
+        if (mpp->nr_active == 0) {
+            /* Enter retry mode */
+            mpp->retry_tick = mpp->no_path_retry * conf->checkint;
+            condlog(1, "%s: Entering recovery mode: max_retries=%d",
+                mpp->alias, mpp->no_path_retry);
+        }
+        break;
+    }
+}
+
+We could see that when there is no active path in one multipath, queue_if_no_path will be disabled.
+There are two parameters decides the final time before disabling the queue_if_no_path.
+no_path_retry   --  no_path_retry in multipath.conf
+checkint        --  polling_interval in multipath.conf (by default 5)
+
+Let's look at the dmesg log:
+[541068.033114]  connection4:0: ping timeout of 5 secs expired, recv timeout 5, last rx 4835727978, last ping 4835732984, now 4835738000
+[541068.033485]  connection4:0: detected conn error (1022)
+[541073.033131]  session4: session recovery timed out after 5 secs
+
+// the sdevs will be offlined after iscsi recovery timed out.
+
+[541073.033140] sd 9:0:0:1: rejecting I/O to offline device
+[541073.033448] sd 9:0:0:1: [sde] killing request
+[541073.033451] sd 9:0:0:1: rejecting I/O to offline device
+[541073.033730] sd 9:0:0:1: [sde] killing request
+[541073.033732] sd 9:0:0:1: rejecting I/O to offline device
+[541073.034007] sd 9:0:0:1: [sde] killing request
+[541073.034016] sd 9:0:0:1: [sde] FAILED Result: hostbyte=DID_NO_CONNECT driverbyte=DRIVER_OK
+[541073.034018] sd 9:0:0:1: [sde] CDB: Read(10) 28 00 00 00 00 00 00 00 08 00
+[541073.034020] blk_update_request: I/O error, dev sde, sector 0
+[541073.034315] sd 9:0:0:1: [sde] FAILED Result: hostbyte=DID_NO_CONNECT driverbyte=DRIVER_OK
+[541073.034317] sd 9:0:0:1: [sde] CDB: Write(10) 2a 00 00 00 36 28 00 00 18 00
+[541073.034318] blk_update_request: I/O error, dev sde, sector 13864
+[541073.034593] sd 9:0:0:1: [sde] FAILED Result: hostbyte=DID_NO_CONNECT driverbyte=DRIVER_OK
+[541073.034595] sd 9:0:0:1: [sde] CDB: Write(10) 2a 00 03 f1 14 38 00 01 c8 00
+[541073.034596] blk_update_request: I/O error, dev sde, sector 66131000
+[541073.034866] device-mapper: multipath: Failing path 8:64.
+
+// We could see io error on target device layer, but not dm layer, it is because queue_if_no_path was still enabled
+// the failed io and and new io will be requeued.
+
+// After about 50s, io error on dm layer came up.
+// This is due to the retry_tick had been exhausted.
+// when queue_if_no_path is disabled, kernel will run the request_queue to fail the requeued io.
+// refer to queue_if_no_path in driver/md/dm-mpath.c
+[541123.486079] blk_update_request: I/O error, dev dm-5, sector 66131000
+[541123.486342] Buffer I/O error on dev dm-5, logical block 8266375, lost async page write
+[541123.486629] Buffer I/O error on dev dm-5, logical block 8266376, lost async page write
+[541123.486900] Buffer I/O error on dev dm-5, logical block 8266377, lost async page write
+[541123.487170] Buffer I/O error on dev dm-5, logical block 8266378, lost async page write
+[541123.487438] Buffer I/O error on dev dm-5, logical block 8266379, lost async page write
+[541123.487705] Buffer I/O error on dev dm-5, logical block 8266380, lost async page write
+[541123.487958] Buffer I/O error on dev dm-5, logical block 8266381, lost async page write
+[541123.488214] Buffer I/O error on dev dm-5, logical block 8266382, lost async page write
+[541123.488475] Buffer I/O error on dev dm-5, logical block 8266383, lost async page write
+[541123.488748] Buffer I/O error on dev dm-5, logical block 8266384, lost async page write
+
+
+So the final result above is expected. There is no bug here.
+In addition, I guess the 'no_path_retry' of the target device is 10. Please confirm with customer.
+
+Thanks
+Jianchao
+</pre>
+</font>
+</p>
 
 </body>
 </html>
