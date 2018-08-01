@@ -13,9 +13,16 @@
 <a href="#Bio_Stacked_Layer">Bio Stacked Layer</a>
 <ul>
 <li><a href="#Bio_based_DM">Bio based DM</a>
+<li><a href="#flush_to_bio_based_dm">flush to bio-based dm</a>
 </ul>
 <a href="#dm_suspend">dm suspend</a><br/>
 <a href="#table_load">table load</a><br/>
+<a href="#cache">cache</a>
+<ul>
+<li><a href="#cache_hit">cache hit</a>
+<li><a href="#cache_miss">cache miss</a>
+<li><a href="#execlusive_lock">execlusive lock</a>
+</ul>
 <a href="#snapshot">snapshot</a>
 <ul>
 <li><a href="#summary">summary</a>
@@ -254,6 +261,54 @@ clone_endio
 </p>
 
 
+<h3><a name="flush_to_bio_based_dm">flush to bio-based dm</a></h3>
+<p>
+<font size="2">
+Yes, we have to send the flush to all of the target devices.
+<pre>
+__split_and_process_bio
+  -> __send_empty_flush
+---
+    while ((ti = dm_table_get_target(ci->map, target_nr++)))
+        __send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
+          -> __clone_and_map_simple_bio
+          ---
+        __bio_clone_fast(clone, ci->bio);
+        if (len)
+            bio_setup_sector(clone, ci->sector, *len);
+<font color="blue">
+            // bio->bi_iter.bi_sector = sector;
+            // bio->bi_iter.bi_size = to_bytes(len);
+            // len is NULL here, so the bio here is an empty bio with only REQ_PREFLUSH
+</font>
+          ---
+---
+
+clone_endio
+  -> dec_pending
+  ---
+    if (atomic_dec_and_test(&io->io_count)) {
+        ...
+        if ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size) {
+<font color="blue">
+            /*
+             * Preflush done for flush with data, reissue
+             * without REQ_PREFLUSH.
+             */
+</font>
+            bio->bi_opf &= ~REQ_PREFLUSH;
+            queue_io(md, bio);
+        } else {
+        ...
+        }
+    }
+
+  ---
+</pre>
+</font>
+</p>
+
+
 <h2><a name="dm_suspend">dm suspend</a></h2>
 <p>
 <font size="2">
@@ -486,6 +541,402 @@ table_load will not install the new table, but just save it into the hash_cell.
         ...
     }
 </pre>
+</font>
+</p>
+
+<h2><a name="cache">cache</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+
+<h3><a name="weird_structures">weird structures</a></h3>
+<p>
+<font size="2">
+<pre>
+struct entry {
+    unsigned hash_next:28;
+    unsigned prev:28;
+    unsigned next:28;
+    unsigned level:6;
+    bool dirty:1;
+    bool allocated:1;
+    bool sentinel:1;
+    bool pending_work:1;
+
+    dm_oblock_t oblock;
+};
+This is a record of a cache.
+Except for some attributes and oblock, there isn't cblock in it.
+This looks like an effort to reduce its size.
+The cblock could be get through infer_cblock.
+
+struct queue {
+    struct entry_space *es;
+
+    unsigned nr_elts;
+    unsigned nr_levels;
+    struct ilist qs[MAX_LEVELS];
+
+    /*
+     * We maintain a count of the number of entries we would like in each
+     * level.
+     */
+    unsigned last_target_nr_elts;
+    unsigned nr_top_levels;
+    unsigned nr_in_top_levels;
+    unsigned target_count[MAX_LEVELS];
+};
+</pre>
+</font>
+</p>
+
+
+<h3><a name="cache_hit">cache hit</a></h3>
+<p>
+<font size="2">
+<pre>
+dm-cache map_bio
+  -> policy_lookup
+    -> smq_lookup
+  //under smq_policy->lock
+  -> __lookup
+  ---
+    e = h_lookup(&mq->table, oblock);
+    if (e) {
+        stats_level_accessed(&mq->cache_stats, e->level);
+
+        requeue(mq, e);
+        *cblock = infer_cblock(mq, e);
+        return 0;
+    } 
+  ---
+
+The entries in smq_policy->table are queued by __complete_background_work.
+
+smq_complete_background_work
+   //under smq_policy->lock
+  -> __complete_background_work
+  ---
+      POLICY_PROMOTE
+        if (success) {
+            e->oblock = work->oblock;
+            e->level = NR_CACHE_LEVELS - 1; //Looks like the highest level.
+            push(mq, e);
+              -> h_insert(&mq->table, e)
+        }
+    POLICY_DEMOTE
+        if (success) {
+            h_remove(&mq->table, e);
+            free_entry(&mq->cache_alloc, e);
+        }
+  ---
+
+<U>smq_policy->table includes the blocks in cache</U>
+
+If the blocks are in cache
+
+map_bio
+---
+    if policy_lookup tell us the blocks are in cache
+
+    if (passthrough_mode(cache)) {
+        ...
+    } else {
+        if (bio_data_dir(bio) == WRITE && writethrough_mode(cache) &&
+            !is_dirty(cache, cblock)) {
+            remap_to_origin_and_cache(cache, bio, block, cblock);
+            ---
+                struct bio *origin_bio = bio_clone_fast(bio, GFP_NOIO, &cache->bs);
+
+                bio_chain(origin_bio, bio);
+
+                __remap_to_origin_clear_discard(cache, origin_bio, oblock, false);
+                  -> remap_to_origin
+                submit_bio(origin_bio); //
+
+                remap_to_cache(cache, bio, cblock);
+            ---
+        } else
+            remap_to_cache_dirty(cache, bio, block, cblock);
+            ---
+            remap_to_cache(cache, bio, cblock);
+            if (bio_data_dir(bio) == WRITE) {
+                set_dirty(cache, cblock);
+                clear_discard(cache, oblock_to_dblock(cache, oblock));
+            }
+            ---
+    }
+    ...
+    return DM_MAPIO_REMAPPED;
+---
+</pre>
+</font>
+</p>
+
+
+<h3><a name="cache_miss">cache miss</a></h3>
+<p>
+<font size="2">
+First of all, when cache miss, bio will be remapped to origin device.
+<pre>
+map_bio
+---
+    if (r == -ENOENT) {
+        struct per_bio_data *pb = get_per_bio_data(bio);
+        inc_miss_counter(cache, bio);
+        if (pb->req_nr == 0) {
+            accounted_begin(cache, bio);
+            remap_to_origin_clear_discard(cache, bio, block);
+              -> __remap_to_origin_clear_discard
+                -> remap_to_origin
+        } else {
+            /*
+             * This is a duplicate writethrough io that is no
+             * longer needed because the block has been demoted.
+             */
+            bio_endio(bio);
+            return DM_MAPIO_SUBMITTED;
+        }
+    }
+---
+</pre>
+But what will do in the smq policy ?
+<pre>
+smq_lookup
+  -> __lookup
+    -> update_hotspot_queue // if no entry in smq_policy->table
+    ---
+    struct entry *e = h_lookup(&mq->hotspot_table, hb);
+
+    if (e) {
+        stats_level_accessed(&mq->hotspot_stats, e->level);
+
+        hi = get_index(&mq->hotspot_alloc, e);
+        q_requeue(&mq->hotspot, e,
+<font color="red">              test_and_set_bit(hi, mq->hotspot_hit_bits) ?
+              0u : mq->hotspot_level_jump, </font>
+              NULL, NULL);
+
+    } 
+    ---
+There is another entry represents the c-o block pair in
+smq_policy->hotspot_table.
+
+After the first time when the entry is allocated and inserted,
+the level of the entry will be upgraded when accessed by second time.
+The granularity is hotspot_level_jump.
+
+The level of the entry decides whether the entry could be premoted.
+__lookup
+---
+    e = h_lookup(&mq->table, oblock);
+    if (e) {
+    ...
+    } else {
+        stats_miss(&mq->cache_stats);
+
+        /*
+         * The hotspot queue only gets updated with misses.
+         */
+        hs_e = update_hotspot_queue(mq, oblock);
+<font color="red">
+        pr = should_promote(mq, hs_e, data_dir, fast_copy);
+        if (pr != PROMOTE_NOT) {
+            queue_promotion(mq, oblock, work);
+            *background_work = true;
+        }
+</font>
+
+        return -ENOENT;
+    }
+---
+
+But the entry level is only upgraded when it is not set
+in mq->hotspot_hit_bits, so what's about the second time ?
+
+See:
+smq_tick
+  //under mq->lock
+  -> end_hotspot_period
+    -> clear_bitset(mq->hotspot_hit_bits, mq->nr_hotspot_blocks);
+
+mq->hotspot_hit_bits will be cleared here.
+
+When will be smq_tick be inovked ?
+
+The common path is:
+clone_endio
+  -> cache_end_io
+    -> policy_tick
+      -> smq_tick
+
+</pre>
+</font>
+</p>
+
+
+<h3><a name="execlusive_lock">execlusive lock</a></h3>
+<p>
+<font size="2">
+<pre>
+The process of promote or demote need to be execlusive with normal IO.
+Premote:
+        copy data from origin_dev to cache_dev
+        modify metadata
+        cache active
+Demote:
+        copy data from cache_dev to origin_dev
+        modify metadata
+        cache inactive
+
+How to do that ?
+
+mg_start
+  -> mg_lock_writes
+    -> mg_copy // no overwrite_bio
+      -> mg_full_copy
+        -> copy
+copy
+---
+    o_region.bdev = cache->origin_dev->bdev;
+    o_region.sector = from_oblock(mg->op->oblock) * cache->sectors_per_block;
+    o_region.count = cache->sectors_per_block;
+
+    c_region.bdev = cache->cache_dev->bdev;
+    c_region.sector = from_cblock(mg->op->cblock) * cache->sectors_per_block;
+    c_region.count = cache->sectors_per_block;
+
+    if (promote)
+        r = dm_kcopyd_copy(cache->copier, &o_region, 1, &c_region, 0, copy_complete, &mg->k);
+    else
+        r = dm_kcopyd_copy(cache->copier, &c_region, 1, &o_region, 0, copy_complete, &mg->k);
+---
+
+Before do the copy, dm-cache will try to lock the block area.
+
+mg_start
+  -> mg_lock_writes
+---
+    /*
+     * Prevent writes to the block, but allow reads to continue.
+     * Unless we're using an overwrite bio, in which case we lock
+     * everything.
+     */
+    build_key(mg->op->oblock, oblock_succ(mg->op->oblock), &key);
+    r = dm_cell_lock_v2(cache->prison, &key,
+                mg->overwrite_bio ?  READ_WRITE_LOCK_LEVEL : WRITE_LOCK_LEVEL,
+                prealloc, &mg->cell);
+---
+lock_level
+#define WRITE_LOCK_LEVEL 0
+#define READ_WRITE_LOCK_LEVEL 1
+---
+    return bio_data_dir(bio) == WRITE ?
+        WRITE_LOCK_LEVEL :
+        READ_WRITE_LOCK_LEVEL;
+---
+
+Usually, the block area will be locked with level WRITE_LOCK_LEVEL (0).
+The read IO will be granted.
+
+map_bio
+  -> bio_detain_shared
+    -> dm_cell_get_v2
+      -> __get //under prison->lock
+      ---
+    if (__find_or_insert(prison, key, cell_prealloc, cell)) {
+        if ((*cell)->exclusive_lock) {
+            if (<font color="red">lock_level <= (*cell)->exclusive_level</font>) {
+                <font color="red">bio_list_add(&(*cell)->bios, inmate);</font>
+                return false;
+            }
+        }
+
+        (*cell)->shared_count++;
+
+    }
+      ---
+
+<B>When an IO fails due to ongoing copy,</B>
+  the bio will be added to cell->bios, these bios will be handled by mg_complete
+mg_complete
+---
+    bio_list_init(&bios);
+    if (mg->cell) {
+        if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
+              -> __unlock
+                -> get bios on cell->bios
+            free_prison_cell(cache, mg->cell);
+    }
+
+    free_migration(mg);
+    defer_bios(cache, &bios);
+---
+
+<B>When a mg fails due to ongoing IO,</B>
+mg_lock_writes
+---
+    build_key(mg->op->oblock, oblock_succ(mg->op->oblock), &key);
+    r = dm_cell_lock_v2(cache->prison, &key,
+                mg->overwrite_bio ?  READ_WRITE_LOCK_LEVEL : WRITE_LOCK_LEVEL,
+                prealloc, &mg->cell);
+    ...
+
+    if (r == 0)
+        mg_copy(&mg->k.ws);
+    else
+        quiesce(mg, mg_copy);
+          -> dm_cell_quiesce_v2
+            -> __quiesce
+              -> set cell->quiesce_continuation
+---
+cache_end_io
+  -> bio_drop_shared_lock
+    -> dm_cell_put_v2
+      -> __put
+---
+    if (!cell->shared_count) {
+        if (cell->exclusive_lock){
+<font color="red">
+            if (cell->quiesce_continuation) {
+                queue_work(prison->wq, cell->quiesce_continuation);
+                cell->quiesce_continuation = NULL;
+            }
+</font>
+        } else {
+            rb_erase(&cell->node, &prison->cells);
+            return true;
+        }
+    }
+
+---
+
+<B>The process of udpating cache metadata is also under lock:</B>
+mg_full_copy
+  ->  init_continuation(&mg->k, mg_upgrade_lock);
+  -> copy
+    -> dm_kcopyd_copy //copy_complete callback is copy_complete
+copy_complete
+  -> queue_continuation
+    -> queue_work mg_upgrade_lock
+
+mg_upgrade_lock
+---
+        /*
+         * Now we want the lock to prevent both reads and writes.
+         */
+        r = dm_cell_lock_promote_v2(mg->cache->prison, mg->cell,
+                        READ_WRITE_LOCK_LEVEL);
+        if (r < 0)
+            mg_complete(mg, false);
+        else if (r)
+            quiesce(mg, mg_update_metadata);
+        else
+            mg_update_metadata(ws);
+---
+mg_update_metadata will modify the cache metadata and invoke mg_complete finally
+which will unlock the lock.
+
+</pre>
+
 </font>
 </p>
 

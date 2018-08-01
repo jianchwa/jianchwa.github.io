@@ -4217,6 +4217,90 @@ Look at bsg_map_hdr
 <font size="2">
 What will be done when direct IO on a block device ?
 <pre>
+__generic_file_write_iter
+---
+    if (iocb->ki_flags & IOCB_DIRECT) {
+        loff_t pos, endbyte;
+
+        written = generic_file_direct_write(iocb, from);
+        if (written < 0 || !iov_iter_count(from) || IS_DAX(inode))
+            goto out;
+<font color="blue">
+        // if direct_IO doesn't complete all of the IO, fallback to buffered IO.
+</font>
+        status = generic_perform_write(file, from, pos = iocb->ki_pos);
+        ...
+<font color="blue">
+        /*
+         * We need to ensure that the page cache pages are written to
+         * disk and invalidated to preserve the expected O_DIRECT
+         * semantics.
+         */
+</font>
+        endbyte = pos + status - 1;
+        err = filemap_write_and_wait_range(mapping, pos, endbyte);
+        if (err == 0) {
+            iocb->ki_pos = endbyte + 1;
+            written += status;
+            invalidate_mapping_pages(mapping,
+                         pos >> PAGE_SHIFT,
+                         endbyte >> PAGE_SHIFT);
+        } else {
+            /*
+             * We don't know how much we wrote, so just return
+             * the number of bytes which were direct-written
+             */
+        }
+    }
+---
+
+generic_file_direct_write(struct kiocb *iocb, struct iov_iter *from)
+{
+    ...
+    if (iocb->ki_flags & IOCB_NOWAIT) {
+        /* If there are pages to writeback, return */
+        if (filemap_range_has_page(inode->i_mapping, pos,
+                       pos + iov_iter_count(from)))
+            return -EAGAIN;
+    } else {
+<font color="red">
+        written = filemap_write_and_wait_range(mapping, pos,
+                            pos + write_len - 1);
+</font>
+        if (written)
+            goto out;
+    }
+<font color="blue">
+    /*
+     * After a write we want buffered reads to be sure to go to disk to get
+     * the new data.  We invalidate clean cached page from the region we're
+     * about to write.  We do this *before* the write so that we can return
+     * without clobbering -EIOCBQUEUED from ->direct_IO().
+     */
+</font>
+    written = invalidate_inode_pages2_range(mapping,
+                    pos >> PAGE_SHIFT, end);
+    ...
+    written = mapping->a_ops->direct_IO(iocb, from);
+    ...
+    if (written > 0) {
+        pos += written;
+        write_len -= written;
+<font color="red">
+        //Interesting thing here, the file is expanded by the direct IO.
+        // we have to modify the size of the inode.
+        if (pos > i_size_read(inode) && !S_ISBLK(inode->i_mode)) {
+            i_size_write(inode, pos);
+            mark_inode_dirty(inode);
+        }
+        iocb->ki_pos = pos;
+    }
+</font>
+    iov_iter_revert(from, write_len - iov_iter_count(from));
+out:
+    return written;
+}
+
 blkdev_direct_IO
   -> __blkdev_direct_IO_simple // Let's look at the simpler case.
 ---
@@ -4253,6 +4337,8 @@ blkdev_direct_IO
     It will get and pin the pages behind the userland buffers.
     Then these pages will be sent to block layer directly.
     <U>So we could say this is zero-copy.</U>
+    Note: <U>get_user_pages_fast will not ensure all of the requested pages will be got</U>
+          <U>and pined.</U>
 </font>
     ret = bio_iov_iter_get_pages(&bio, iter);
     if (unlikely(ret))
@@ -4298,31 +4384,9 @@ blkdev_direct_IO
     bio_uninit(&bio);
 ---
 </pre>
-But one thing need to be talked, there is also pagecache for the blockdevice,
-don't we need to care about the pagecache here ?<br/>
-<br/>
-If there is data in pagecache (Or buffer for blockdev ?), a read direct IO will
-get stale data from disk. <br/>
 
-Let's look at the do_blockdev_direct_IO which is employed by FS.
-<pre>
----
-    if (dio->flags & DIO_LOCKING) {
-        if (iov_iter_rw(iter) == READ) {
-            struct address_space *mapping =
-                    iocb->ki_filp->f_mapping;
 
-            inode_lock(inode);
-<font color="blue">
-            // This will flush out the data in cache.
-</font>
-            retval = filemap_write_and_wait_range(mapping, offset,
-                                  end - 1);
-            ...
-        }
-    }
 
----
 </pre>
 
 </font>
