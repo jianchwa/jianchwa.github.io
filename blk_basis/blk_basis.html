@@ -42,6 +42,7 @@
 <ul>
 <li><a href="#Setup_and_complete_a_bio">Setup and complete a bio</a>
 <li><a href="#Bio_operations">Bio operations</a>
+<li><a href="#Bio_split">Bio split</a>
 </ul>
 <a href="#Merge">Merge</a><br/>
 <a href="#FLUSH_and_FUA">FLUSH and FUA</a><br/>
@@ -67,6 +68,13 @@
 </ul>
 <a href="#bsg">bsg</a><br/>
 <a href="#direct_IO">direct_IO</a><br/>
+<a href="#blk_RPM">blk RPM</a><br/>
+<ul>
+<li><a href="#RPM">RPM</a>
+<li><a href="#Hooks_in_BLK">Hooks in BLK</a>
+<li><a href="#Work_process">Work process</a>
+<li><a href="#RPM_Core">RPM Core</a>
+</ul>
 </font>
 </p>
 
@@ -1814,6 +1822,97 @@ static int clone_bio(struct dm_target_io *tio, struct bio *bio,
 </p>
 
 
+<h3><a name="Bio_split">Bio split</a></h3>
+<p>
+<font size="2">
+<pre>
+bio will be split in blk_mq_make_request, why ?
+The associated commit is:
+54efd50b ( block: make generic_make_request handle arbitrarily sized bios)
+
+---
+    The way the block layer is currently written, it goes to great lengths
+    to avoid having to split bios; upper layer code (such as bio_add_page())
+    checks what the underlying device can handle and tries to always create
+    bios that don't need to be split.
+    
+    But this approach becomes unwieldy and eventually breaks down with
+    stacked devices and devices with dynamic limits, and it adds a lot of
+    complexity.
+---
+
+Then FS layer could submit arbitrary size bios.
+
+How to do it ?
+
+blk_queue_split
+  -> blk_bio_segment_split
+    -> bio_split
+---
+    split = bio_clone_fast(bio, gfp, bs);
+      -> __bio_clone_fast
+      ---
+        bio->bi_disk = bio_src->bi_disk;
+        bio->bi_partno = bio_src->bi_partno;
+        bio_set_flag(bio, BIO_CLONED);
+        if (bio_flagged(bio_src, BIO_THROTTLED))
+            bio_set_flag(bio, BIO_THROTTLED);
+        bio->bi_opf = bio_src->bi_opf;
+        bio->bi_write_hint = bio_src->bi_write_hint;
+        bio->bi_iter = bio_src->bi_iter;
+<font size="red">
+        bio->bi_io_vec = bio_src->bi_io_vec;
+</font>
+        ...
+      ---
+    split->bi_iter.bi_size = sectors << 9;
+
+    if (bio_integrity(split))
+        bio_integrity_trim(split);
+
+    bio_advance(bio, split->bi_iter.bi_size);
+---
+              |  sectors  |
+   bi_io_vec  [  bv  ] [  bv  ] [  bv  ] [  bv  ]
+              \____  _____/\________  __________/
+                    V                V
+          split->bi_iter         bio->bi_iter
+
+blk_queue_split
+---
+    if (split) {
+        /* there isn't chance to merge the splitted bio */
+        split->bi_opf |= REQ_NOMERGE;
+
+        /*
+         * Since we're recursing into make_request here, ensure
+         * that we mark this bio as already having entered the queue.
+         * If not, and the queue is going away, we can get stuck
+         * forever on waiting for the queue reference to drop. But
+         * that will never happen, as we're already holding a
+         * reference to it.
+         */
+        bio_set_flag(*bio, BIO_QUEUE_ENTERED);
+
+        bio_chain(split, *bio);
+        trace_block_split(q, split, (*bio)->bi_iter.bi_sector);
+<font color="blue">
+                a big bio
+        |  max  |
+        |__________________________|
+        \___ ___/\________ ________/
+            v             v
+          submit      go back to
+                     generic_make_request
+
+</font>
+        generic_make_request(*bio);
+        *bio = split;
+    }
+---
+</pre>
+</font>
+</p>
 
 
 <h2><a name="Merge">Merge</a></h2>
@@ -4391,5 +4490,269 @@ blkdev_direct_IO
 
 </font>
 </p>
+
+
+<h2><a name="blk_RPM">blk RPM</a></h2>
+<h3><a name="RPM">RPM</a></h3>
+<p>
+<font size="2">
+Traditional suspend/resume
+<ul>
+<li> System wide
+<li> All devices together
+<li> Initiated by userspace
+<li> Any device can prevent the system suspend
+</ul>
+Runtime suspend/resume
+<ul>
+<li> Device-local suspend/resume
+<li> Single device at a time
+<li> Controlled by driver
+</ul>
+<pre>
+* Once the subsystem-level suspend callback (or the driver suspend callback, 
+  if invoked directly) has completed successfully for the given device, the PM 
+  core regards the device as suspended, which need not mean that it has been 
+  put into a low power state.  It is supposed to mean, however, that the 
+  device will not process data and will not communicate with the CPU(s) and 
+  RAM until the appropriate resume callback is executed for it.  The runtime 
+  PM status of a device after successful execution of the suspend callback is 
+  'suspended'.
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="Hooks_in_BLK">Hooks in BLK</a></h3>
+<p>
+<font size="2">
+<B>Hooks in blk-legacy</B>
+<pre>
+__elv_add_request
+  -> blk_pm_add_request
+---
+    if    q->dev // support RPM
+       && rq->rq_flags & RQF_PM //not PM command
+       && <font color="red">q->nr_pending++</font> == 0
+       && (q->rpm_status == RPM_SUSPENDED || q->rpm_status == RPM_SUSPENDING))
+
+       pm_request_resume(q->dev) // start resume
+---
+elv_requeue_request
+  -> blk_pm_requeue_request
+    ---
+    if (rq->q->dev && !(rq->rq_flags & RQF_PM))
+        <font color="red">rq->q->nr_pending--</font>;
+    ---
+  -> __elv_add_request()//ELEVATOR_INSERT_REQUEUE
+
+__blk_put_request
+  -> blk_pm_put_request
+---
+    if (rq->q->dev && !(rq->rq_flags & RQF_PM) && !<font color=“red”>--rq->q->nr_pending</font>)
+        pm_runtime_mark_last_busy(rq->q->dev);
+---
+
+blk_peek_request
+  -> elv_next_request
+    -> iterate q->queue_head
+       if blk_pm_allow_request
+         return it
+    ---
+    switch (rq->q->rpm_status) {
+    case RPM_RESUMING:
+    case RPM_SUSPENDING:
+        return rq->rq_flags & RQF_PM;
+    case RPM_SUSPENDED:
+        return false;
+    }
+
+    return true;
+    ---
+<font color="blue">
+Don't process normal requests when queue is suspended
+or in the process of suspending/resuming
+</font>
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="Work_process">Work process</a></h3>
+<p>
+<font size="2">
+The normal process of the runtime PM running in block layer is:
+<pre>
+        blk_pre_runtime_suspend
+          if q->nr_pending is zero
+             set q->rpm_status to RPM_SUSPENDING
+               |
+               v
+        sdev_runtime_suspend
+          -> pm->runtime_suspend
+               |
+               v
+        blk_post_runtime_suspend
+          -> set state to RPM_SUSPENDED
+
+When new request is added:
+        __elv_add_request
+          -> blk_pm_add_request
+          ---
+    if (q->dev && !(rq->rq_flags & RQF_PM) && q->nr_pending++ == 0 &&
+        (q->rpm_status == RPM_SUSPENDED || q->rpm_status == RPM_SUSPENDING))
+        <font color="red">pm_request_resume(q->dev);</font>
+          ---
+The resume process will be started here.
+
+Before the resume is completed, the requests will not been issued to LLDD.
+
+        blk_peek_request
+          -> elv_next_request
+          ---
+        list_for_each_entry(rq, &q->queue_head, queuelist) {
+            if (blk_pm_allow_request(rq))
+                return rq;
+          ---
+
+During the process of pm runtime resuming:
+        blk_pre_runtime_resume
+          -> set rpm_status to RPM_RESUMING
+        pm->runtime_resume
+        blk_post_runtime_resume
+        ---
+        q->rpm_status = RPM_ACTIVE;
+        __blk_run_queue(q);
+        pm_runtime_mark_last_busy(q->dev);
+        <font color="red">pm_request_autosuspend(q->dev);</font>
+        ---
+
+rpm_suspend // if RPM_AUTO
+  -> pm_runtime_autosuspend_expiration
+    -> last_busy = READ_ONCE(dev->power.last_busy);
+<font color="blue">
+    it will check whether the device has been idle for some time,
+    if yes, the suspend process will proceed, otherwise, set up the
+    suspend_timer.
+    
+    the check here depends on the dev->power.last_busy
+    it is updated around the blk-legacy layer.
+	the most important one is in blk_pm_put_request.
+</font>
+
+pm_suspend_timer_fn
+---
+    if (expires > 0 && !time_after(expires, jiffies)) {
+        dev->power.timer_expires = 0;
+        rpm_suspend(dev, dev->power.timer_autosuspends ?
+            (RPM_ASYNC | RPM_AUTO) : RPM_ASYNC);
+    }
+---
+</pre>
+</font>
+</p>
+
+
+
+<h3><a name="RPM_Core">RPM Core</a></h3>
+<p>
+<font size="2">
+<pre>
+pm_runtime_put
+  -> __pm_runtime_idle //RPM_GET_PUT | RPM_ASYNC
+    ---
+    if (rpmflags & RPM_GET_PUT) {
+        if (!atomic_dec_and_test(&dev->power.usage_count))
+            return 0;
+    }
+
+    might_sleep_if(!(rpmflags & RPM_ASYNC) && !dev->power.irq_safe);
+
+    spin_lock_irqsave(&dev->power.lock, flags); 
+    //<font color="blue">This spinlock will serialize all the things</font>
+    retval = rpm_idle(dev, rpmflags);
+    spin_unlock_irqrestore(&dev->power.lock, flags);
+    ---
+
+rpm_idle
+---
+    ...
+    callback = RPM_GET_CALLBACK(dev, runtime_idle);
+
+    if (callback)
+        retval = __rpm_callback(callback, dev);
+<font color="blue">
+    // __rpm_callback will unlock the dev->power.lock before invokes the
+    // driver's callback.
+</font>
+    ...
+    return retval ? retval : rpm_suspend(dev, rpmflags | RPM_AUTO);
+---
+scsi_runtime_idle will always returns -EBUSY.
+Let's look at RPM_SUSPENDED
+---
+ repeat:
+    retval = rpm_check_suspend_allowed(dev);
+      -> if dev->power.runtime_status == RPM_SUSPENDED, return 1
+    ...
+    if (retval)
+        goto out;
+
+    ...
+    /* Other scheduled or pending requests need to be canceled. */
+    pm_runtime_cancel_pending(dev);
+
+    if (dev->power.runtime_status == RPM_SUSPENDING) {
+        DEFINE_WAIT(wait);
+        ...
+<font color="blue">
+        /* Wait for the other suspend running in parallel with us. */
+</font>
+        for (;;) {
+            prepare_to_wait(&dev->power.wait_queue, &wait,
+                    TASK_UNINTERRUPTIBLE);
+            if (dev->power.runtime_status != RPM_SUSPENDING)
+                break;
+
+            spin_unlock_irq(&dev->power.lock);
+
+            schedule();
+
+            spin_lock_irq(&dev->power.lock);
+        }
+        finish_wait(&dev->power.wait_queue, &wait);
+        goto repeat;
+    }
+<font color="red">
+    __update_runtime_status(dev, RPM_SUSPENDING);
+</font>
+    callback = RPM_GET_CALLBACK(dev, runtime_suspend);
+
+    dev_pm_enable_wake_irq_check(dev, true);
+    retval = rpm_callback(callback, dev);
+    if (retval)
+        goto fail;
+
+ no_callback:
+<font color="red">
+    __update_runtime_status(dev, RPM_SUSPENDED);
+</font>
+    pm_runtime_deactivate_timer(dev);
+
+    if (dev->parent) {
+        parent = dev->parent;
+        atomic_add_unless(&parent->power.child_count, -1, 0);
+    }
+    wake_up_all(&dev->power.wait_queue);
+
+
+---
+</pre>
+</font>
+</p>
+
+
 </body>
 </html>

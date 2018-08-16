@@ -19,7 +19,11 @@
 <li><a href="#Rcu_Tree">Rcu Tree</a>
 <li><a href="#How_does_RCU_run">How does RCU run</a>
 <ul>
-<li><a href="#Grace_period_and_Quiescent_state">Grace period and Quiescent state</a>
+<li><a href="#Grace_period_and_Quiescent_state">Grace period and Quiescent state</a><br/>
+</ul>
+<li><a href="#RCU_Usage">RCU Usage</a>
+<ul>
+<li><a href="#scsi_host_busy">scsi_host_busy</a></h4>
 </ul>
 </ul>
 </font>
@@ -628,6 +632,106 @@ __do_softirq()
     -> rcu_bh_qs() //<font color="red">after loop of invoking softirq action</font>
 </pre>
 
+</font>
+</p>
+
+<h3><a name="RCU_Usage">RCU Usage</a></h3>
+
+<h4><a name="scsi_host_busy">scsi_host_busy</a></h4>
+<p>
+<font size="2">
+<pre>
+scsi_host_queue_ready
+---
+    if (scsi_host_in_recovery(shost))
+        return 0;
+
+    busy = atomic_inc_return(&shost->host_busy) - 1;
+<font color="blue">
+    // We add the host_busy here atomically, but this is not\
+    // the final result. We could decrement host_busy next due to
+    // multiple reasons.
+</font>                                                              scsi_host_set_state(shost, SHOST_RECOVERY)    
+                                                                     scsi_eh_wakeup
+    if (atomic_read(&shost->host_blocked) > 0) {                     ---
+        if (busy)                                                    if (atomic_read(&shost->host_busy) == shost->host_failed) {
+            goto starved;                                                wake_up_process(shost->ehandler);
+                                                                     ---
+        if (atomic_dec_return(&shost->host_blocked) > 0)             <font color="blue">The host_busy here is not the final result</font>
+            goto out_dec;                                            <font color="blue">operation on host_busy is atomic, but the whole scsi_host_queue_ready is not atomic</font>
+    }
+
+    if (shost->can_queue > 0 && busy >= shost->can_queue)
+        goto starved;
+    if (shost->host_self_blocked)
+        goto starved;
+    ...
+    return 1;
+
+starved:
+    spin_lock_irq(shost->host_lock);
+    if (list_empty(&sdev->starved_entry))
+        list_add_tail(&sdev->starved_entry, &shost->starved_list);
+    spin_unlock_irq(shost->host_lock);
+out_dec:
+    atomic_dec(&shost->host_busy);
+    return 0;
+---
+
+The worst result could be:
+scsi_host_queue_ready return due to busy >= shost->can_queue, and the
+scsi_eh_wakeup doesn't wake up the EH kthread due to the race. And then
+the requests in EH cannot be handled and shost->can_queue cannot be decremented
+and IO hang comes up finally.
+
+The fix could be:
+scsi_host_queue_ready                        scsi_eh_scmd_add
+---                                          ---
+    rcu_read_lock();                         scsi_host_set_state(shost, SHOST_RECOVERY)
+    if (scsi_host_in_recovery(shost)) {   
+        rcu_read_unlock();
+        return 0;
+    }
+    host_busy operations;
+    rcu_read_unlock();
+                                             synchronize_rcu();
+                                             shost->host_failed++;
+                                             scsi_eh_wakeup(shost);
+---
+Then scsi_eh_wakeup will not race with scsi_host_queue_ready any more due to the
+SHOST_RECOVERY state.
+scsi_eh_scmd_add is always invoked in process context, so I think this should be
+OK.
+
+The fix in upstream is as following:
+scsi_host_queue_ready
+  -> scsi_dec_host_busy
+  ---
+    rcu_read_lock();
+    atomic_dec(&shost->host_busy);
+    if (unlikely(scsi_host_in_recovery(shost))) {
+        spin_lock_irqsave(shost->host_lock, flags);
+        if (shost->host_failed || shost->host_eh_scheduled)
+            scsi_eh_wakeup(shost);
+        spin_unlock_irqrestore(shost->host_lock, flags);
+    }
+    rcu_read_unlock();
+  ---
+
+scsi_eh_scmd_add
+  -> scsi_host_set_state(shost, SHOST_RECOVERY)
+  -> call_rcu(&scmd->rcu, scsi_eh_inc_host_failed);
+
+scsi_eh_inc_host_failed
+---
+    spin_lock_irqsave(shost->host_lock, flags);
+    shost->host_failed++;
+    scsi_eh_wakeup(shost);
+    spin_unlock_irqrestore(shost->host_lock, flags);
+---
+Weird solution.
+
+</pre>
 </font>
 </p>
 
