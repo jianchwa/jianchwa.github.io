@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>JBD2</title>
+</head>
+<body>
+<div>
+    <h1>JBD2</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Concepts">Concepts</a><br/>
+<a href="#Implementation">Implementation</a>
+<ul>
+<li><a href="#Handle">Handle</a>
+<li><a href="#Send_to_log">Send to log</a>
+<li><a href="#Wait_complete">Wait for complete</a>
+<li><a href="#commit_record">commit record</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="Concepts">Concepts</a></h2>
+<hr style="height:5px;border:none;border-top:1px solid black;" />
+
+<h3><a name="Handle">Handle</a></h3>
+<p>
+<font size="2">
+What is a Handle ?
+<pre>
+A Handle represents a single atomic update in fs.
+For example:
+We want to create a new file 'jbd2_test' in /home/will, then we need following operations in fs layer.
+ - decrease the number of free inodes in the inode count block
+ - initialize the block of on-disk inode
+ - add an entry in the block that holds the directory entires of /home/will
+
+All of the 3 update belongs to a single handle.
+
+</pre>
+
+</font>
+</p>
+
+<h3><a name="Send_to_log">Send to log</a></h3>
+<p>
+<font size="2">
+<pre>
+
+                         LAST_TAG   
+     +------------------  ----+---+---+---+---+   +---+
+     | H | T |u| T | T |..| T | D | D | D | D |...| D |
+     +------------------  ----+---+---+---+---+   +---+
+     \___________ ____________/   \_ _/           
+                 V                  V
+             Descriptor            Data
+             One Block
+
+H   journal_header_t
+T   journal_block_tag_t
+u   uuid
+
+The jh's is on commit_transaction->t_buffers.
+
+Create descriptor:
+jbd2_journal_get_descriptor_buffer //JBD2_DESCRIPTOR_BLOCK
+  -> jbd2_journal_next_log_block // get a block nr
+  -> __getblk // get the associated bh from the jbd blkdev
+
+Write bh to journal
+set bh state to BH_JWrite //being written to log
+jbd2_journal_write_metadata_buffer
+  -> jbd_lock_bh_state
+<font color="blue">
+    // setup the shadow bh
+    One thing need to be noted:
+    The bh is being committing to log could be modified 
+    by others. We carry out a COW on the bh to promote
+    performance. <U>The VFS must use the bh in normal way</U>
+    , so JBD2 has to do the dirty work.                   
+</font>                                                      
+                                                             jbd2_journal_get_write_access
+                                                             -> do_get_write_access
+   ---                                                       ---   
+    if (jh_in->b_frozen_data) {                              jbd_lock_bh_state // used to serialize access to jh
+        done_copy_out = 1;                                   jh->b_transaction not NULL, jh->b_frozen_data is NULL
+        new_page = virt_to_page(jh_in->b_frozen_data);       if (buffer_shadow(bh)) {    
+        new_offset = offset_in_page(jh_in->b_frozen_data);       jbd_unlock_bh_state(bh);
+    } else {                                                     wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+        new_page = jh2bh(jh_in)->b_page;                         goto repeat;
+        new_offset = offset_in_page(jh2bh(jh_in)->b_data);   }
+    }                                                        <font color="red">//bh->b_page is referenced by shadow bh </font>
+    ...                                                      
+   ---                                                           
+<font color="blue">                                       
+    // the new_page and new_offset include the data which 
+    // the shadow bh will contains.                       
+</font>                                                   
+  ---                                                        if (jh->b_jlist == BJ_Metadata || force_copy) {
+    set_bh_page(new_bh, new_page, new_offset);                   if (!frozen_buffer) {
+    new_bh->b_size = bh_in->b_size;                                  JBUFFER_TRACE(jh, "allocate memory for buffer");
+    new_bh->b_bdev = journal->j_dev;                                 jbd_unlock_bh_state(bh);
+    new_bh->b_blocknr = blocknr;                                     frozen_buffer = jbd2_alloc(jh2bh(jh)->b_size,
+    new_bh->b_private = bh_in;                                                      GFP_NOFS | __GFP_NOFAIL);
+    set_buffer_mapped(new_bh);                                       goto repeat;
+    set_buffer_dirty(new_bh);                                    }
+  ---                                                            jh->b_frozen_data = frozen_buffer;
+  -> __jbd2_journal_file_buffer //BJ_Shadow                      frozen_buffer = NULL;
+  -> set original bh to BH_Shadow                                jbd2_freeze_jh_data(jh); //<font color="blue">copy data to jh->b_frozen_data</font>
+<font color="blue">                                          }     
+    // IO on shadow buffer is running
+    // The BH_Shadow will be cleared by 
+    // journal_end_buffer_io_sync.
+</font>
+  -> jbd_unlock_bh_state                                     jbd_unlock_bh_state
+
+submit bios
+
+---
+            for (i = 0; i < bufs; i++) {
+                struct buffer_head *bh = wbuf[i];
+                  ...
+                lock_buffer(bh);
+                clear_buffer_dirty(bh);
+                set_buffer_uptodate(bh);
+                bh->b_end_io = journal_end_buffer_io_sync;
+                submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+            }
+---
+
+</pre>
+</font>
+</p>
+
+<h3><a name="Wait_complete">Wait for complete</a></h3>
+<p>
+<font size="2">
+<pre>
+<font color="blue">
+we have just managed to send a transaction to
+the log.  Before we can commit it, wait for the IO so far to
+complete. <U>Control buffers</U> being written are on the
+transaction's log_list queue, and <U>metadata buffers</U> are on
+the io_bufs list.
+</font>
+    while (!list_empty(&io_bufs)) {
+        struct buffer_head *bh = list_entry(io_bufs.prev,
+                            struct buffer_head,
+                            b_assoc_buffers);
+
+        wait_on_buffer(bh); //<font color="blue">//shadow buffer</font>
+        cond_resched();
+        ...
+        free_buffer_head(bh);
+<font color=“blue”>
+        //the original metadata buffer, or namely shadowed buffer
+</font>
+        jh = commit_transaction->t_shadow_list->b_tprev;
+        bh = jh2bh(jh);
+        clear_buffer_jwrite(bh);
+<font color="blue">
+        // BH_Shadow is cleared by journal_end_buffer_io_sync.
+        // Now we clear BH_JWrite which means being written to log
+</font>
+        jbd2_journal_file_buffer(jh, commit_transaction, <font
+        color="red">BJ_Forget</font>);
+        ...
+    }
+
+    while (!list_empty(&log_bufs)) {
+        struct buffer_head *bh;
+
+        bh = list_entry(log_bufs.prev, struct buffer_head, b_assoc_buffers);
+        wait_on_buffer(bh);
+        ...
+        clear_buffer_jwrite(bh);
+        jbd2_unfile_log_bh(bh);
+        ...
+    }
+</pre>
+</font>
+</p>
+
+<h3><a name="commit_record">commit record</a></h3>
+<p>
+<font size="2">
+<pre>
+<B>In theory, commit record should be submitted when the logs are confirmed to be
+on non-volatile storage.</B>
+
+journal_submit_commit_record
+---
+    bh = jbd2_journal_get_descriptor_buffer(commit_transaction,
+                        JBD2_COMMIT_BLOCK);
+    ...
+    tmp = (struct commit_header *)bh->b_data;
+    tmp->h_commit_sec = cpu_to_be64(now.tv_sec);
+    tmp->h_commit_nsec = cpu_to_be32(now.tv_nsec);
+    ...
+    lock_buffer(bh);
+    clear_buffer_dirty(bh);
+    set_buffer_uptodate(bh);
+    bh->b_end_io = journal_end_buffer_io_sync;
+
+    if (journal->j_flags & JBD2_BARRIER &&
+        !jbd2_has_feature_async_commit(journal))
+        ret = submit_bh(REQ_OP_WRITE,
+            <font color="red"><B>REQ_SYNC | REQ_PREFLUSH | REQ_FUA</B></font>, bh);
+    else
+        ret = submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+<font color="blue">
+    // the JBD2_BARRIER option should be for the tradeoff between performance
+    // and safety.
+</font>
+---
+
+To ensure the journal reliable, we need two flush at least
+
+      log
+      flush [1]
+      commit  
+      flush [2]
+      metadata
+
+flush [1] is to ensure when we get commit, the log is on the disk and correct.
+In fact, we have another way to ensure this.
+We calculate a checksum of the log and record it in the commit. Then we could
+know whether the log is complete or right through the checksum in the commit record.
+Certainly, this is not free. Calculating checksum will raise the cpu load.
+
+The checksum of the log is calculated at :
+start_journal_io:
+            for (i = 0; i < bufs; i++) {
+                struct buffer_head *bh = wbuf[i];
+                /*
+                 * Compute checksum.
+                 */
+                if (jbd2_has_feature_checksum(journal)) {
+<font color="red">
+                    crc32_sum =
+                        jbd2_checksum_data(crc32_sum, bh);
+</font>
+                }
+
+                lock_buffer(bh);
+                clear_buffer_dirty(bh);
+                set_buffer_uptodate(bh);
+                bh->b_end_io = journal_end_buffer_io_sync;
+                submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+            }
+
+journal_submit_commit_record
+---
+    if (jbd2_has_feature_checksum(journal)) {
+        tmp->h_chksum_type     = JBD2_CRC32_CHKSUM;
+        tmp->h_chksum_size     = JBD2_CRC32_CHKSUM_SIZE;
+        tmp->h_chksum[0]     = cpu_to_be32(crc32_sum);
+    }
+---
+
+Then the flush [1] could be eliminated.
+But the flush [2] is still necessary before submit the metadata to disk,
+we must ensure the log has been on the non-volatile storage.
+
+Without the limit of flush [1], we even could submit the commit record before
+log IO is completed. This feature is ASYNC_COMMIT.
+</pre>
+</font>
+</p>
+
+
+</body>
+</html>

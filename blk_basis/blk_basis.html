@@ -49,6 +49,7 @@
 <a href="#Queue_state_flags">Queue state flags</a><br/>
 <a href="#WBT">WBT</a><br/>
 <a href="#blkdev_gendisk_hd">blkdev gendisk hd</a><br/>
+<a href="#blk-sysfs">blk sysfs</a><br/>
 <a href="#request_queue_cleanup_and_release">request_queue cleanup and release</a><br/>
 <a href="#blk_integrity">blk_integrity</a><br/>
 <a href="#blk-loop">blk loop</a>
@@ -2540,6 +2541,59 @@ mount_bdev
                            queue->make_request_fn
 
 </pre>
+
+</font>
+</p>
+
+<h2><a name="blk-sysfs">blk sysfs</a></h2>
+<p>
+<font size="2">
+Let's look at how is the following sysfs interface added. </br>
+<pre>
+    /sys/block/nvme/queue/
+	      ^     ^     ^
+		 [1]   [2]   [3]
+
+    /sys/block/nvme/mq
+	                ^
+				   [4]
+</pre>
+<ul>
+<li> [1] /sys/block : block_depr
+<pre>
+genhd_device_init
+---
+	/* create top-level block dir */
+	if (!sysfs_deprecated)
+		block_depr = kobject_create_and_add("block", NULL);
+---
+</pre>
+<li> [2] /sys/block/nvme : gendisk->part0.__dev.kobj
+<pre>
+device_add_disk
+  -> __device_add_disk
+    -> register_disk
+      -> sysfs_create_link(block_depr, &ddev->kobj,
+					kobject_name(&ddev->kobj));
+</pre>
+<li> [3] /sys/block/nvme/queue : request_queue->kobj
+<pre>
+device_add_disk
+  -> __device_add_disk
+    -> blk_register_queue
+	  ->  kobject_add(&q->kobj, kobject_get(&dev->kobj), "%s", <font color="red">"queue"</font>)
+The ktype of q->kobj is blk_queue_ktype
+</pre>
+<li> [4] /sys/block/nvme/mq : request_queue->mq_kobj
+<pre>
+device_add_disk
+  -> __device_add_disk
+    -> blk_register_queue
+	  -> __blk_mq_register_dev <font color="blue">parent dev gendisk->part0.__dev </font>
+	    -> kobject_add(&q->mq_kobj, kobject_get(&dev->kobj), "%s", "mq")
+
+</pre>
+</ul>
 
 </font>
 </p>
