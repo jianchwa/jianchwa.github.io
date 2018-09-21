@@ -22,23 +22,34 @@
 </ul>
 <a href="#log">log</a>
 <ul>
-<li><a href="#log_format">format</a>
+<li><a href="#log_formating">log formating</a>
 <li><a href="#checkpoint">checkpoint</a>
 <li><a href="#log_in_core">in core log</a>
+<ul>
+<li><a href="#iclog">iclog</a>
+<li><a href="#iclog_ring_and_physical_log_space">iclog ring and physical log space</a>
+<li><a href="#iclog_format">iclog format</a>
+</ul>
 <li><a href="#flush_to_disk">flush to disk</a>
 <li><a href="#LSN">LSN</a>
 <ul>
 <li> <a href="#order_of_callbacks">order of callbacks</a>
 <li> <a href="#order_of_AIL">order of AIL</a>
 </ul>
-<li><a href="#Left_log_space">Left log space</a>
+<li><a href="#log_space">log space</a>
+<ul>
+<li><a href="#left_log_space">lef log space</a>
+<li><a href="#log_space_accounting">log space accounting</a>
 <li><a href="#log_space_reserve">log space reserve</a>
+</ul>
 <li><a href="#relog">relog</a>
-<li><a href="#iclog_ring_and_physical_log_space">iclog ring and physical log space</a>
-<li><a href="#iclog_format">iclog format</a>
+<li><a href="#intent_log">intent log</a>
+<ul>
+<li><a href="#deferred_operation">deferred operations</a>
+</ul>
 </ul>
 <a href="#reflink">reflink</a><br/>
-<a href="#deferred_operation">deferred operations</a>
+
 </font>
 </p>
 
@@ -289,7 +300,7 @@ lip  : xfs_log_item
 cil  : xfs_cil
 bp   : xfs_buf
 </pre>
-<h4><a name="log_format">format</a></h4>
+<h4><a name="log_formating">log formating</a></h4>
 <p>
 <font size="2">
 Why do we need the log format ?
@@ -386,13 +397,6 @@ xfs_trans_commit
         if (lip->li_lv && shadow->lv_size <= lip->li_lv->lv_size) {
             ...
         } else {
-            <font color="blue">
-                if lip->li_lv is NULL, use the shadow one.
-                actually, <U>before commit this lv, the lip->li_lv will be taken</U>
-                <U>down and cleared to NULL by xlog_cil_push under</U>
-                <U>cil->xc_ctx_lock.</U>
-            </font>
-            /**/
             /* switch to shadow buffer! */
             lv = shadow;
             lv->lv_item = lip;
@@ -403,13 +407,15 @@ xfs_trans_commit
     }
           ---
 </pre>
-When need to push these lvs to log, we will take the lvs aways from the log items.
+
+Regarding to the lip->li_lv, we have 3 cases as following:
+<ul>
+<li> lip->li_lv is NULL, initial sate
+<li> lip->li_lv is NULL, the lv is taken away by xlog_cil_push
 <pre>
 xlog_cil_push
   ---
-  ...
-    down_write(&cil->xc_ctx_lock);
-  ...
+    <font color="red">down_write(&cil->xc_ctx_lock);</font>
     while (!list_empty(&cil->xc_cil)) {
         struct xfs_log_item    *item;
 
@@ -425,8 +431,9 @@ xlog_cil_push
         num_iovecs += lv->lv_niovecs;
     }
   ---
-
 </pre>
+<li> lip->li_lv is not NULL, there has been log in it, <U>overwrite it</U>
+</ul>
 </font>
 </p>
 
@@ -591,6 +598,8 @@ There are two points here:
 </p>
 
 <h4><a name="log_in_core">in core log</a></h4>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<h4><a name="iclog">iclog</a></h4>
 <p>
 <font size="2">
 
@@ -658,7 +667,7 @@ xlog_state_get_iclog_space
 ---
    atomic_inc(&iclog->ic_refcnt);   /* prevents sync */
    log_offset = iclog->ic_offset;
-<font color="blue“>
+<font color="blue">
     // ic_offset is the current number of bytes written to in this iclog.
     // if ic_offset is zero, that says this is the first writting on this iclog.
 </font>
@@ -814,10 +823,311 @@ xlog_state_do_callback
 </font>
 </p>
 
+<h4><a name="iclog_ring_and_physical_log_space">iclog ring and physical log space</a></h4>
+<p>
+<font size="2">
+iclog ring:
+<ul>
+<li> l_iclog_bufs
+<pre>
+xlog_get_iclog_buffer_size
+---
+    if (mp->m_logbufs <= 0)
+        log->l_iclog_bufs = XLOG_MAX_ICLOGS;
+    else
+        log->l_iclog_bufs = mp->m_logbufs;
+---
+
+#define XLOG_MAX_ICLOGS        8
+</pre>
+<li> l_iclog_size
+<pre>
+xlog_get_iclog_buffer_size
+---
+    if (mp->m_logbsize > 0) {
+        size = log->l_iclog_size = mp->m_logbsize;
+        log->l_iclog_size_log = 0;
+        ...
+    }
+    /* All machines use 32kB buffers by default. */
+    log->l_iclog_size = XLOG_BIG_RECORD_BSIZE;
+---
+</pre>
+</ul>
+
+The biggest total iclog size is 8 * 256K == 2M<br/>
+
+But this is not the real physical log space.<br/>
+
+The real physical log space is:
+<ul>
+<li> l_logBBstart
+<li> l_logBBsize
+<pre>
+Both of them are from:
+xfs_mountfs
+---
+    error = xfs_log_mount(mp, mp->m_logdev_targp,
+                  XFS_FSB_TO_DADDR(mp, sbp->sb_logstart),
+                  XFS_FSB_TO_BB(mp, sbp->sb_logblocks));
+---
+</pre>
+</ul>
+
+The max and min size of the log space is
+<pre>
+   XFS_MAX_LOG_BLOCKS blocks  (1024 * 1024)
+or XFS_MAX_LOG_BYTES          (2 * 1024 * 1024 * 1024)
+
+   XFS_MIN_LOG_BLOCKS blocks  (512)
+   XFS_MIN_LOG_BYTES          (10 * 1024 * 1024)
+</pre>
+
+
+iclog ring:
+<pre>
+                            <--.
+                           ---  \
+                       O /     \
+         log->l_iclog-> |       |
+                         \ N   /
+                      \    ---
+               rotate  '-->
+
+rotate: it is done by xlog_state_switch_iclogs
+O     : older
+N     : newer
+
+</pre>
+Where to allocate the iclog space ?
+<pre>
+xlog_write
+  -> xlog_state_get_iclog_space
+    -> get an XLOG_STATE_ACTIVE iclog and reserve space in it.
+    ---
+        //under log->l_icloglock
+        iclog->ic_offset += len;
+    ---
+    if the log->l_iclog is not ACTIVE, wait for it.
+      -> xlog_wait on log->l_flush_wait
+
+Where to free the iclog space ?
+
+xlog_iodone
+  -> xlog_state_done_syncing
+    -> xlog_state_do_callback
+      -> xlog_state_clean_log
+    -> wake_up_all(&log->l_flush_wait);
+
+</pre>
+
+In conclusion, at one moment, there only be <U>2M log IO in-flight</U> at most.
+
+<pre>
+      .-->
+     /   ---                     
+       /     \                   
+      | iclog |                  
+       \     /                   
+         ---  /                  
+          <--'                   
+|------------------------------------------------|
+           physical log space
+
+The iclog ring will roll forward in xlog_state_switch_iclogs.
+</pre>
+
+<pre>
+XFS transaction subsystem is that most transactions are asynchronous. That is,
+they don't commit to disk until either a log buffer is filled (a log buffer can
+hold multiple transactions) or a synchronous operation forces the log buffers
+holding the transactions to disk. This means that XFS is doing aggregation of
+transactions in memory - batching them, if you like - to minimise the impact
+of the log IO on transaction throughput.
+
+The limitation on asynchronous transaction throughput is the number and size of
+log buffers made available by the log manager. By default there are 8 log
+buffers available and the size of each is 32kB - the size can be increased up
+to 256kB by use of a mount option.
+
+Effectively, <U>this gives us the maximum bound of outstanding metadata changes
+that can be made to the filesystem at any point in time - if all the log
+buffers are full and under IO, then no more transactions can be committed until
+the current batch completes.</U> It is now common for a single current CPU core to
+be to able to issue enough transactions to keep the log buffers full and under
+IO permanently. Hence the XFS journalling subsystem can be considered to be IO
+bound.
+</pre>
+
+
+[Life Cycle of a iclog]
+
+<pre>
+XLOG_STATE_WANT_SYNC
+  xlog_state_switch_iclogs
+  ---
+    iclog->ic_state = XLOG_STATE_WANT_SYNC;
+    ...
+    /* roll log?: ic_offset changed later */
+    log->l_curr_block += BTOBB(eventual_size)+BTOBB(log->l_iclog_hsize);
+    ...
+    if (log->l_curr_block >= log->l_logBBsize) {
+        log->l_curr_block -= log->l_logBBsize;
+        smp_wmb();
+        log->l_curr_cycle++;
+    }
+    log->l_iclog = iclog->ic_next;
+  ---
+
+XLOG_STATE_SYNCING
+  xlog_state_release_iclog
+    -> if XLOG_STATE_WANT_SYNC
+       set SYNCING
+    -> xlog_sync
+
+
+XLOG_STATE_DONE_SYNC
+  xlog_state_done_syncing
+
+
+XLOG_STATE_DO_CALLBACK
+  xlog_state_do_callback
+
+XLOG_STATE_CALLBACK
+  xlog_state_do_callback
+  //has been the lowest lsn and ready to do callback.
+
+XLOG_STATE_DIRTY
+  xlog_state_do_callback
+  //after complete the callbacks
+
+XLOG_STATE_ACTIVE
+  xlog_state_do_callback
+    -> xlog_state_clean_log
+</pre>
+
+
+<h4><a name="iclog_format">iclog format</a></h4>
+
+Every iclog has its header.
+<pre>
+
+[1][2]    [3]  
+|--Header--|----Payload---|
+
+[1] iclog->ic_data = bp->b_addr
+[2] ic_data is xlog_in_core_2_t
+  typedef union xlog_in_core2 {
+         xlog_rec_header_t    hic_header;
+      xlog_rec_ext_header_t    hic_xheader;
+      char            hic_sector[XLOG_HEADER_SIZE];
+  } xlog_in_core_2_t;
+  #define ic_header    ic_data->hic_header
+[3] iclog->ic_datap = (char *)iclog->ic_data + log->l_iclog_hsize;
+
+(xlog_alloc_log)
+
+<U>The first u32 of each log sector must contain the cycle number.</U>
+Since log item buffers are formatted without regard to this requirement,
+the original contents of the first four bytes of each sector in the log
+are copied into the corresponding element of this array. After that, the
+first four bytes of those sectors are stamped with the cycle number. This
+process is reversed at recovery time. If there are more sectors in this
+log record than there are slots in this array, the cycle data continues
+for as many sectors are needed; each sector is formatted as type xlog_rec_ext_header.
+
+xlog_sync
+  -> xlog_pack_data
+  ---
+    cycle_lsn = CYCLE_LSN_DISK(iclog->ic_header.h_lsn);
+
+    dp = iclog->ic_datap;
+    for (i = 0; i < BTOBB(size); i++) {
+        if (i >= (XLOG_HEADER_CYCLE_SIZE / BBSIZE))
+            break;
+        iclog->ic_header.h_cycle_data[i] = *(__be32 *)dp;
+        *(__be32 *)dp = cycle_lsn;
+        dp += BBSIZE;
+    }
+  ---
+
+<U>The cycle is started from 1</U> (xlog_alloc_log log->l_curr_cycle = 1)
+</pre>
+
+<pre>
+
+       tail      head
+       (c 200)   (c 200)
+        |         |
+        v         v
+   |-----------------------------|
+        \____ ____/
+             v
+     non-checkpointed log
+
+non-checkpointed: the metadata associated with the log has not been flushed to
+                  disk
+<B>We should try to do recovery from the tail.</B>
+This tail is recored in iclog header, xlog_rec_header_t.h_tail_lsn.
+
+xlog_state_release_iclog
+---
+    if (iclog->ic_state == XLOG_STATE_WANT_SYNC) {
+        /* update tail before writing to iclog */
+        xfs_lsn_t tail_lsn = <font color="red">xlog_assign_tail_lsn(log->l_mp)</font>;
+        sync++;
+        iclog->ic_state = XLOG_STATE_SYNCING;
+        iclog->ic_header.h_tail_lsn = cpu_to_be64(tail_lsn);
+        xlog_verify_tail_lsn(log, iclog, tail_lsn);
+        /* cycle incremented when incrementing curr_block */
+    }
+---
+
+This is a perfect position to update the tail lsn of the log.
+<U>It could ensure the tail of the log is updated when we overwrite the
+checkpointed aera of the log.</U>(the h_tail_lsn is on the iclog which will be flushed
+to log.)
+
+
+Unlike the jbd2, which has a superblock for journal, xfs record the tail of the
+log in every LR. It could reduce some extra IO out of LR.
+But the trouble is how to find out the tail when do recovery ?
+
+Even if we could search the log to find out xlog_rec_header_t's magic
+0xFEEDbabe, there could be multiple xlog_rec_header_t structures to be found and
+they may has different tail lsn. And what we need is the last one.
+How to find out it ?
+
+Consider we have a cycle number recored at head of every sector.
+
+                 End
+                  |
+                  v
+|200|200|200|200|200|199|199|199|199|
+
+                                 End
+                                  |
+                                  v
+|200|200|200|200|200|200|200|200|200|
+
+
+What we do is to search backward from the End to find out the xlog_rec_header_t's
+magic.
+
+xlog_find_tail
+  -> xlog_find_head
+  -> xlog_rseek_logrec_hdr
+
+</pre>
+
+
+
+
 <h4><a name="flush_to_disk">flush to disk</a></h4>
 <p>
 <font size="2">
-After commit record IO is completed,
+After commit record IO is completed, the log item associated with the lvs in the
+ctx will be added to AIL, at the same time, the log items are unpind.
 <pre>
 xlog_cil_committed (completion callback of commit record)
   -> xfs_trans_committed_bulk //ctx->lv_chain (xlog_cil_push put the lvs on it)
@@ -1036,10 +1346,10 @@ xlog_cil_committed
         // space is moved forward, try to wake up the waiters.
 </font>
         if (mlip_changed) {
-			...
+            ...
             xfs_log_space_wake(ailp->ail_mount);
         }
-	---
+    ---
 </pre>
 
 Question:
@@ -1068,7 +1378,10 @@ push them continously.
 </p>
 
 
-<h4><a name="Left_log_space">Left log space</a></h4>
+<h4><a name="log_space">log space</a></h4>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h5><a name="left_log_space">left log space</a></h5>
 <p>
 <font size="2">
 <pre>
@@ -1176,62 +1489,404 @@ xlog_grant_add_space.
 </font>
 </p>
 
-<h4><a name="log_space_reserve">log space reserve</a></h4>
+<h5><a name="log_space_accounting">log space accounting</a></h5>
 <p>
 <font size="2">
-Reserve log space:
+
+<br/>
+Log format
 <pre>
-xfs_trans_alloc
-  -> xfs_trans_reserve
-    -> xfs_log_reserve
+Log space:
+
+<lr-hdr><          reg         > <lr-hdr><          reg         > <lr-hdr><          reg         >
+
+Log format of a transaction[0]:
+
+      < start-oph >< oph >< trans-hdr >< oph >< reg1 >< oph >...< commit-oph >
+      [1]                                                         [2]
+
+[0]
+   The transaction here is not the one in xfs_trans_commit, it is the ctx in xlog_cil_push.
+   It could include the lvs of a couple of xfs_trans
+
+   xfs_trans->t_items - li - li - li
+                         \    \    \
+                          lv   lv   lv
+
+   ctx->lv_chain - lv -lv -lv
+
+[1]
+   xlog_cil_push
+     -> xlog_write
+       -> xlog_write_start_rec
+          clear XLOG_TIC_INITED of ctx->ticket
+
+[2]
+   xlog_cil_push
+     -> xfs_log_done //ctx->ticket->t_flags & XLOG_TIC_INITED == 0
+       -> xlog_commit_record
+
+
+</pre>
+Actual log space accounting.
+<ul>
+<li> actual log
+<pre>
+diff_len and diff_iovecs from xlog_cil_insert_format_items
+<U>diff_len returns the actual log space consumed by the lvs in the transaction</U><br/>
+A log item's (lip->li_lv) could have 4 cases:
+
+  [a] initial state
+  [b] lv has been taken away by xlog_cil_push
+  [c] lv is there, and its size is enough to carry the new logs
+  [d] lv is there, and its size is not enough to carry the new logs
+
+For the case a and b,
+
+    diff_len = lv->lv_bytes
+
+For the case c and d
+
+    diff_len = lv->lv_bytes - old_lv->lv_bytes
+
+    The original log is overwritten, so we could occupy the previous reserved
+    log space.
+</pre>
+<li> xlog_op_header_t
+<pre>
+diff_iovecs from the xlog_cil_insert_format_items is used to account the size of
+xlog_op_header_t (one xlog_op_header_t per iovec)
+---
+    xlog_cil_insert_format_items(log, tp, &len, &diff_iovecs);
+
+    spin_lock(&cil->xc_cil_lock);
+
+    /* account for space used by new iovec headers  */
+    iovhdr_res = diff_iovecs * sizeof(xlog_op_header_t);
+    len += iovhdr_res;
+---
+</pre>
+<li> log record headers
+<pre>
+---
+    /* do we need space for more log record headers? */
+
+    iclog_space = log->l_iclog_size - log->l_iclog_hsize;
+    if (len > 0 && <font color="red">(ctx->space_used / iclog_space !=
+                (ctx->space_used + len) / iclog_space)) </font>{
+        split_res = (len + iclog_space - 1) / iclog_space;
 <font color="blue">
-    //Push on the buffer cache code if we ever use more than 75% of the on-disk log space.
+        /* need to take into account split region headers, too */
+        XLOG_CONTINUE_TRANS ?
 </font>
-      -> xlog_grant_push_ail
-        -> xfs_ail_push
-      -> xlog_grant_head_check //<font color="blue">log->l_reserve_head</font>
-        -> xlog_grant_head_wait //<font color="blue">if no enough space, go to wait.</font>
-      -> xlog_grant_add_space //<font color="blue">Both l_write_head and l_reserve_head</font>
-
-</pre>
-
-When the entry has the minimum lsn is removed from the AIL list, it is a time
-point to wake up the log space waiters.
-<pre>
-xfs_log_space_wake
----
-    if (!list_empty_careful(&log->l_write_head.waiters)) {
-        spin_lock(&log->l_write_head.lock);
-        free_bytes = xlog_space_left(log, &log->l_write_head.grant);
-        xlog_grant_head_wake(log, &log->l_write_head, &free_bytes);
-        spin_unlock(&log->l_write_head.lock);
-    }
-
-    if (!list_empty_careful(&log->l_reserve_head.waiters)) {
-        spin_lock(&log->l_reserve_head.lock);
-        free_bytes = xlog_space_left(log, &log->l_reserve_head.grant);
-        xlog_grant_head_wake(log, &log->l_reserve_head, &free_bytes);
-        spin_unlock(&log->l_reserve_head.lock);
+        split_res *= log->l_iclog_hsize + sizeof(struct xlog_op_header);
+        ctx->ticket->t_unit_res += split_res;
+        ctx->ticket->t_curr_res += split_res;
+        tp->t_ticket->t_curr_res -= split_res;
+        ASSERT(tp->t_ticket->t_curr_res >= len);
     }
 ---
+
+<U>A ctx contains a couple of lvs, these lvs will be written to log one time
+and all of lvs in a same ctx will have a same log commit record.</U>
+
+So we could see, ctx->space_used is used here to calculate whether additional
+log record header is needed.
 </pre>
-Question:<br/>
+<li> Common part of the log
 <pre>
-In fact, we have two log space management points. One is what we are saying
-here. Another one is xlog_state_get_iclog_space. What's the difference ?
+The actual accounting is done in xlog_cil_push.
+ctx->ticket will be used to account this.
 
-xlog_state_get_iclog_space is the allocation interface for the in-core log space
-ring. The log space will be freed when the log commit record is completed.
+It is allocated at:
+  xlog_cil_ticket_alloc
+    -> xlog_ticket_alloc // unit_bytes is zero, xfs_log_calc_unit_res will return the log space needed for common part
+      -> xfs_log_calc_unit_res
+    -> tic->t_curr_res = 0
 
-The log reservation will be released only when an entry is removed from AIL,
-indicating the metadata modification is not only logged, but also flushed to disk.
-
-One of the most important principle is: a log could be overwritten only when its
-associated modification has been on disk. This is why we move forward the log
-space only when an entry is moved from the AIL.
+It will first steal the reservation from the first xfs_trans inserted into this
+ctx.
+xlog_cil_insert_items
+---
+    if (ctx->ticket->t_curr_res == 0) {
+        ctx_res = ctx->ticket->t_unit_res;
+        ctx->ticket->t_curr_res = ctx_res;
+        tp->t_ticket->t_curr_res -= ctx_res;
+    }
+---
+Then account the actual log space in xlog_cil_push.
+The left part will be release in xfs_log_done in
 </pre>
+</ul>
 </font>
 </p>
+
+<h5><a name="log_space_reserve">log space reserve</a></h5>
+<p>
+<font size="2">
+
+The log reservation steps:
+<ul>
+[1] reserve the maximum log space needed
+<pre>
+xfs_trans_reserve
+  -> xfs_log_reserve
+    -> xlog_ticket_alloc
+      -> xfs_log_calc_unit_res // calculate the maximum log space needed
+  -> xlog_grant_head_check
+    -> xlog_ticket_reservation
+      -> return tic->t_unit_res * tic->t_cnt
+  -> xlog_grant_add_space l_reserve_head
+  -> xlog_grant_add_space l_write_head
+</pre>
+[2] account the actual log space used<br/>
+[3] release the redundant log space with xfs_log_done.
+<pre>
+There are two paths to do this:
+  [a] When roll trans
+      xlog_regrant_reserve_log_space
+      ---
+        if (ticket->t_cnt > 0)
+            ticket->t_cnt--;
+
+        xlog_grant_sub_space(log, &log->l_reserve_head.grant,
+                        ticket->t_curr_res);
+        xlog_grant_sub_space(log, &log->l_write_head.grant,
+                        ticket->t_curr_res);
+        ticket->t_curr_res = ticket->t_unit_res;
+      ---
+<font color="red">
+        Just release tic->t_curr_res
+</font>
+  [b] When commit trans
+      xlog_ungrant_log_space
+      ---
+        if (ticket->t_cnt > 0)
+            ticket->t_cnt--;
+    
+        bytes = ticket->t_curr_res;
+        if (ticket->t_cnt > 0) {
+            ASSERT(ticket->t_flags & XLOG_TIC_PERM_RESERV);
+<font color="red">            bytes += ticket->t_unit_res*ticket->t_cnt; </font>
+        }
+
+        xlog_grant_sub_space(log, &log->l_reserve_head.grant, bytes);
+        xlog_grant_sub_space(log, &log->l_write_head.grant, bytes);
+      ---
+<font color="red">
+        Not only release tic->t_curr_res, but also the left permanent
+        reservation tic->t_unit_res * tic->t_cnt
+</font>
+</pre>    
+</ul>
+        
+Let's look at some examples:
+<pre>
+            bash-1440  [005] ....   101.856925: xlog_ticket_alloc: input 254080 calc 267016 cnt 2
+            bash-1440  [005] ....   101.857868: xlog_ungrant_log_space: curr 256644 unit 267016 cnt 1
+            bash-1440  [005] ....   101.858341: xlog_ticket_alloc: input 326016 calc 340524 cnt 8
+            bash-1440  [005] ....   101.858373: xlog_regrant_reserve_log_space: curr 340524 unit 340524 cnt 7
+            bash-1440  [005] ....   101.858381: xlog_ungrant_log_space: curr 340524 unit 340524 cnt 6
+     kworker/4:1-186   [004] ....   105.789587: xlog_ticket_alloc: input 0 calc 9268 cnt 1
+     kworker/4:1-186   [004] ...1   105.789720: xlog_verify_iclog_lsn.isra.20: iclog b 120 c 1 tail b 120 c 1
+     kworker/4:1-186   [004] ....   105.789730: xlog_ungrant_log_space: curr 8704 unit 9268 cnt 0
+              cp-1546  [003] ....   110.256017: xlog_ticket_alloc: input 254080 calc 267016 cnt 2
+              cp-1546  [003] ....   110.256160: xlog_ungrant_log_space: curr 256624 unit 267016 cnt 1
+              cp-1546  [003] ....   110.256640: xlog_ticket_alloc: input 178936 calc 190824 cnt 8
+              cp-1546  [003] ....   110.257872: xlog_ungrant_log_space: curr 190012 unit 190824 cnt 7
+              cp-1546  [003] ....   110.258000: xlog_ticket_alloc: input 760 calc 10028 cnt 0
+     kworker/6:1-68    [006] ....   110.258781: xlog_ungrant_log_space: curr 10028 unit 10028 cnt 0
+              cp-1546  [003] ....   110.259266: xlog_ticket_alloc: input 5752 calc 15020 cnt 0
+              cp-1546  [003] ....   110.259303: xlog_ungrant_log_space: curr 15020 unit 15020 cnt 0
+              cp-1546  [003] ....   110.259326: xlog_ticket_alloc: input 178936 calc 190824 cnt 8
+              cp-1546  [003] ....   110.259358: xlog_regrant_reserve_log_space: curr 190720 unit 190824 cnt 7
+              cp-1546  [003] ....   110.259402: xlog_regrant_reserve_log_space: curr 190620 unit 190824 cnt 6
+              cp-1546  [003] ....   110.259429: xlog_regrant_reserve_log_space: curr 190768 unit 190824 cnt 5
+              cp-1546  [003] ....   110.259433: xlog_ungrant_log_space: curr 190824 unit 190824 cnt 4
+              cp-1546  [003] ....   110.259441: xlog_ticket_alloc: input 5752 calc 15020 cnt 0
+              cp-1546  [003] ....   110.259448: xlog_ungrant_log_space: curr 15020 unit 15020 cnt 0
+              cp-1546  [003] ....   110.259448: xlog_ungrant_log_space: curr 15020 unit 15020 cnt 0
+     kworker/4:1-186   [004] ....   136.508683: xlog_ticket_alloc: input 0 calc 9268 cnt 1
+     kworker/4:1-186   [004] ...1   136.508693: xlog_verify_iclog_lsn.isra.20: iclog b 128 c 1 tail b 120 c 1
+     kworker/4:1-186   [004] ....   136.508702: xlog_ungrant_log_space: curr 8704 unit 9268 cnt 0
+<font color="red">
+     kworker/4:2-370   [004] ....   197.948672: xlog_ticket_alloc: input 4224 calc 13492 cnt 1
+     kworker/4:2-370   [004] ....   197.948727: xlog_ungrant_log_space: curr 3792 unit 13492 cnt 0
+</font>
+</pre>
+Most of time, the reserved log space will be surplus.
+
+</font>
+</p>
+
+<h4><a name="intent_log">intent log</a></h4>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+Log Items
+<pre>
+    Transaction Headers
+    Intent to Free an Extent                (EFI) \
+    Completion of Intent to Free an Extent  (EFD)  |
+    Reverse Mapping Updates Intent          (RUI)  |
+    Completion of Reverse Mapping Updates   (RUD)  |
+    Reference Count Updates Intent          (CUI)   > <font color="red">Itent Log</font>
+    Completion of Reference Count Updates   (CUD)  |
+    File Block Mapping Intent               (BUI)  |
+    Completion of File Block Mapping Updates(BUD) /
+    Inode Updates
+    Inode Data Log Item
+    Buffer Log Item
+    Buffer Data Log Item
+    Update Quota File
+    Quota Update Data Log Item
+    Disable Quota Log Item
+    Inode Creation Log Item
+
++--------------+
+|xfs defer ops |
++--------------+--------+
+|       xfs log         |
++-----------------------+----------------+
+|                xfs buf                 |
+-----------------------------------------+
+               submit_bio
+</pre>
+</font>
+<p>
+
+
+<h5><a name="deferred_operation">deferred operations</a></h5>
+<p>
+<font size="2">
+<B>What is the deferred operation mechanism for ?</B>
+<pre>
+<U>The deferred operations in XFS is a kind of "intent logging mechanism".</U>
+intent logging means the logs record operation intent.
+If a failure occurs, then when the system is recovering, it can use the intent log to
+detect what operations were still in process during the failure, and use the intent log
+to help recover from the failure, usually by either undoing a partially completed operation,
+or by redoing one that might need to be completed
+</pre>
+
+<pre>
+                     XFS_DEFER_OPS_TYPE_REFCOUNT
+                     |       XFS_DEFER_OPS_TYPE_RMAP,
+                     |       |
+xfs_trans->t_dfops - dfp0 - dfp1
+                     |
+                     |
+                     dfp_work - ri0 - ri1 - ri2
+                                type = XFS_REFCOUNT_INCREASE
+                                startblock
+                                blockcount
+dfp  xfs_defer_pending
+ri   xfs_refcount_intent
+</pre>
+
+<B>defer operations callbacks</B>
+<pre>
+All of the defer operation callbacks are stores in defer_op_types[]
+</pre>
+<pre>
+Take refcount deferred_operation as example.
+</pre>
+<ul>
+[1] create_intent
+<pre>
+xfs_refcount_update_create_intent
+  -> xfs_cui_log_item
+    -> xfs_log_item_init //<font color="blue">XFS_LI_CUI xfs_cui_item_ops</font>
+  -> xfs_trans_add_item
+</pre>
+[2] diff_items
+[3] log_item
+<pre>
+xfs_refcount_update_log_item
+---
+<font color="blue">
+    //Fill up the xfs_phys_extent which will be written to intent log.
+</font>
+    ext = &cuip->cui_format.cui_extents[next_extent];
+    ext->pe_startblock = refc->ri_startblock;
+    ext->pe_len = refc->ri_blockcount;
+    xfs_trans_set_refcount_flags(ext, refc->ri_type);
+---
+</pre>
+[4] create_done
+<pre>
+xfs_refcount_update_create_done
+  -> xfs_trans_get_cud
+    -> xfs_cud_init
+      -> xfs_log_item_init//<font color="blue">XFS_LI_CUD xfs_cud_item_ops</font>
+  -> xfs_trans_add_item
+</pre>
+[5] finish_item
+<pre>
+xfs_refcount_update_finish_item
+  -> xfs_trans_log_finish_refcount_update
+    -> xfs_refcount_finish_one
+<font color="blue">
+    // Looks like do the real work here.
+</font>
+</pre>
+[6] cleanup_fn
+</ul>
+
+</pre>
+<B>Code path</B>
+<pre>
+
+xfs_refcount_increase_extent
+  -> __xfs_refcount_add
+    -> xfs_defer_add
+
+xfs_defer_finish
+  -> xfs_defer_finish_noroll
+    -> xfs_defer_create_intents
+<font color="blue">
+        //Create intent log for the items linked in this transaction.
+</font>
+       ---
+        list_for_each_entry(dfp, &tp->t_dfops, dfp_list) {
+            dfp->dfp_intent = dfp->dfp_type-><font color="red">create_intent(tp,
+                    dfp->dfp_count) <B>[1]</B></font>;
+            list_sort(tp->t_mountp, &dfp->dfp_work,
+                    dfp-><font color="red">dfp_type->diff_items <B>[2]</B></font>);
+            list_for_each(li, &dfp->dfp_work)
+                dfp-><font color="red">dfp_type->log_item(tp, dfp->dfp_intent, li) <B>[3]</B></font>;
+        }
+       ---
+    -> xfs_defer_trans_roll <font color="blue"><U>//commit the logs to cil</U></font>
+    ->
+    ---
+<font color="blue">
+        <U>//Create an intent-done log</U>
+</font>
+        dfp->dfp_done = dfp-><font color="red">dfp_type->create_done <B>[4]</B></font>(*tp, dfp->dfp_intent,
+                dfp->dfp_count);
+        cleanup_fn = dfp->dfp_type->finish_cleanup;
+
+        /* Finish the work items. */
+        state = NULL;
+        list_for_each_safe(li, n, &dfp->dfp_work) {
+            list_del(li);
+            dfp->dfp_count--;
+            error = dfp-><font color="red">dfp_type->finish_item <B>[5]</B></font>(*tp, li,
+                    dfp->dfp_done, &state);
+            ...
+            }
+        if (cleanup_fn)
+            <font color="red">cleanup_fn <B>[6]</B></font>(*tp, state, error);
+    ---
+</pre>
+
+
+
+</font>
+</p>
+  
+
 
 
 <h4><a name="relog">relog</a></h4>
@@ -1279,281 +1934,6 @@ be release finally.
 </font>
 </p>
 
-
-
-<h4><a name="iclog_ring_and_physical_log_space">iclog ring and physical log space</a></h4>
-<p>
-<font size="2">
-iclog ring:
-<ul>
-<li> l_iclog_bufs
-<pre>
-xlog_get_iclog_buffer_size
----
-	if (mp->m_logbufs <= 0)
-		log->l_iclog_bufs = XLOG_MAX_ICLOGS;
-	else
-		log->l_iclog_bufs = mp->m_logbufs;
----
-
-#define XLOG_MAX_ICLOGS		8
-</pre>
-<li> l_iclog_size
-<pre>
-xlog_get_iclog_buffer_size
----
-	if (mp->m_logbsize > 0) {
-		size = log->l_iclog_size = mp->m_logbsize;
-		log->l_iclog_size_log = 0;
-		...
-	}
-	/* All machines use 32kB buffers by default. */
-	log->l_iclog_size = XLOG_BIG_RECORD_BSIZE;
----
-</pre>
-</ul>
-
-The biggest total iclog size is 8 * 256K == 2M<br/>
-
-But this is not the real physical log space.<br/>
-
-The real physical log space is:
-<ul>
-<li> l_logBBstart
-<li> l_logBBsize
-<pre>
-Both of them are from:
-xfs_mountfs
----
-	error = xfs_log_mount(mp, mp->m_logdev_targp,
-			      XFS_FSB_TO_DADDR(mp, sbp->sb_logstart),
-			      XFS_FSB_TO_BB(mp, sbp->sb_logblocks));
----
-</pre>
-</ul>
-
-The max and min size of the log space is
-<pre>
-   XFS_MAX_LOG_BLOCKS blocks  (1024 * 1024)
-or XFS_MAX_LOG_BYTES          (2 * 1024 * 1024 * 1024)
-
-   XFS_MIN_LOG_BLOCKS blocks  (512)
-   XFS_MIN_LOG_BYTES          (10 * 1024 * 1024)
-</pre>
-
-
-iclog ring:
-<pre>
-                            <--.
-                           ---  \
-                       O /     \
-         log->l_iclog-> |       |
-                         \ N   /
-                      \    ---
-               rotate  '-->
-
-rotate: it is done by xlog_state_switch_iclogs
-O     : older
-N     : newer
-
-</pre>
-Where to allocate the iclog space ?
-<pre>
-xlog_write
-  -> xlog_state_get_iclog_space
-    -> get an XLOG_STATE_ACTIVE iclog and reserve space in it.
-	---
-		//under log->l_icloglock
-		iclog->ic_offset += len;
-	---
-	if the log->l_iclog is not ACTIVE, wait for it.
-	  -> xlog_wait on log->l_flush_wait
-
-Where to free the iclog space ?
-
-xlog_iodone
-  -> xlog_state_done_syncing
-    -> xlog_state_do_callback
-	  -> xlog_state_clean_log
-	-> wake_up_all(&log->l_flush_wait);
-
-</pre>
-
-In conclusion, at one moment, there only be <U>2M log IO in-flight</U> at most.
-
-<pre>
-      .-->
-     /   ---                     
-       /     \                   
-      | iclog |                  
-       \     /                   
-         ---  /                  
-          <--'                   
-|------------------------------------------------|
-           physical log space
-
-The iclog ring will roll forward in xlog_state_switch_iclogs.
-</pre>
-
-[Life Cycle of a iclog]
-
-<pre>
-XLOG_STATE_WANT_SYNC
-  xlog_state_switch_iclogs
-  ---
-	iclog->ic_state = XLOG_STATE_WANT_SYNC;
-	...
-	/* roll log?: ic_offset changed later */
-	log->l_curr_block += BTOBB(eventual_size)+BTOBB(log->l_iclog_hsize);
-	...
-	if (log->l_curr_block >= log->l_logBBsize) {
-		log->l_curr_block -= log->l_logBBsize;
-		smp_wmb();
-		log->l_curr_cycle++;
-	}
-	log->l_iclog = iclog->ic_next;
-  ---
-
-XLOG_STATE_SYNCING
-  xlog_state_release_iclog
-    -> if XLOG_STATE_WANT_SYNC
-	   set SYNCING
-	-> xlog_sync
-
-
-XLOG_STATE_DONE_SYNC
-  xlog_state_done_syncing
-
-
-XLOG_STATE_DO_CALLBACK
-  xlog_state_do_callback
-
-XLOG_STATE_CALLBACK
-  xlog_state_do_callback
-  //has been the lowest lsn and ready to do callback.
-
-XLOG_STATE_DIRTY
-  xlog_state_do_callback
-  //after complete the callbacks
-
-XLOG_STATE_ACTIVE
-  xlog_state_do_callback
-    -> xlog_state_clean_log
-</pre>
-
-
-<h4><a name="iclog_format">iclog format</a></h4>
-
-Every iclog has its header.
-<pre>
-
-[1][2]    [3]  
-|--Header--|----Payload---|
-
-[1] iclog->ic_data = bp->b_addr
-[2] ic_data is xlog_in_core_2_t
-  typedef union xlog_in_core2 {
-   	  xlog_rec_header_t	hic_header;
-	  xlog_rec_ext_header_t	hic_xheader;
-	  char			hic_sector[XLOG_HEADER_SIZE];
-  } xlog_in_core_2_t;
-  #define ic_header	ic_data->hic_header
-[3] iclog->ic_datap = (char *)iclog->ic_data + log->l_iclog_hsize;
-
-(xlog_alloc_log)
-
-<U>The first u32 of each log sector must contain the cycle number.</U>
-Since log item buffers are formatted without regard to this requirement,
-the original contents of the first four bytes of each sector in the log
-are copied into the corresponding element of this array. After that, the
-first four bytes of those sectors are stamped with the cycle number. This
-process is reversed at recovery time. If there are more sectors in this
-log record than there are slots in this array, the cycle data continues
-for as many sectors are needed; each sector is formatted as type xlog_rec_ext_header.
-
-xlog_sync
-  -> xlog_pack_data
-  ---
-	cycle_lsn = CYCLE_LSN_DISK(iclog->ic_header.h_lsn);
-
-	dp = iclog->ic_datap;
-	for (i = 0; i < BTOBB(size); i++) {
-		if (i >= (XLOG_HEADER_CYCLE_SIZE / BBSIZE))
-			break;
-		iclog->ic_header.h_cycle_data[i] = *(__be32 *)dp;
-		*(__be32 *)dp = cycle_lsn;
-		dp += BBSIZE;
-	}
-  ---
-
-<U>The cycle is started from 1</U> (xlog_alloc_log log->l_curr_cycle = 1)
-</pre>
-
-<pre>
-
-       tail      head
-       (c 200)   (c 200)
-        |         |
-        v         v
-   |-----------------------------|
-        \____ ____/
-             v
-     non-checkpointed log
-
-non-checkpointed: the metadata associated with the log has not been flushed to
-                  disk
-<B>We should try to do recovery from the tail.</B>
-This tail is recored in iclog header, xlog_rec_header_t.h_tail_lsn.
-
-xlog_state_release_iclog
----
-	if (iclog->ic_state == XLOG_STATE_WANT_SYNC) {
-		/* update tail before writing to iclog */
-		xfs_lsn_t tail_lsn = <font color="red">xlog_assign_tail_lsn(log->l_mp)</font>;
-		sync++;
-		iclog->ic_state = XLOG_STATE_SYNCING;
-		iclog->ic_header.h_tail_lsn = cpu_to_be64(tail_lsn);
-		xlog_verify_tail_lsn(log, iclog, tail_lsn);
-		/* cycle incremented when incrementing curr_block */
-	}
----
-
-This is a perfect position to update the tail lsn of the log.
-<U>It could ensure the tail of the log is updated when we overwrite the
-checkpointed aera of the log.</U>(the h_tail_lsn is on the iclog which will be flushed
-to log.)
-
-
-Unlike the jbd2, which has a superblock for journal, xfs record the tail of the
-log in every LR. It could reduce some extra IO out of LR.
-But the trouble is how to find out the tail when do recovery ?
-
-Even if we could search the log to find out xlog_rec_header_t's magic
-0xFEEDbabe, there could be multiple xlog_rec_header_t structures to be found and
-they may has different tail lsn. And what we need is the last one.
-How to find out it ?
-
-Consider we have a cycle number recored at head of every sector.
-
-                 End
-                  |
-                  v
-|200|200|200|200|200|199|199|199|199|
-
-                                 End
-                                  |
-                                  v
-|200|200|200|200|200|200|200|200|200|
-
-
-What we do is to search backward from the End to find out the xlog_rec_header_t's
-magic.
-
-xlog_find_tail
-  -> xlog_find_head
-  -> xlog_rseek_logrec_hdr
-
-</pre>
 
 
 
@@ -1689,163 +2069,6 @@ xfs_do_writepage
 </font>
 </p>
 
-<h3><a name="deferred_operation">deferred operations</a></h3>
-<p>
-<font size="2">
-<B>What is the deferred operation mechanism for ?</B>
-<pre>
-<U>The deferred operations in XFS is a kind of "intent logging mechanism".</U>
-intent logging means the logs record operation intent.
-If a failure occurs, then when the system is recovering, it can use the intent log to
-detect what operations were still in process during the failure, and use the intent log
-to help recover from the failure, usually by either undoing a partially completed operation,
-or by redoing one that might need to be completed
-</pre>
-
-<pre>
-                     XFS_DEFER_OPS_TYPE_REFCOUNT
-                     |       XFS_DEFER_OPS_TYPE_RMAP,
-                     |       |
-xfs_trans->t_dfops - dfp0 - dfp1
-                     |
-                     |
-                     dfp_work - ri0 - ri1 - ri2
-                                type = XFS_REFCOUNT_INCREASE
-                                startblock
-                                blockcount
-dfp  xfs_defer_pending
-ri   xfs_refcount_intent
-</pre>
-
-<B>defer operations callbacks</B>
-<pre>
-All of the defer operation callbacks are stores in defer_op_types[]
-</pre>
-<pre>
-Take refcount deferred_operation as example.
-</pre>
-<ul>
-[1] create_intent
-<pre>
-xfs_refcount_update_create_intent
-  -> xfs_cui_log_item
-    -> xfs_log_item_init //<font color="blue">XFS_LI_CUI xfs_cui_item_ops</font>
-  -> xfs_trans_add_item
-</pre>
-[2] diff_items
-[3] log_item
-<pre>
-xfs_refcount_update_log_item
----
-<font color="blue">
-    //Fill up the xfs_phys_extent which will be written to intent log.
-</font>
-    ext = &cuip->cui_format.cui_extents[next_extent];
-    ext->pe_startblock = refc->ri_startblock;
-    ext->pe_len = refc->ri_blockcount;
-    xfs_trans_set_refcount_flags(ext, refc->ri_type);
----
-</pre>
-[4] create_done
-<pre>
-xfs_refcount_update_create_done
-  -> xfs_trans_get_cud
-    -> xfs_cud_init
-      -> xfs_log_item_init//<font color="blue">XFS_LI_CUD xfs_cud_item_ops</font>
-  -> xfs_trans_add_item
-</pre>
-[5] finish_item
-<pre>
-xfs_refcount_update_finish_item
-  -> xfs_trans_log_finish_refcount_update
-    -> xfs_refcount_finish_one
-<font color="blue">
-    // Looks like do the real work here.
-</font>
-</pre>
-[6] cleanup_fn
-</ul>
-
-</pre>
-<B>Code path</B>
-<pre>
-
-xfs_refcount_increase_extent
-  -> __xfs_refcount_add
-    -> xfs_defer_add
-
-xfs_defer_finish
-  -> xfs_defer_finish_noroll
-    -> xfs_defer_create_intents
-<font color="blue">
-        //Create intent log for the items linked in this transaction.
-</font>
-       ---
-        list_for_each_entry(dfp, &tp->t_dfops, dfp_list) {
-            dfp->dfp_intent = dfp->dfp_type-><font color="red">create_intent(tp,
-                    dfp->dfp_count) <B>[1]</B></font>;
-            list_sort(tp->t_mountp, &dfp->dfp_work,
-                    dfp-><font color="red">dfp_type->diff_items <B>[2]</B></font>);
-            list_for_each(li, &dfp->dfp_work)
-                dfp-><font color="red">dfp_type->log_item(tp, dfp->dfp_intent, li) <B>[3]</B></font>;
-        }
-       ---
-    -> xfs_defer_trans_roll <font color="blue"><U>//commit the logs to cil</U></font>
-    ->
-    ---
-<font color="blue">
-        <U>//Create an intent-done log</U>
-</font>
-        dfp->dfp_done = dfp-><font color="red">dfp_type->create_done <B>[4]</B></font>(*tp, dfp->dfp_intent,
-                dfp->dfp_count);
-        cleanup_fn = dfp->dfp_type->finish_cleanup;
-
-        /* Finish the work items. */
-        state = NULL;
-        list_for_each_safe(li, n, &dfp->dfp_work) {
-            list_del(li);
-            dfp->dfp_count--;
-            error = dfp-><font color="red">dfp_type->finish_item <B>[5]</B></font>(*tp, li,
-                    dfp->dfp_done, &state);
-            ...
-            }
-        if (cleanup_fn)
-            <font color="red">cleanup_fn <B>[6]</B></font>(*tp, state, error);
-    ---
-</pre>
-
-Log Items
-<pre>
-    Transaction Headers
-    Intent to Free an Extent                (EFI) \
-    Completion of Intent to Free an Extent  (EFD)  |
-    Reverse Mapping Updates Intent          (RUI)  |
-    Completion of Reverse Mapping Updates   (RUD)  |
-    Reference Count Updates Intent          (CUI)   > <font color="red">Itent Log</font>
-    Completion of Reference Count Updates   (CUD)  |
-    File Block Mapping Intent               (BUI)  |
-    Completion of File Block Mapping Updates(BUD) /
-    Inode Updates
-    Inode Data Log Item
-    Buffer Log Item
-    Buffer Data Log Item
-    Update Quota File
-    Quota Update Data Log Item
-    Disable Quota Log Item
-    Inode Creation Log Item
-
-+--------------+
-|xfs defer ops |
-+--------------+--------+
-|       xfs log         |
-+-----------------------+----------------+
-|                xfs buf                 |
------------------------------------------+
-               submit_bio
-</pre>
-
-</font>
-</p>
-         
+       
 </body>
 </html>

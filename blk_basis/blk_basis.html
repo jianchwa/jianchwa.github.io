@@ -76,6 +76,10 @@
 <li><a href="#Work_process">Work process</a>
 <li><a href="#RPM_Core">RPM Core</a>
 </ul>
+<li><a href="#blk_and_hardware">blk and hardware</a>
+<ul>
+<li><a href="#dma_alignment">dma alignment</a>
+</ul>
 </font>
 </p>
 
@@ -2307,7 +2311,24 @@ The quiescing mechanism has big advantage on it, so BLK_MQ_S_STOPPED is rarely
 used now.
 <br/>
 <li> <strong>QUEUE_FLAG_DYING</strong><br/>
-First, let's look at blk_set_queue_dying()
+<U>QUEUE_FLAG_DYING indicates no request could enter a request anymore.</U><br/>
+queue dying is different from queue freeze which will block new IO comming in,<br/>
+<U>blk_queue_enter returns -ENODEV for it.</U><br/>
+Look at the check points of QUEUE_FLAG_DYING
+<ul>
+<pre>
+[1] blk_queue_enter   (-ENODEV)
+[2] blk_get_queue
+[3] get_request                               (blk-legacy)
+[4] generic_make_request/direct_make_request
+[5] blk_insert_cloned_request                 (blk-legacy)
+[6] blk_flush_plug_list                       (blk-legacy)
+[7] blk_execute_rq_nowait                     (blk-legacy)
+[8] sysfs interfaces
+</pre>
+</ul>
+QUEUE_FLAG_DYING will not stop requests to be issued.
+<br/>
 <pre>
 void blk_set_queue_dying(struct request_queue *q)
 {
@@ -2315,71 +2336,17 @@ void blk_set_queue_dying(struct request_queue *q)
     queue_flag_set(QUEUE_FLAG_DYING, q);
     spin_unlock_irq(q->queue_lock);
 
-    /*
-     * <font color="red">When queue DYING flag is set, we need to block new req
-     * entering queue, </font>so we call blk_freeze_queue_start() to
-     * prevent I/O from crossing blk_queue_enter().
-     */
-    blk_freeze_queue_start(q);  // just kill the percpu ref and will not wait.
-    <font color="blue">
-    /*
-       blk_queue_enter()
-
-       percpu_ref_tryget_live() will fail when the     percpu ref is killed (__PERCPU_REF_DEAD)
-       >>>>
-       ret = wait_event_interruptible(q->mq_freeze_wq,
-                (atomic_read(&q->mq_freeze_depth) == 0 &&
-                 (preempt || !blk_queue_preempt_only(q))) ||
-                blk_queue_dying(q));
-        if (blk_queue_dying(q))
-            return -ENODEV;
-
-     */
-    </font>
+    blk_freeze_queue_start(q);  <font color="blue">// kill the percpu-ref q_usage_counter, then blk_queue_dying will be
+                                // checked in slow path in blk_queue_enter</font>
 
     if (q->mq_ops)
         blk_mq_wake_waiters(q); //<font color="red">wake the ones waiting on driver tag</font>
-    else {
-        struct request_list *rl;                                                                                      
-                                                             /
-        spin_lock_irq(q->queue_lock);                       |  block legacy
-        blk_queue_for_each_rl(rl, q) {                      |  
-            if (rl->rq_pool) {                              |  get_request()    <------------------ +
-                wake_up_all(&rl->wait[BLK_RW_SYNC]);        |      -> __get_request()               |
-                wake_up_all(&rl->wait[BLK_RW_ASYNC]); ----> |             -> if blk_queue_dying()   |
-            }                                               |               return                  |
-        }                                                   |      -> if blk_queue_dying            |
-        spin_unlock_irq(q->queue_lock);                     |            return                     | wakeup retry
-    }                                                       |      -> waiting on rl->wait[is_sync]  |
-                                                            |              |                        |
-                                                            |              |                        |
-                                                             \             +------------------------+
-
-
+    ...
     /* Make blk_queue_enter() reexamine the DYING flag. */
     wake_up_all(&q->mq_freeze_wq);   //after this, no one could cross blk_queue_enter() in generic_make_request()
 }
 </pre>
-QUEUE_FLAG_DYING mainly gates the blk_queue_enter() and generic_make_request(),
-the difference from blk queue freezing is blk_queue_enter() <font color="red">will fail and return
--ENODEV</font> instead of block there. <br/>
 
-There are some differences between block legacy and blk-mq. <br/>
-<ul>
-<li> there is not any QUEUE_FLAG_DYING checking in blk_mq_get_tag(), it means
-that even if someone waiting tag is waked up by blk_set_queue_dying(), but it
-will do anything for it.
-<li> no checking in blk_execute_rq_nowait() as the block legacy and only a
-comment as follow:
-<pre>
-     don't check dying flag for MQ because the request won't
-     be reused after dying flag is set
-</pre>
-</ul>
-These seems to mean that if someone crosses the blk_queue_enter() in blk_mq, it
-will be able to submit request on a dying queue. Is it right or safe ?
-Maybe yes, at least, in blk_cleanup_queue(), it will wait to drain the queue
-first. <br/>
 
 <br/>
 <li> <strong>QUEUE_FLAG_QUIESCED</strong><br/>
@@ -4807,6 +4774,45 @@ Let's look at RPM_SUSPENDED
 </font>
 </p>
 
+<h2><a name="blk_and_hardware">blk and hardware</a></h2>
+<h3><a name="dma_alignment">dma alignment</a></h3>
+<p>
+<font size="2">
+Some storage controllers have DMA alignment requirement, which is often set
+through blk_queue_dma_alignment, such as 512 bytes.<br/>
+<br/>
+One of the usages of dma_alignment of request_queue.
+<pre>
+blk_rq_map_kern
+---
+    do_copy = !blk_rq_aligned(q, addr, len) || object_is_on_stack(kbuf);
+<font color="blue">
+    //unsigned int alignment = queue_dma_alignment(q) | q->dma_pad_mask;
+    //return !(addr & alignment) && !(len & alignment);
+</font>
+    if (do_copy)
+        bio = bio_copy_kern(q, kbuf, len, gfp_mask, reading);
+<font color="blue">
+    //New page will be allocated and copy data in it.
+    //When bio is done, the data will be copied back to the original buffer.
+    //Refer to bio_copy_kern_endio_read
+</font>
+    else
+        bio = bio_map_kern(q, kbuf, len, gfp_mask);
+<font color="blue">
+    //Add the page associated with the buffer into bio.
+</font>
+---
+
+The caller of this blk_rq_map_kern:
+ - __scsi_execute
+ - __nvme_submit_sync_cmd
+</pre>
+
+Another similar interface is blk_rq_map_user_iov.
+
+</font>
+</p>
 
 </body>
 </html>
