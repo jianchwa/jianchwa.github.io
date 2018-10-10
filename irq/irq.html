@@ -14,6 +14,11 @@
 <ul>
 <li><a href="#IRQ_Domain">IRQ Domain</a>
 <li><a href="#IRQ_Affinity">IRQ Affinity</a>
+<ul>
+<li><a href="#cpu_mask">cpu_mask</a>
+<li><a href="#managed_irq">managed irq</a>
+<li><a href="#irqbalance">irqbalance</a>
+</ul>
 </ul>
 </font>
 </p>
@@ -123,6 +128,7 @@ domain:  INTEL-IR-MSI-1-2
 <h2><a name="IRQ_Affinity">IRQ Affinity</a></h2>
 <hr style="height:5px;border:none;border-top:3px solid black;"/>
 
+<h3><a name="cpu_mask">cpu_mask</a></h3>
 <p>
 <font size="2">
 
@@ -156,10 +162,29 @@ cpu_present_mask is just a copy of cpu_possible_mask.
 (*) Well, cpu_present_mask is dynamic in the hotplug case. If not
 hotplug, it’s a copy of cpu_possible_mask, hence fixed at boot.
 </pre>
+</font>
+</p>
 
-<br/>
-<br/>
-<br/>
+<h3><a name="managed_irq">managed irq</a></h3>
+<p>
+<font size="2">
+The <U>managed</U> here means the kernel is responsible for managing the cpu affinity
+of the irqs.<br/>
+
+If the driver provide some affinity hint when allocate vectors, then the irqs will be
+managed ones.
+<pre>
+irq_remapping_setup_msi_irqs
+  -> do_setup_msix_irqs
+    -> irq_alloc_hwirq_affinity
+	  -> __irq_alloc_hwirqs
+	    -> __irq_alloc_descs
+		  -> alloc_descs
+		  ---
+			flags = affinity ? IRQD_AFFINITY_MANAGED : 0;
+			// If affinity mask is provided, affinity will be managed by kernel.
+		  ---
+</pre>
 
 The path to generate the irq affinity masks.
 <pre>
@@ -338,6 +363,264 @@ taskset -c 3 dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1
 And get following log in dmesg
 [  350.800366] nvme nvme0: I/O 253 QID 5 timeout, completion polled
 </pre>
+
+The userland deamon (irqbalance) cannot set affinity of managed irqs.
+<pre>
+write_irq_affinity
+  -> irq_can_set_affinity_usr
+    -> !irqd_affinity_is_managed //Affinity is auto-managed by the kernel, userland cannot modify it.
+  -> irq_select_affinity_usr
+    -> setup_affinity
+</pre>
+</font>
+</p>
+
+<h3><a name="irqbalance">irqbalance</a></h3>
+<p>
+<font size="2">
+<B>Build the cpu hierarchy</B>
+<pre>
+main
+  -> build_object_tree
+    -> build_numa_node_list // parse /sys/devices/system/node/ 
+    -> parse_cpu_tree
+
+The cpu heirarchy is built as:
+
+ - At the top are numa_nodes
+ - All CPU packages belong to a single numa_node
+ - All Cache domains belong to a CPU package
+ - All CPU cores belong to a cache domain
+
+Objects are built in that order (top down)
+Object workload is the aggregate sum of the workload of the objects below it
+</pre>
+All the components on the hierarchy is topo_obj
+<pre>
+struct topo_obj {
+    uint64_t load;
+    uint64_t last_load;
+    enum obj_type_e obj_type;
+    int number;
+    int powersave_mode;
+    cpumask_t mask;
+    GList *interrupts;           // GList entry of irq_info
+    struct topo_obj *parent;
+    GList *children;
+    GList **obj_type_list;
+};
+
+enum obj_type_e {
+    OBJ_TYPE_CPU,
+    OBJ_TYPE_CACHE,
+    OBJ_TYPE_PACKAGE,
+    OBJ_TYPE_NODE
+};
+
+</pre>
+<B>Collect irq info</B>
+<pre>
+main
+  -> build_object_tree
+    -> rebuild_irq_db
+</pre>
+
+
+<B>Calculate the positions where the irqs should be migrated</B>
+<pre>
+calculate_placement
+---
+    if (g_list_length(rebalance_irq_list) > 0) {
+<font color="blue">
+        // Place irqs in the best node.
+</font>
+        for_each_irq(rebalance_irq_list, place_irq_in_node, NULL);
+        for_each_object(numa_nodes, place_irq_in_object, NULL);
+        for_each_object(packages, place_irq_in_object, NULL);
+        for_each_object(cache_domains, place_irq_in_object, NULL);
+    }
+---
+
+The basic principle to balance irqs is:
+
+    asign = place.least_irqs ? place.least_irqs : place.best;
+
+The least_irqs and best are from find_best_object
+---
+    newload = d->load;
+    if (newload < best->best_cost) {
+        best->best = d;
+        best->best_cost = newload;
+        best->least_irqs = NULL;
+    }
+
+    if (newload == best->best_cost) {
+        if (g_list_length(d->interrupts) < g_list_length(best->best->interrupts))
+            best->least_irqs = d;
+    }
+---
+
+Assign the irq to the cpu with least load, if load is equal, select the cpu with
+least irqs.
+
+Certainly, during this, the affinity_hint also plays a role there.
+
+Look at:
+find_best_object
+---
+    /*
+      * If the hint policy is subset, then we only want 
+      * to consider objects that are within the irqs hint, but
+      * only if that irq in fact has published a hint
+      */
+    if (hint_policy == HINT_POLICY_SUBSET) {
+        if (!cpus_empty(best->info->affinity_hint)) {
+            cpus_and(subset, best->info->affinity_hint, d->mask);
+            if (cpus_empty(subset))
+                return;
+        }
+    }
+
+---
+</pre>
+
+<B>Where is the irq_info->load from ?</B>
+<pre>
+static void assign_load_slice(struct irq_info *info, void *data)
+{
+    uint64_t *load_slice = data;
+    info->load = (info->irq_count - info->last_irq_count) * *load_slice;
+
+    /*
+      * Every IRQ has at least a load of 1
+      */
+    if (!info->load)
+        info->load++;
+}
+</pre>
+
+<B>How to activate the mapping ?</B>
+
+<pre>
+activate_mapping
+---
+<font color="blue">
+    /*
+      * only activate mappings for irqs that have moved
+      */
+</font>
+    if (!info->moved)
+        return;
+
+    if ((hint_policy == HINT_POLICY_EXACT) &&
+        (!cpus_empty(info->affinity_hint))) {
+        if (cpus_intersects(info->affinity_hint, banned_cpus))
+            log(TO_ALL, LOG_WARNING,
+                "irq %d affinity_hint and banned cpus confict\n",
+                info->irq);
+        else {
+            applied_mask = info->affinity_hint;
+            valid_mask = 1;
+        }
+    } else if (info->assigned_obj) {
+<font color="blue">
+        // This assigned_obj here could be a cpu object, and also could be a
+        // cache, package even node obj.[1]
+</font>
+        applied_mask = info->assigned_obj->mask;
+        if ((hint_policy == HINT_POLICY_SUBSET) &&
+            (!cpus_empty(info->affinity_hint))) {
+            cpus_and(applied_mask, applied_mask, info->affinity_hint);
+            if (!cpus_intersects(applied_mask, unbanned_cpus))
+                log(TO_ALL, LOG_WARNING,
+                    "irq %d affinity_hint subset empty\n",
+                   info->irq);
+            else
+                valid_mask = 1;
+        } else {
+            valid_mask = 1;
+        }
+    }
+
+    /*
+      * Don't activate anything for which we have an invalid mask 
+      */
+    if (!valid_mask || check_affinity(info, applied_mask))
+        return;
+
+    if (!info->assigned_obj)
+        return;
+
+    sprintf(buf, "/proc/irq/%i/smp_affinity", info->irq);
+    file = fopen(buf, "w");
+    if (!file)
+        return;
+
+    cpumask_scnprintf(buf, PATH_MAX, applied_mask);
+    fprintf(file, "%s", buf);
+    fclose(file);
+    info->moved = 0; /*migration is done*/
+}
+</pre>
+
+[1] Look at the calculate_placement.
+<pre>
+        for_each_irq(rebalance_irq_list, place_irq_in_node, NULL);
+        for_each_object(numa_nodes, place_irq_in_object, NULL);
+        for_each_object(packages, place_irq_in_object, NULL);
+        for_each_object(cache_domains, place_irq_in_object, NULL
+</pre>
+The balance steps are:
+<ul>
+<pre>
+1. balance all the irqs between different numa nodes.
+2. balance all the irqs in one node between different packages.
+3. balance all the irqs in one package between different cache domains.
+4. balance all the irqs in one cache domain between different cpus.
+</pre>
+</ul>
+
+Look at following example:
+<pre>
+Given a irq has been assigned a package topo_obj, however, the cpu on
+the irq->affinity_hint is offlined, then due to the following code fragment,
+find_best_object
+---
+    if (hint_policy == HINT_POLICY_SUBSET) {
+        if (!cpus_empty(best->info->affinity_hint)) {
+            cpus_and(subset, best->info->affinity_hint, d->mask);
+            if (cpus_empty(subset))
+                return;
+        }
+    }
+---
+this irq will not get further assignment.
+Its final assigned obj is the package topo_obj and its final smp_affinity is the
+mask of the package topo_obj.
+</pre>
+<B>balance level</B>
+Initially, all the irq_infos are in rebalance_irq_list.
+<pre>
+Then they will be queued to different topo_obj based on their balance level.
+
+For example: a irq's balance level is BALANCE_PACKAGE.
+
+Then:
+<ul>
+1. select a best node, move irq from rebalance_irq_list to the node obj->interrupts
+2. select a best package from the best node.
+   find_best_object_for_irq on the best node's obj
+3. find_best_object_for_irq on the best package's obj,
+   due to the irq's balance level is BALANCE_PACKAGE, it will return.
+4. the irq will be preserved on the package's obj->interrupts list.
+5. even if we try to invoke find_best_object_for_irq on underlying obj, this irq
+   will not be involved, because it is not on the interrupts list.
+</ul>
+</pre>
+force_rebalance_irq will move a irq back to rebalance_irq_list, then it will be
+rebalanced from top to down.
+
+
 </font>
 </p
 

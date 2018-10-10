@@ -19,6 +19,7 @@
 <ul>
 <li><a href="#pag_metadata_buffer_lock">lock</a>
 <li><a href="#pag_metadata_buffer_read_in">read in</a>
+<li><a href="#xfs_buf_lock">xfs buf lock</a>
 </ul>
 <a href="#log">log</a>
 <ul>
@@ -46,7 +47,22 @@
 <li><a href="#intent_log">intent log</a>
 <ul>
 <li><a href="#deferred_operation">deferred operations</a>
+<li><a href="#intent_log_recover">intent log recover</a>
 </ul>
+<li><a href="#log_miscs">miscs</a>
+</ul>
+<a href="#AG_free_space_management">AG free space management</a>
+<ul>
+<li><a href="#AG_Free_Space_B+trees">AG Free Space B+trees</a>
+<li><a href="#xfs_alloc_ag_vextent_size">xfs_alloc_ag_vextent_size</a>
+<li><a href="#xfs_alloc_fixup_trees">xfs_alloc_fixup_trees</a>
+<li><a href="#AG_free_list">AG free list</a>
+<li><a href="#Busy_extent">Busy extent</a>
+</ul>
+<a href="#BT">B Tree</a>
+<ul>
+<li><a href="#xfs_btree_ops">xfs_btree_ops</a>
+<li><a href="#xfs_btree_lookup">xfs_btree_lookup</a>
 </ul>
 <a href="#reflink">reflink</a><br/>
 
@@ -246,6 +262,186 @@ next_chunk:
     }
 ---
 </pre>
+</font>
+</p>
+
+<h3><a name="xfs_buf_lock">xfs buf lock</a></h3>
+<p>
+<font size="2">
+Lock and unlock scenarios.
+<ul>
+<li> xfs_buf_delwri_submit_buffers
+<pre>
+LOCK:
+
+xfs_buf_delwri_submit_buffers
+---
+    blk_start_plug(&plug);
+    list_for_each_entry_safe(bp, n, buffer_list, b_list) {
+        if (!wait_list) {
+            if (xfs_buf_ispinned(bp)) {
+                pinned++;
+                continue;
+            }
+            if (!xfs_buf_trylock(bp))
+                continue;
+        } else {
+            xfs_buf_lock(bp);
+        }
+        ...
+        bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_WRITE_FAIL);
+        bp->b_flags |= XBF_WRITE;
+        if (wait_list) {
+            bp->b_flags &= ~XBF_ASYNC;
+            list_move_tail(&bp->b_list, wait_list);
+        } else {
+            bp->b_flags |= XBF_ASYNC;
+            list_del_init(&bp->b_list);
+        }
+        __xfs_buf_submit(bp, false);
+    }
+    blk_finish_plug(&plug);
+---
+
+UNLOCK:
+
+For the XBF_ASYNC case, it will be unlocked by
+xfs_buf_ioend
+---
+    if (bp->b_iodone)
+        (*(bp->b_iodone))(bp);
+    else if (bp->b_flags & XBF_ASYNC)
+        <font color="red">xfs_buf_relse(bp);</font>
+    else
+        complete(&bp->b_iowait);
+---
+For the !XBF_ASYNC case,
+xfs_buf_delwri_submit
+---
+    xfs_buf_delwri_submit_buffers(buffer_list, &wait_list);
+
+    /* Wait for IO to complete. */
+    while (!list_empty(&wait_list)) {
+        bp = list_first_entry(&wait_list, struct xfs_buf, b_list);
+
+        list_del_init(&bp->b_list);
+        ...
+        error2 = xfs_buf_iowait(bp);
+        <font color="red">xfs_buf_relse(bp);</font>
+    }
+
+---
+</pre>
+
+<li> xfs_buf_find
+<pre>
+LOCK:
+
+xfs_buf_find
+---
+    if (!xfs_buf_trylock(bp)) {
+        if (flags & XBF_TRYLOCK) {
+            xfs_buf_rele(bp);
+            XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
+            return -EAGAIN;
+        }
+        xfs_buf_lock(bp);
+    }
+---
+
+xfs_buf_find  xfs_buf_incore
+              xfs_buf_get_map xfs_buf_read_map xfs_buf_readahead_map  [1]
+                                               xfs_buf_read           xlog_recover_buffer_pass2 [2]
+                                                                      xlog_recover_inode_pass2  [3]
+                                                                      xfs_readlink_bmap_ilocked [4]
+
+                                               xfs_trans_read_buf_map[5]
+
+                              xfs_buf_get      xfs_update_secondary_sbs   [6]
+                                               xfs_attr_rmtval_set itself [7]
+                                               xfs_trans_get_buf_map [8]
+UNLOCK:
+
+[1] This is just for readahead.
+xfs_buf_readahead_map
+---
+    if (bdi_read_congested(target->bt_bdev->bd_bdi))
+        return;
+
+    xfs_buf_read_map(target, map, nmaps,
+             XBF_TRYLOCK|XBF_ASYNC|XBF_READ_AHEAD, ops);
+---
+Due to the XBF_ASYNC, it will be unlocked by xfs_buf_ioend
+
+[2] unlocked by xlog_recover_buffer_pass2 itself.
+[2] unlocked by xlog_recover_inode_pass2 itself.
+    For both two case [2] and [3], the bps will be submitted by xfs_buf_delwri_submit.
+    Look at xlog_do_recovery_pass and xlog_recover_process_ophdr.
+
+[4] unlocked by xfs_readlink_bmap_ilocked itself.
+
+[5] This is for update transactions.
+    The bp will be added to the transaction.
+    xfs_trans_read_buf_map
+    ---
+    bp = xfs_buf_read_map(target, map, nmaps, flags, ops);
+    ...
+    if (tp) {
+        _xfs_trans_bjoin(tp, bp, 1);
+    }
+    ---
+    So finally, the bp will be unlocked by xfs_buf_item_unlock
+    xfs_buf_item_unlock
+    ---
+    bool            hold = !!(bip->bli_flags & XFS_BLI_HOLD);
+    ...
+    if (!hold)
+        xfs_buf_relse(bp);
+    ---
+    
+<font size="1">
+    The XFS_BLI_HOLD is not a common case.
+    One of the usage of XFS_BLI_HOLD.
+    xfs_dir_ialloc
+    ---
+<font color="blue">
+        /*
+         * Normally, xfs_trans_commit releases all the locks.
+         * We call bhold to hang on to the ialloc_context across
+         * the commit.  Holding this buffer prevents any other
+         * processes from doing any allocations in this
+         * allocation group.
+         */
+</font>
+        xfs_trans_bhold(tp, ialloc_context);
+    ---
+</font>
+
+    The xfs_buf_item_unlock is invoked in:
+    xfs_log_commit_cil
+      -> xlog_cil_insert_items
+      -> xfs_trans_free_items
+        -> lip->li_ops->iop_unlock
+           xfs_buf_item_unlock
+
+    In addition, the bp could be unlocked by xfs_trans_brelse.
+    xfs_trans_brelse
+    ---
+    /*
+     * If the buffer is dirty within this transaction, we can't
+     * release it until we commit.
+     */
+    if (test_bit(XFS_LI_DIRTY, &bip->bli_item.li_flags))
+		return;
+    ...
+    xfs_buf_relse(bp);
+	---
+ [6] unlocked by xfs_update_secondary_sbs itself.
+ [7] unlocked by xfs_attr_rmtval_set itself
+ [8] same with case [5]
+</pre>
+</ul>
+
 </font>
 </p>
 
@@ -1887,9 +2083,132 @@ xfs_defer_finish
 </p>
   
 
+<h5><a name="intent_log_recover">intent log recover</a></h5>
+<p>
+<font size="2">
+The basic principle is:<br/>
+<ul>
+<li> Both intent log item and log done are there, needn't to replay the intent log item.
+<pre>
+xfs_mountfs
+  -> xfs_log_mount
+    -> xlog_alloc_log
+    -> xlog_recover
+      -> xlog_do_recover
+        -> xlog_do_log_recovery
+          -> xlog_do_recovery_pass // analyze log record
+            -> xlog_recover_process // check log record crc
+              -> xlog_recover_process_data // analyze oph
+                -> xlog_recover_process_ophdr
+                  -> xlog_recovery_process_trans
+                    -> xlog_recover_commit_trans // when get a complete transaction (ctx in xlog_cil_push)
+                      -> xlog_recover_items_pass2
+                        -> xlog_recover_commit_pass2
+xlog_recover_rui_pass2
+<font color="blue">
+It allocates an in-core rui, copies the extents from the format
+structure into it, and adds the rui to the AIL with the given
+LSN.
+</font>
+xlog_recover_rud_pass2
+<font color="blue">
+This routine is called when an RUD format structure is found in a committed
+transaction in the log. Its purpose is to cancel the corresponding RUI if it
+was still in the log. To do this it searches the AIL for the RUI with an id
+equal to that in the RUD format structure. If we find it we drop the RUD
+reference, which removes the RUI from the AIL and frees it.
+</font>
+
+
+Look at xfs_defer_finish_noroll
+---
+    while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+        /* log intents and pull in intake items */
+        xfs_defer_create_intents(*tp);
+        list_splice_tail_init(&(*tp)->t_dfops, &dop_pending);
+
+        /*
+         * Roll the transaction.
+         */
+        error = xfs_defer_trans_roll(tp);
+        if (error)
+            goto out;
+
+        /* Log an intent-done item for the first pending item. */
+        dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
+                       dfp_list);
+        dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+                dfp->dfp_count);
+        cleanup_fn = dfp->dfp_type->finish_cleanup;
+
+        /* Finish the work items. */
+        state = NULL;
+        list_for_each_safe(li, n, &dfp->dfp_work) {
+            list_del(li);
+            dfp->dfp_count--;
+            error = dfp->dfp_type->finish_item(*tp, li,
+                    dfp->dfp_done, &state);
+            ...
+        }
+            ...
+    }
+---
+
+The real work of a intent log is done in dfp->dfp_type->finish_item().
+<U>The logs (inode and buf items) is committed to a same transaction with the
+intent log done.</U> So if the log done is there, associated log of the real work
+must be there. We needn't replay the intent log any more.
+
+</pre>
+<li> If only intent log item, replay it.
+<pre>
+xfs_mountfs
+  -> xfs_log_mount //<font color="blue">analyze log here</font>
+  -> xfs_log_mount_finish
+    -> xlog_recover_finish
+      -> xlog_recover_process_intents
+    ---
+    spin_lock(&ailp->ail_lock);
+    lip = xfs_trans_ail_cursor_first(ailp, &cur, 0);
+    while (lip != NULL) {
+        if (!xlog_item_is_intent(lip)) {
+            break;
+        }
+
+        switch (lip->li_type) {
+        case XFS_LI_EFI:
+            error = xlog_recover_process_efi(log->l_mp, ailp, lip);
+            break;
+        case XFS_LI_RUI:
+            error = xlog_recover_process_rui(log->l_mp, ailp, lip);
+            break;
+        case XFS_LI_CUI:
+            error = xlog_recover_process_cui(parent_tp, ailp, lip);
+            break;
+        case XFS_LI_BUI:
+            error = xlog_recover_process_bui(parent_tp, ailp, lip);
+            break;
+        }
+        if (error)
+            goto out;
+        lip = xfs_trans_ail_cursor_next(ailp, &cur);
+    }
+out:
+    xfs_trans_ail_cursor_done(&cur);
+    spin_unlock(&ailp->ail_lock);
+
+    ---
+</pre>
+</ul>
+</font>
+</p>
+
+
+
 
 
 <h4><a name="relog">relog</a></h4>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
 <p>
 <font size="2">
 What is relogging ?
@@ -1934,10 +2253,689 @@ be release finally.
 </font>
 </p>
 
+<h3><a name="log_miscs">miscs</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<B>In one trasaction, there can only be one modification on one log item.</B>
+<pre>
+The one transaction here is the one xfs_cil_ctx in xlog_cil_push
+
+It will take all of the lvs down from the log items queued on cil->xc_cil
+under down_write of cil->xc_ctx_lock.
+
+xfs_log_commit_cil
+  -> xlog_cil_insert_items // under down_read of cil->xc_ctx_lock
+    -> xlog_cil_insert_format_items
+
+If the lip->lv is not NULL, format the log there. Otherwise, use the shadow lv
+and this lv will be written to log in another transaction.
+</pre>
+
+<B>ctx</B>
+<pre>
+xlog_cil_push write the lvs to log in unit of ctx.
+This ctx has a commit record.
+
+When the iclog where the commit record of a ctx is written to log,
+xlog_cil_committed will be invoked.
+
+xlog_cil_committed
+  -> xfs_trans_committed_bulk
+    -> xfs_log_item_batch_insert
+    ---
+    for (i = 0; i < nr_items; i++) {
+        struct xfs_log_item *lip = log_items[i];
+
+        lip->li_ops->iop_unpin(lip, 0);
+    }
+    ---
+</pre>
+</font>
+</p>
+
+
+<h2><a name="AG_free_space_management">AG free space management</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h3><a name="AG_Free_Space_B+trees">AG Free Space B+trees</a></h3>
+<p>
+<font size="2">
+The XFS filesystem tracks free space in an allocation group using two B+trees. One B+tree tracks space by block
+number, the second by the size of the free space block. This scheme allows XFS to <U>find quickly free space near a
+given block or of a given size</U>.<br/>
+All block numbers, indexes, and counts are <B>AG relative</B>.
+<pre>
+agf->agf_roots[] -.
+                  |
+                  v
+           +-----------+
+           |   Header  |        
+           +--+--+--+--+        key:[startblock,blockcount]
+           |K1|K2|K3|K4|        1:[12,16] 2:[184586,3] 3:[225579,1] 4:[511629,1]
+           +--+--+--+--+        
+           |P1|P2|P3|P4|        1:2 2:83347 3:6 4:4
+           +--+--+--+--+        
+            |   |
+       .----'   '-------.  
+       v                v
+       2              83347
+ +-----------+    +-----------+               
+ |   Header  |    |   Header  |               
+ +--+--+--+--+    +--+--+--+--+               
+ |R0|R1|R2|R3|    |R0|R1|R2|R3|
+ +--+--+--+--+    +--+--+--+--+
+</pre>
+</font>
+</p>
 
 
 
+<h3><a name="xfs_alloc_ag_vextent_size">xfs_alloc_ag_vextent_size</a></h3>
+<p>
+<font size="2">
+Allocate a variable extent anywhere in the allocation group agno.<br/>
+Extent's length (returned in len) will be between minlen and maxlen.<br/>
+<pre>
+xfs_alloc_ag_vextent_size
+---
+<font color="blue">
+     //Allocate and initialize a cursor for the by-size btree.
+</font>
+    cnt_cur = xfs_allocbt_init_cursor(args->mp, args->tp, args->agbp,
+        args->agno, <font color="red">XFS_BTNUM_CNT</font>);
 
+<font color="blue">
+    //Look for an entry >= maxlen+alignment-1 blocks.
+    //The result will be the <U>nearest</U> one. 
+</font>
+    if ((error = xfs_alloc_lookup_ge(cnt_cur, 0,
+            args->maxlen + args->alignment - 1, &i)))
+        goto error0;
+
+    if (!i) {
+        ...
+    } else {
+        /*
+         * Search for a non-busy extent that is large enough.
+         */
+        for (;;) {
+            error = xfs_alloc_get_rec(cnt_cur, &fbno, &flen, &i);
+            busy = xfs_alloc_compute_aligned(args, fbno, flen,
+                    &rbno, &rlen, &busy_gen);
+<font color="blue">
+            //xfs_extent_busy_trim
+            //regarding to busy extent, please refer to <a href="#Busy_extent">Busy extent</a>
+</font>
+
+            if (rlen >= args->maxlen)
+                break;
+
+<font color="blue">
+            // shift to right the rec
+</font>
+            error = xfs_btree_increment(cnt_cur, 0, &i);
+            if (i == 0) {
+                /*
+                 * Our only valid extents must have been busy.
+                 * Make it unbusy by forcing the log out and
+                 * retrying.
+                 */
+                xfs_btree_del_cursor(cnt_cur,
+                             XFS_BTREE_NOERROR);
+                trace_xfs_alloc_size_busy(args);
+                xfs_extent_busy_flush(args->mp,
+                            args->pag, busy_gen);
+                goto restart;
+            }
+        }
+    }
+    ...
+<font color="blue">
+    // Allocate and initialize a cursor for the by-block tree.
+</font>
+    bno_cur = xfs_allocbt_init_cursor(args->mp, args->tp, args->agbp,
+        args->agno, <font color="red">XFS_BTNUM_BNO</font>);
+    if ((error = xfs_alloc_fixup_trees(cnt_cur, bno_cur, fbno, flen,
+            rbno, rlen, XFSA_FIXUP_CNT_OK)))
+        goto error0;
+    xfs_btree_del_cursor(cnt_cur, XFS_BTREE_NOERROR);
+    xfs_btree_del_cursor(bno_cur, XFS_BTREE_NOERROR);
+    cnt_cur = bno_cur = NULL;
+    args->len = rlen;
+    args->agbno = rbno;
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="xfs_alloc_fixup_trees">xfs_alloc_fixup_trees</a></h3>
+
+<p>
+<font size="2">
+Update the bnobt and cntbt, remove the allocated record from the two trees.<br/>
+<pre>
+
+
+       fb
+  |---------| freespace record we get from freespace btree
+  |f0|---|f1|    result record we need
+
+The steps to fix the cntbt and bnobt:
+ a. delete fb from the cntbt
+ b. insert f0 and f1 into cntbt
+ c. update fb to f0 (cut fb down to f0)
+ d. insert f1
+
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="AG_free_list">AG free list</a></h3>
+<p>
+<font size="2">
+The AG Free List is located in the 4th sector of each AG and is known as the AGFL. It is an array of AG relative
+block pointers for reserved space for growing the free space B+trees.
+<pre>
+
+(bmap    refcount    rmap    inode)    data block
+ the above 4 btrees itself need              
+ block to construct the btree             
+                            |  xfs_alloc_vextent
+                            v
+                     bnobt     cntbt
+                 the above 2 btrees' block
+                 are allocated from agfl
+                            |  xfs_alloc_fix_freelist 
+                            v
+                           agfl
+                     
+During operations on free space btree (bnobt and cntbt), new free block maybe
+needed, if no available free blocks, we may encounter deadlock, especially, free
+space.
+
+</pre>
+
+There are two blocks associated with agfl.
+<ul>
+<li> agf (AG Free Space Block)
+<pre>
+    - agf_flfirst
+    - agf_fllast
+    - agf_flcount
+
+    2nd sector of an AG.
+    XFS_AGF_DADDR
+</pre>
+<li> agfl (AG Free list)
+<pre>
+    4th sector of an AG
+    XFS_AGFL_DADDR
+</pre>
+</ul>
+
+Two basic interfaces of agfl
+<ul>
+<li> xfs_alloc_get_freelist
+<pre>
+---
+<font color="blue">
+    // Get bp of agfl
+</font>
+    error = xfs_alloc_read_agfl(mp, tp, be32_to_cpu(agf->agf_seqno), &agflbp);
+    ...
+    agfl_bno = XFS_BUF_TO_AGFL_BNO(mp, agflbp);
+<font color="blue">
+    // Get the first free block from the agfl
+</font>
+    bno = be32_to_cpu(agfl_bno[be32_to_cpu(agf->agf_flfirst)]);
+<font color="blue">
+    // Push the ring of agfl
+</font>
+    be32_add_cpu(&agf->agf_flfirst, 1);
+    xfs_trans_brelse(tp, agflbp);
+    if (be32_to_cpu(agf->agf_flfirst) == xfs_agfl_size(mp))
+        agf->agf_flfirst = 0;
+
+    pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+    ASSERT(!pag->pagf_agflreset);
+    be32_add_cpu(&agf->agf_flcount, -1);
+    xfs_trans_agflist_delta(tp, -1);
+    pag->pagf_flcount--;
+    xfs_perag_put(pag);
+
+    logflags = XFS_AGF_FLFIRST | XFS_AGF_FLCOUNT;
+    ...
+<font color="blue">
+    // We only modify the agf, so just log it.
+</font>
+    xfs_alloc_log_agf(tp, agbp, logflags);
+    *bnop = bno;
+---
+</pre>
+<li> xfs_alloc_put_freelist
+<pre>
+---
+<font color="blue">
+    // Get bp of agfl
+</font>
+    if (!agflbp && (error = xfs_alloc_read_agfl(mp, tp,
+            be32_to_cpu(agf->agf_seqno), &agflbp)))
+        return error;
+    be32_add_cpu(&agf->agf_fllast, 1);
+    if (be32_to_cpu(agf->agf_fllast) == xfs_agfl_size(mp))
+        agf->agf_fllast = 0;
+
+    pag = xfs_perag_get(mp, be32_to_cpu(agf->agf_seqno));
+    ASSERT(!pag->pagf_agflreset);
+    be32_add_cpu(&agf->agf_flcount, 1);
+    xfs_trans_agflist_delta(tp, 1);
+    pag->pagf_flcount++;
+
+    logflags = XFS_AGF_FLLAST | XFS_AGF_FLCOUNT;
+    ...
+    xfs_perag_put(pag);
+
+    xfs_alloc_log_agf(tp, agbp, logflags);
+<font color="blue">
+    // Fill in the free block into the agfl
+</font>
+    agfl_bno = XFS_BUF_TO_AGFL_BNO(mp, agflbp);
+    blockp = &agfl_bno[be32_to_cpu(agf->agf_fllast)];
+    *blockp = cpu_to_be32(bno);
+    startoff = (char *)blockp - (char *)agflbp->b_addr;
+
+<font color="blue">
+    // we need to log both agf and agfl.
+</font>
+    xfs_alloc_log_agf(tp, agbp, logflags);
+
+    xfs_trans_buf_set_type(tp, agflbp, XFS_BLFT_AGFL_BUF);
+    xfs_trans_log_buf(tp, agflbp, startoff,
+              startoff + sizeof(xfs_agblock_t) - 1);
+---
+</pre>
+</ul>
+<br/>
+<B>Is xfs_alloc_fix_freelist exclusive</B> ?
+<pre>
+The lock of agf buffer could ensure the exclusivity.
+It will be locked by
+xfs_alloc_read_agf
+  -> xfs_read_agf
+    -> xfs_trans_read_buf
+      -> xfs_trans_read_buf_map
+        -> xfs_buf_read_map
+          -> xfs_buf_get_map
+            -> xfs_buf_find
+              -> xfs_buf_lock
+<font color="blue">
+Before the transaction is committed or rolled, if the bp has been in the
+ transaction, it will not be locked again.
+</font>
+This is done by,
+xfs_trans_read_buf_map
+  -> xfs_trans_buf_item_match
+
+Where to unlock ?
+Every time we do allocation/free, agf, at least agf->agf_freeblks,
+will be modified. So it must be logged and the lock will be freed
+after log formating.
+
+<U>Actually, the whole free space allocation and free are under the lock of
+agf's bp.</U>
+
+</pre>
+
+<B>defer agfl block frees</B>
+<pre>
+f8f2835a9cf300079835e1adb1d90f85033be04c (xfs: defer agfl block frees when dfops is available)
+
+
+The AGFL fixup code executes before every block allocation/free and rectifies the
+AGFL based on the current, dynamic allocation requirements of the fs. The AGFL must
+hold a minimum number of blocks to satisfy a worst case split of the free space
+btrees caused by the impending allocation operation.
+
+Since the AGFL caches individual blocks, AGFL reduction typically involves multiple,
+single block frees. We've had reports of transaction overrun problems during certain
+workloads that boil down to AGFL reduction freeing multiple blocks and consuming more
+space in the log than was reserved for the transaction (note, it is tic->t_unit_res).
+
+One way to address this problem is to release surplus blocks from the AGFL immediately
+but defer the free of those blocks (similar to how file-mapped blocks are unmapped from
+the file in one transaction and freed via a deferred operation) until the transaction is
+rolled.
+
+Let's look at how to achieve this,
+
+__xfs_trans_commit
+  -> xfs_defer_finish_noroll
+  ---
+    while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+        /* log intents and pull in intake items */
+        xfs_defer_create_intents(*tp);  <font color="red">[1]<B></B></font>
+        list_splice_tail_init(&(*tp)->t_dfops, &dop_pending);
+<font color="blue">
+        // Roll the transaction.
+        // The transaction will re-get a log space reservation.
+</font>
+        error = xfs_defer_trans_roll(tp); <font color="red"><B>[2]</B></font>
+        ...
+                                                    <font color="red"><B>[3]</B></font>
+        dfp->dfp_done = dfp->dfp_type-><font color="red">create_done</font>(*tp, dfp->dfp_intent, dfp->dfp_count);
+        cleanup_fn = dfp->dfp_type->finish_cleanup;
+        /* Finish the work items. */
+        state = NULL;
+        list_for_each_safe(li, n, &dfp->dfp_work) {
+            list_del(li);
+            dfp->dfp_count--;
+<font color="blue">
+            // Do the real work behind the intend
+</font>
+                                     <font color="red"><B>[4]</B></font>
+            error = dfp->dfp_type-><font color="red">finish_item</font>(*tp, li, dfp->dfp_done, &state);
+            ...
+        }
+        ...
+    }
+  ---
+
+Given there are 4 intent log item in this transaction and all of them are btree
+updating. If log all of the operations in one transaction committing, the
+tic->t_unit_res maybe used up. But when handle them in defer work, things are
+different.
+
+ a. create intend log for all of them.
+ b. roll the trasaction
+ c. create intend done log for the 1st one
+ d. do the real work, such as updating btree and agf
+ e. roll the transaction
+ ...
+
+We could see, every time the transaction is rolled, <U>it just commit one btree
+updating operation and the log space needed is predictable.</U>
+</pre>
+</font>
+</p>
+
+<h3><a name="Busy_extent">Busy extent</a></h3>
+<p>
+<font size="2">
+Busy block/extent entry.  Indexed by a rbtree in perag to mark blocks that
+have been freed but whose transactions aren't committed to disk yet.<br/>
+<pre>
+
+xlog_cil_committed
+---
+    xfs_extent_busy_sort(&ctx->busy_extents);
+    xfs_extent_busy_clear(mp, &ctx->busy_extents,
+                 (mp->m_flags & XFS_MOUNT_DISCARD) && !abort);
+---
+
+</pre>
+
+Think of following operations sequence:
+<pre>
+ 1. free extent E_a from F_a in transaction T_a
+ 2. allocate extent E_a to F_b in transaction T_b again.
+ 3. write on the E_a of F_b. 
+
+The issue here is: if the data written on E_a reaches disk before the log of T_a
+and T_b, and power is lost at the moment. When do recovery, we cannot replay the
+log of free extent E_a from F_a, but the blocks associated to extent E_a has
+been corrupted.
+</pre>
+How does ext4 handle this ?
+<pre>
+ext4_free_blocks
+---
+<font color="red">
+    /*
+     * We need to make sure we don't reuse the freed block until after the
+     * transaction is committed. We make an exception if the inode is to be
+     * written in writeback mode since writeback mode has weak data
+     * consistency guarantees.
+     */
+</font>
+    if (ext4_handle_valid(handle) &&
+        ((flags & EXT4_FREE_BLOCKS_METADATA) ||
+         !ext4_should_writeback_data(inode))) {
+<font color="blue">
+        // if order or journal mode
+</font>
+        ...
+        mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
+        ext4_mb_free_metadata(handle, &e4b, new_entry);
+        ---
+            spin_lock(&sbi->s_md_lock);
+<font color="red">
+            list_add_tail(&new_entry->efd_list, &sbi->s_freed_data_list);
+</font>
+            sbi->s_mb_free_pending += clusters;
+            spin_unlock(&sbi->s_md_lock);
+        ---
+    }
+---
+
+ext4_journal_commit_callback
+ -> ext4_process_freed_data
+   -> ext4_mb_load_buddy
+     -> ext4_mb_load_buddy_gfp
+       -> find_or_create_page
+       -> ext4_mb_init_cache // if not Uptodate
+<font color="blue">
+        // struct inode *inode = sbi->s_buddy_cache;
+</font>
+
+jbd2_journal_commit_transaction
+---
+    if (journal->j_commit_callback)
+        journal->j_commit_callback(journal, commit_transaction);
+---
+</pre>
+</font>
+</p>
+
+<h2><a name="BT">B Tree</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h3><a name="xfs_btree_ops">xfs_btree_ops</a></h3>
+<p>
+<font size="2">
+xfs_btree_ops
+<ul>
+<li> init_ptr_from_cur, initialise start pointer from cursor
+<pre>
+xfs_btree_lookup
+---
+    cur->bc_ops->init_ptr_from_cur(cur, &ptr);
+    pp = &ptr;
+---
+
+xfs_allocbt_init_ptr_from_cur
+---
+    ptr->s = agf->agf_roots[cur->bc_btnum];
+<font color="blue">
+    //agf here is the on-disk one.
+</font>
+---
+</pre>
+<li> init_key_from_rec, get key from the record in level 0 node.
+<pre>
+We need to iterate the btree and compare the keys.
+If level > 0, there are specific key fields there.
+But for level 0, only record there. So we need this callback to get key value
+from the record.
+
+xfs_btree_lookup
+  -> xfs_lookup_get_search_key
+---
+    if (level == 0) {
+        cur->bc_ops->init_key_from_rec(kp,
+                xfs_btree_rec_addr(cur, keyno, block));
+        return kp;
+    }
+
+    return xfs_btree_key_addr(cur, keyno, block);
+---
+</pre>
+<li> key_diff, compare the key
+</ul>
+
+</font>
+</p>
+
+<h3><a name="xfs_btree_lookup">xfs_btree_lookup</a></h3>
+<p>
+<font size="2">
+xfs_btree_lookup will iterate the btree and fill the entries fillowing:
+<ul>
+<li> xfs_btree_cur->bc_bufs, the bp of the block we want at every level
+<li> xfs_btree_cur->bc_ptrs, the key of the entry in every level's node.
+</ul>
+<pre>
+    /* initialise start pointer from cursor */
+    cur->bc_ops->init_ptr_from_cur(cur, &ptr);
+    pp = &ptr;
+    for (level = cur->bc_nlevels - 1, diff = 1; level >= 0; level--) {
+        error = xfs_btree_lookup_get_block(cur, level, pp, &block);
+        if (diff == 0) {
+            /*
+             * If we already had a key match at a higher level, we
+             * know we need to use the first entry in this block.
+             */
+            keyno = 1;
+        } else {
+            int    high;    /* high entry number */
+            int    low;    /* low entry number */
+
+            /* Set low and high entry numbers, 1-based. */
+            low = 1;
+            high = xfs_btree_get_numrecs(block);
+            ...
+            while (low <= high) {
+                union xfs_btree_key    key;
+                union xfs_btree_key    *kp;
+
+                XFS_BTREE_STATS_INC(cur, compare);
+
+                /* keyno is average of low and high. */
+                keyno = (low + high) >> 1;
+
+                /* Get current search key */
+                kp = xfs_lookup_get_search_key(cur, level,
+                        keyno, block, &key);
+
+                /*
+                 * Compute difference to get next direction:
+                 *  - less than, move right
+                 *  - greater than, move left
+                 *  - equal, we're done
+                 */
+                diff = cur->bc_ops->key_diff(cur, kp);
+                if (diff < 0)
+                    low = keyno + 1;
+                else if (diff > 0)
+                    high = keyno - 1;
+                else
+                    break;
+            }
+        }
+<font color="blue">
+        Except for the diff==0, the search loop exit is due to low == high.
+
+        Before that, keyno = (high + low)/2
+        if diff < 0, low = keyno + 1
+        if diff > 0, high = keyno -1
+
+        We could get: low + 2 = high
+
+        Take the bnobt as example, the final result of loop above is:
+        
+        KEY   low     keyno   high
+        PTR   ptr_l   ptr_k   ptr_h
+        BNO   bno_l   bno_k   bno_h    (start block number of the range)
+                   ^        ^
+                  [1]      [2]
+
+        diff = bno_k - bno_want
+
+        if diff > 0, bno_want is at [1], it is included in ptr_l, res = keyno - 1
+        if diff < 0, bno_want is at [2], it is included in ptr_k, res = keyno
+</font>
+        if (level > 0) {
+            if (diff > 0 && --keyno < 1)
+                keyno = 1;
+            ...
+            cur->bc_ptrs[level] = keyno;
+        }
+    }
+<font color="blue">
+    For intermediate node, it must include the key we want.
+    But for leaf node, things is different.
+
+    low      keyno      high
+         ^           ^
+         '           '
+      diff > 0    diff < 0
+
+    LE    diff > 0, res = keyno - 1
+          diff < 0, res = keyno
+    
+    EQ    diff > 0, res = keyno
+          diff < 0, res = keyno + 1
+          (<font color="red">EQ and GE return same records, but the stat is different</font>)
+    GE    diff > 0, res = keyno
+          diff < 0, res = keyno + 1
+          In case of keyno + 1 may exceed current node, 
+          
+                    [K1]<font color="blue">[K2]</font><font color="red">[K3]</font>[K4]
+                    [P1][<font color="blue">P2]</font><font color="red">[P3]</font>[P4]
+                         |   |
+                     .---'   '----------.
+                     v                  v
+              [R1][R2][R3][<font color="blue">R4]</font>   <font color="red">[R1]</font>[R2][R3][R4]
+                           ^      
+                           keyno
+          we need invoke xfs_btree_increment to shift the path right (blue -> red)
+    
+</font>
+    if (dir != XFS_LOOKUP_LE && diff < 0) {
+        keyno++;
+        xfs_btree_get_sibling(cur, block, &ptr, <font color="red">XFS_BB_RIGHTSIB</font>);
+        if (dir == XFS_LOOKUP_GE &&
+<font color="red">            keyno > xfs_btree_get_numrecs(block) &&</font>
+            !xfs_btree_ptr_is_null(cur, &ptr)) {
+            int    i;
+
+            cur->bc_ptrs[0] = keyno;
+            error = xfs_btree_increment(cur, 0, &i);
+            ...
+            *stat = 1;
+            return 0;
+        }
+    } else if (dir == XFS_LOOKUP_LE && diff > 0)
+        keyno--;
+    cur->bc_ptrs[0] = keyno;
+
+    /* Return if we succeeded or not. */
+    if (keyno == 0 || keyno > xfs_btree_get_numrecs(block))
+        *stat = 0;
+    else if (dir != XFS_LOOKUP_EQ || diff == 0)
+        *stat = 1;
+    else
+        *stat = 0;
+    return 0;
+
+</pre>
+</font>
+</p>
+
+
+    
 <h2><a name="reflink">reflink</a></h2>
 <p>
 <font size="2">
