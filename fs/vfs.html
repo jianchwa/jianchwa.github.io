@@ -19,6 +19,7 @@
 <ul>
 <li><a href="#path_walking">path_walking</a>
 <li><a href="#locks_of_dentry">locks_of_dentry</a>
+<li><a href="#lookup_in_parellel">lookup in parellel</a>
 </ul>
 <a href="#inode">inode</a><br/>
 <ul>
@@ -509,6 +510,161 @@ scenario.
 </ul>
 </font>
 </p>
+
+
+<h3><a name="lookup_in_parellel">lookup in parellel</a></h3>
+<p>
+<font size="2">
+
+There are two parts of dentry look up, the fast path and slow path.<br/>
+Let's look at the slow path here.<br/>
+
+Quote from here
+<pre>
+https://lwn.net/Articles/685108/
+
+All directory operations are done with the inode mutex (i_mutex) held, which prevents anything else 
+from touching that directory. But the most common operation, lookup, is non-destructive, so there is
+no real conceptual reason to stop it from happening in parallel.
+</pre>
+
+The typical scenario could be
+<pre>
+
+CPU0     CPU1      CPU2     CPU3     CPU4
+T0       T1        T2       T3       T4
+  \      \         |        /        /
+    \      \       |      /        /
+      \      \     |    /        /
+               
+              /var/log/ 
+          T0  T1  T2  T3  T4
+
+If all of the dentries of T0 ~ T1 happen to be not in memory, all of them have
+to invoke lookup_slow.
+
+If the lock here is a mutex, the performance will very bad.
+</pre>
+
+Then a rw_semaphore is introduced to replace the mutex.
+<pre>
+static struct dentry *lookup_slow(const struct qstr *name,
+                  struct dentry *dir,
+                  unsigned int flags)
+{
+    struct inode *inode = dir->d_inode;
+    struct dentry *res;
+    inode_lock_shared(inode);
+<font color="blue">      -> down_read(&inode->i_rwsem); </font>
+    res = __lookup_slow(name, dir, flags);
+    inode_unlock_shared(inode);
+    return res;
+}
+</pre>
+<br/>
+But there is a problem: the mutex currently protects the directory entry (dentry).
+A lookup operation can cause dentries to be created, which can lead to races if two
+dentries are created for the same name.<br/>
+How to handle this ?
+<pre>
+Look at the d_alloc_parallel.
+---
+    struct hlist_bl_head *b = in_lookup_hash(parent, hash);
+<font color="blue">
+    // alloc a dentry structrue here.
+</font>
+    struct dentry *new = d_alloc(parent, name);
+ 
+retry:
+    rcu_read_lock();
+    r_seq = read_seqbegin(&rename_lock);
+<font color="blue">
+    // look up the a dentry with (parent, name) in hash cache
+    // there could be some one create a same one concurrently.
+</font>
+    dentry = __d_lookup_rcu(parent, name, &d_seq);
+    if (unlikely(dentry)) {
+        ...
+<font color="blue">
+    // anything changes on the dentry ?
+</font>
+        if (read_seqcount_retry(&dentry->d_seq, d_seq)) {
+            rcu_read_unlock();
+            dput(dentry);
+            goto retry;
+        }
+        rcu_read_unlock();
+        dput(new);
+        return dentry;
+    }
+    if (unlikely(read_seqretry(&rename_lock, r_seq))) {
+        rcu_read_unlock();
+        goto retry;
+    }
+
+    hlist_bl_lock(b);
+<font color="blue">
+    // A spin lock here.
+    // So there could be only one entering this critical section,
+    // namely, only one of concurrent lookups with same parent and name pair
+    // could add its dentry on the hash cache, the others have to wait. When
+    // they come in this critical section, a dentry with same name and parent
+    // pair has been there.
+    // At the moment, there are 2 cases:
+    //  - the dentry is in lookup, indicating inode->i_op->lookup is ongoing.
+    //    we have to wait.
+    //  - otherwise, the lookup has been completed, we could return this dentry
+    //    directly.
+</font>
+    hlist_bl_for_each_entry(dentry, node, b, d_u.d_in_lookup_hash) {
+        if (dentry->d_name.hash != hash)
+            continue;
+        if (dentry->d_parent != parent)
+            continue;
+        if (!d_same_name(dentry, parent, name))
+            continue;
+        hlist_bl_unlock(b);
+        /* now we can try to grab a reference */
+        if (!lockref_get_not_dead(&dentry->d_lockref)) {
+            rcu_read_unlock();
+            goto retry;
+        }
+
+        rcu_read_unlock();
+        /*
+         * somebody is likely to be still doing lookup for it;
+         * wait for them to finish
+         */
+        spin_lock(&dentry->d_lock);
+        d_wait_lookup(dentry);
+        if (unlikely(dentry->d_name.hash != hash))
+            goto mismatch;
+        if (unlikely(dentry->d_parent != parent))
+            goto mismatch;
+        if (unlikely(d_unhashed(dentry)))
+            goto mismatch;
+        if (unlikely(!d_same_name(dentry, parent, name)))
+            goto mismatch;
+        /* OK, it *is* a hashed match; return it */
+        spin_unlock(&dentry->d_lock);
+        dput(new);
+        return dentry;
+    }
+    rcu_read_unlock();
+    /* we can't take ->d_lock here; it's OK, though. */
+    new->d_flags |= DCACHE_PAR_LOOKUP; <font color="red">// dentry in-lookup is set here.</font>
+    new->d_wait = wq;
+    hlist_bl_add_head_rcu(&new->d_u.d_in_lookup_hash, b);
+    hlist_bl_unlock(b);
+    return new;
+
+---
+</pre>
+
+</font>
+</p>
+
+
 
 <h2><a name="inode">inode</a></h2>
 <h3><a name="aops">address_space ops</a></h3>

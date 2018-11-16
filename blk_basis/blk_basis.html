@@ -80,6 +80,13 @@
 <ul>
 <li><a href="#dma_alignment">dma alignment</a>
 </ul>
+<a href="#DISCARD">DISCARD</a>
+<ul>
+<li><a href="#What_is_discard">What is discard</a>
+<li><a href="#discard_in_blk">discard in blk</a>
+<li><a href="#discard_in_fs">discard in fs</a>
+</ul>
+
 </font>
 </p>
 
@@ -4813,6 +4820,271 @@ Another similar interface is blk_rq_map_user_iov.
 
 </font>
 </p>
+
+
+<a href="#DISCARD">DISCARD</a>
+<ul>
+<li><a href="#What_is_discard">What is discard</a>
+<li><a href="#discard_in_blk">discard in blk</a>
+<li><a href="#discard_in_fs">discard in fs</a>
+</ul>
+
+
+<h3><a name="DISCARD">DISCARD</a></h3>
+<h4><a name="What_is_discard">What is discard</a></h4>
+<p>
+<font size="2">
+
+write amplification
+<pre> 
+    |----|                         Write granularity (e.g 32K)
+    |----------------------------| Erase granularity (e.g 128K)
+ 
+    There are contiguous user data blocks.
+    If we want to write a 32K block in it, we have to
+     - read in 128K data, and update data in it
+     - erase
+     - write this 128K
+</pre>
+
+Wear leveling
+<pre>
+    A write can only occur to those pages that are erased, thereforehost write commands
+    invoke flash erase cycles prior to writing to the flash. This write/erase cycling causes
+    cell wear which imposes the limited write-life. Host write accesses can occur to any location
+    which can cause hot-spots, which causes premature wear in these locations.
+    <font color="red">wear-leveling is used to prevent the hot-spots</font>
+
+    <B>Mapping</B>
+
+    In most cases, the controller maintains a lookup table to translate the memory array physical
+    block address (PBA) to the logical block address (LBA) used by the host system. The controller's
+    wear-leveling algorithm determines which physical block to use each time data is programmed,
+    eliminating the relevance of the physical location of data and enabling data to be stored
+    anywhere within the memory array.
+
+    <B>Selecting</B>
+
+    The controller typically either writes to the available erased block with the lowest erase count
+    (dynamic wear leveling); or it selects an available target block with the lowest overall erase
+    count, erases the block if necessary
+
+    <B>Garbage collection</B>
+
+    Given that previously written-to blocks must be erased before they are able to receive data again,
+    the SSD controller must, for performance, actively pre-erase blocks so new write commands can always
+    get an empty block. 
+</pre>
+What is the discard command for ?
+<pre>
+If the user or operating system erases a file (not just remove parts of it), the file
+will typically be marked for deletion, but the actual contents on the disk are never
+actually erased. Because of this, the SSD does not know that it can erase the LBAs
+previously occupied by the file, <U>so the SSD will keep including such LBAs in the
+garbage collection.</U>
+
+Enables the operating system to tell an SSD which blocks of previously saved data are
+no longer needed as a result of file deletions or volume formatting. When an LBA is
+replaced by the OS, as with an overwrite of a file, the SSD knows that the original
+LBA can be marked as stale or invalid and it will not save those blocks during Garbage
+collection.
+</pre>
+<br/>
+Another useful link about this <a href="https://lwn.net/Articles/293658/">Block layer discard requests</a>
+<br/>
+<br/>
+Linux calls this as <B>DISCARD</B><br/>
+Different storage protocol has a different name, e.g TRIM ( ATA ) UNMAP ( SBC ) Deallocate ( NVME )
+
+</font>
+</p>
+
+<h4><a name="discard_in_blk">discard in blk</a></h4>
+<p>
+<font size="2">
+<ul>
+<li>Merge
+<pre>
+The restriction of merging of DISCARD is more relaxed, because the command in underlying storage
+protocol supports <B>Ranges</B>.
+For example:
+ - TRIM in ATA
+   Supports up to 64 ranges
+   16 bits worth of blocks per range
+ - UNMAP in SBC
+   Supports an implementation specific number of ranges
+   32 bits worth of blocks per range
+ - Deallocate in NVMe
+   Supports up to 256 ranges
+   32 bits worth of blocks per range
+
+Look at how does nvme setup the discard command.
+nvme_setup_discard
+---
+    unsigned short segments = blk_rq_nr_discard_segments(req), n = 0;
+    ...
+
+    range = kmalloc_array(segments, sizeof(*range), GFP_ATOMIC);
+    if (!range)
+        return BLK_STS_RESOURCE;
+
+    __rq_for_each_bio(bio, req) {
+        u64 slba = nvme_block_nr(ns, bio->bi_iter.bi_sector);
+        u32 nlb = bio->bi_iter.bi_size >> ns->lba_shift;
+
+        if (n < segments) {
+            range[n].cattr = cpu_to_le32(0);
+            range[n].nlb = cpu_to_le32(nlb);
+            range[n].slba = cpu_to_le64(slba);
+        }
+        n++;
+    }
+
+---
+
+So discontiguous bios or requests could be merged together.
+blk_mq_bio_list_merge
+---
+        if (!blk_rq_merge_ok(rq, bio))
+            continue;
+
+        switch (blk_try_merge(rq, bio)) {
+            ...
+        case ELEVATOR_DISCARD_MERGE:
+            merged = bio_attempt_discard_merge(q, rq, bio);
+            break;
+        default:
+            continue;
+        }
+---
+
+In blk_try_merge
+---
+<font color="red">
+    if (req_op(rq) == REQ_OP_DISCARD &&
+        queue_max_discard_segments(rq->q) > 1)
+        return ELEVATOR_DISCARD_MERGE;
+</font>
+    else if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector)
+        return ELEVATOR_BACK_MERGE;
+    else if (blk_rq_pos(rq) - bio_sectors(bio) == bio->bi_iter.bi_sector)
+        return ELEVATOR_FRONT_MERGE;
+    return ELEVATOR_NO_MERGE;
+---
+We could see only the req op is concerned. They needn't to be contiguous.
+</pre>
+<li> throttle
+<pre>
+DISCARD has been throttled by WBT,
+Look at the comment of patch from Jens to limit DISCARD in WBT.
+"
+Throttle discards like we would any background write. Discards should
+be background activity, so if they are impacting foreground IO, then
+we will throttle them down.
+"
+In kyber, DISCARD is counted as KYBER_OTHER which has very low priority.
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="discard_in_fs">discard in fs</a></h4>
+<p>
+<font size="2">
+There is a danger about discard in fs
+<pre>
+the filesystem may well discard a set of sectors, then write new data to them once they are allocated to
+a new file. It would be a serious mistake to reorder the new writes ahead of the discard operation,
+causing the newly-written data to be lost.
+</pre>
+
+Let's look at how to handle this in individual fs.
+<ul>
+<li> XFS
+<pre>
+xlog_cil_committed
+<font color="blue">
+  //transaction log of free block operation has been on the disk
+  //these blocks has been able to be allocated by others.
+  //so it is safe to discard these blocks
+</font>)
+---
+    xfs_trans_committed_bulk(ctx->cil->xc_log->l_ailp, ctx->lv_chain,
+                    ctx->start_lsn, abort);
+
+    xfs_extent_busy_sort(&ctx->busy_extents);
+    xfs_extent_busy_clear(mp, &ctx->busy_extents,
+                 (mp->m_flags & XFS_MOUNT_DISCARD) && !abort);
+<font size="1">
+    ---
+    list_for_each_entry_safe(busyp, n, list, list) {
+        ...
+        if (do_discard && busyp->length &&
+            !(busyp->flags & XFS_EXTENT_BUSY_SKIP_DISCARD)) {
+            busyp->flags = XFS_EXTENT_BUSY_DISCARDED;
+        } else {
+            xfs_extent_busy_clear_one(mp, pag, busyp);
+            wakeup = true;
+        }
+    ---
+</font>
+    ...
+    if (!list_empty(&ctx->busy_extents))
+        xlog_discard_busy_extents(mp, ctx);
+---
+
+xlog_discard_busy_extents
+---
+    blk_start_plug(&plug);
+    list_for_each_entry(busyp, list, list) {
+        error = __blkdev_issue_discard(mp->m_ddev_targp->bt_bdev,
+                XFS_AGB_TO_DADDR(mp, busyp->agno, busyp->bno),
+                XFS_FSB_TO_BB(mp, busyp->length),
+                GFP_NOFS, 0, &bio);
+        ...
+    }
+    if (bio) {
+        bio->bi_private = ctx;
+        bio->bi_end_io = xlog_discard_endio;
+        submit_bio(bio);
+    } else {
+        xlog_discard_endio_work(&ctx->discard_endio_work);
+    }
+    blk_finish_plug(&plug);
+---
+</pre>
+<li> EXT4
+<pre>
+<font color="blue">
+This function is called by the jbd2 layer once the commit has finished,
+so we know we can free the blocks that were released with that commit.
+</font>
+ext4_process_freed_data
+---
+    if (test_opt(sb, DISCARD)) {
+        list_for_each_entry(entry, &freed_data_list, efd_list) {
+            err = ext4_issue_discard(sb, entry->efd_group,
+                         entry->efd_start_cluster,
+                         entry->efd_count,
+                         &discard_bio);
+            ...
+
+        if (discard_bio) {
+            submit_bio_wait(discard_bio);
+            bio_put(discard_bio);
+        }
+    }
+---
+</pre>
+</ul>
+
+
+</font>
+</p>
+
+
+
 
 </body>
 </html>

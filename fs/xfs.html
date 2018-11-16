@@ -10,16 +10,17 @@
 </div>
 <p>
 <font size="2">
-<a href="#iext_BpTree">inode extent B+ tree</a>
+<a href="#block_map">block map</a>
 <ul>
-<li><a href="#iext_BpTree_lookup">lookup</a>
-<li><a href="#iext_BpTree_write_delay">write delayed allocate</a>
+<li><a href="#allocate_block">allocate block</a>
 </ul>
 <a href="#per-ag_metadata_buffer">per-ag metadata buffer</a>
 <ul>
-<li><a href="#pag_metadata_buffer_lock">lock</a>
 <li><a href="#pag_metadata_buffer_read_in">read in</a>
 <li><a href="#xfs_buf_lock">xfs buf lock</a>
+<li><a href="#xfs_buf_b_hold">b_hold</a>
+<li><a href="#lifecyle_of_bli">lifecycle of buf log item</a>
+<li><a href="#xfs_trans_binval">xfs_trans_binval</a>
 </ul>
 <a href="#log">log</a>
 <ul>
@@ -49,6 +50,7 @@
 <li><a href="#deferred_operation">deferred operations</a>
 <li><a href="#intent_log_recover">intent log recover</a>
 </ul>
+<li><a href="#delayed_log">Delayed log</a>
 <li><a href="#log_miscs">miscs</a>
 </ul>
 <a href="#AG_free_space_management">AG free space management</a>
@@ -59,6 +61,12 @@
 <li><a href="#AG_free_list">AG free list</a>
 <li><a href="#Busy_extent">Busy extent</a>
 </ul>
+<a href="#AG_free_inode_managment">AG free inode managment</a>
+<ul>
+<li><a href="#Inode_allocation">Inode allocation</a>
+<li><a href="#Policy_to_select_AG">Policy to select AG</a>
+</ul>
+
 <a href="#BT">B Tree</a>
 <ul>
 <li><a href="#xfs_btree_ops">xfs_btree_ops</a>
@@ -69,11 +77,7 @@
 </font>
 </p>
 
-<h3><a name="iext_BpTree">inode extent B+ tree</a></h3>
-
-<h4><a name="iext_BpTree_lookup">lookup</a></h4>
-<p>
-<font size="2">
+<h3><a name="block_map">block map</a></h3>
 <pre>
 enum {
     NODE_SIZE    = 256,
@@ -107,25 +111,206 @@ On a 64-bit system, a node has two keys, a leaf has one recs.
 Take the smallest value of the lower level node as the KEY.
 The value here is file offset.
 </font>
-
-// under XFS_ILOCK_SHARED
-xfs_bmapi_read
-  -> xfs_iread_extents // read in the extents from disk.
-  -> xfs_iext_lookup_extent
-
-
 </pre>
-
 </font>
 </p>
 
-
-<h4><a name="iext_BpTree_write_delay">write delayed allocate</a></h4>
+<h4><a name="allocate_block">allocate block</a></h4>
 <p>
 <font size="2">
+How to allocate blocks for regular file ?<br/>
+Basic principles
 <pre>
+For large files, we try to allocate extents initially near the inode
+and afterwards near the existing block in the file which is closest to
+the offset in the file for which we are allocating space.
+
+That implies blocks will be allocated near the last block in the file
+for sequential writers and near blocks in the middle of the file for
+processes writing into holes.
+
+Files and directories are not limited to allocating space within a single
+allocation group.
+</pre>
+
+<pre>
+xfs_bmap_btalloc
+(tp->t_firstblock is NULLFSBLOCK, ignore filestream)
+
+    //start block of new extent
+    ap->blkno = XFS_INO_TO_FSB(mp, ap->ip->i_ino);
+
+    xfs_bmap_adjacent
+<font color="blue">
+    1. If allocating at eof, and there's a previous real block,
+       try to use its last block as our starting point.
+</font>
+       ---
+        if (ap->eof && ap->prev.br_startoff != NULLFILEOFF &&
+            !isnullstartblock(ap->prev.br_startblock) &&
+                ISVALID(ap->prev.br_startblock + ap->prev.br_blockcount,
+                ap->prev.br_startblock)) {
+            ap->blkno = ap->prev.br_startblock + ap->prev.br_blockcount;
+            /*
+             * Adjust for the gap between prevp and us.
+             */
+            adjust = ap->offset -
+                (ap->prev.br_startoff + ap->prev.br_blockcount);
+            if (adjust &&
+                ISVALID(ap->blkno + adjust, ap->prev.br_startblock))
+                ap->blkno += adjust;
+        }
+        ---
+<font color="blue">
+    2. If not at eof, then compare the two neighbor blocks.
+       Figure out whether either one gives us a good starting point,
+       and pick the better one.
+</font>
+
+    xfs_bmap_btalloc_nullfb
+      -> <font color="red">args->type = XFS_ALLOCTYPE_START_BNO </font>
+
+    if (!(ap->tp->t_flags & XFS_TRANS_LOWMODE) && ap->aeof) {
+        if (!ap->offset) {
+            args.alignment = stripe_align;
+            atype = args.type;
+            isaligned = 1;
+            if (blen > args.alignment && blen <= args.maxlen)
+                args.minlen = blen - args.alignment;
+            args.minalignslop = 0;
+        } else {
+<font color="blue">
+            /*
+             * First try an exact bno allocation.
+             * If it fails then do a near or start bno
+             * allocation with alignment turned on.
+             */
+</font>
+            atype = args.type;
+            tryagain = 1;
+            args.type = XFS_ALLOCTYPE_THIS_BNO;
+            args.alignment = 1;
+            ...
+        }
+    } else {
+        args.alignment = 1;
+        args.minalignslop = 0;
+    }
 
 
+allocation fallback sequence in xfs_bmap_btalloc,
+for example,
+
+    XFS_ALLOCTYPE_THIS_BNO
+            |
+            v
+    XFS_ALLOCTYPE_NEAR_BNO/START_BNO
+         alignment = 1
+            |
+            v
+         alignment = 0
+            |
+            v
+     XFS_ALLOCTYPE_FIRST_AG
+     loop all of the ags
+
+
+xfs_alloc_fix_freelist will do following things:
+1. check whether there is enough contiguous free space for the allocation.
+2. check whether there is enough free space for remaining allocation.
+   changing of the bnobt and cntbt also needs free blocks.
+3. fixup the agfl.
+
+Before invoke xfs_alloc_ag_vextent, xfs_alloc_fix_freelist will be invoked to
+check the case 1 and 2 to ensure there is enough free spaces.
+
+However, even if there is enough free space, the allocation still could fail for
+XFS_ALLOCTYPE_NEAR_BNO and XFS_ALLOCTYPE_THIS_BNO. At the moment, the
+<font color="red"> args->agbno will be NULLAGBLOCK.</font>
+
+Look at the code of xfs_alloc_vextent
+---
+    switch (type) {
+    case XFS_ALLOCTYPE_THIS_AG:
+    case XFS_ALLOCTYPE_NEAR_BNO:
+    case XFS_ALLOCTYPE_THIS_BNO:
+        args->agno = XFS_FSB_TO_AGNO(mp, args->fsbno);
+        args->pag = xfs_perag_get(mp, args->agno);
+        error = xfs_alloc_fix_freelist(args, 0);
+        ...
+        if (!args->agbp)
+            break;
+        args->agbno = XFS_FSB_TO_AGBNO(mp, args->fsbno);
+        if ((error = xfs_alloc_ag_vextent(args)))
+            goto error0;
+        break;
+    case XFS_ALLOCTYPE_START_BNO:
+<font color="blue">
+        /*
+         * Try near allocation first, then anywhere-in-ag after
+         * the first a.g. fails.
+         */
+</font>
+        args->agbno = XFS_FSB_TO_AGBNO(mp, args->fsbno);
+        args->type = XFS_ALLOCTYPE_NEAR_BNO;
+    case XFS_ALLOCTYPE_FIRST_AG:
+        if (type == XFS_ALLOCTYPE_FIRST_AG) {
+            args->agno = XFS_FSB_TO_AGNO(mp, args->fsbno);
+            args->type = XFS_ALLOCTYPE_THIS_AG;
+            sagno = 0;
+            flags = 0;
+        } else {
+            args->agno = sagno = XFS_FSB_TO_AGNO(mp, args->fsbno);
+            flags = XFS_ALLOC_FLAG_TRYLOCK;
+        }
+        for (;;) {
+            args->pag = xfs_perag_get(mp, args->agno);
+            error = xfs_alloc_fix_freelist(args, flags);
+            if (args->agbp) {
+                if ((error = xfs_alloc_ag_vextent(args)))
+                    goto error0;
+                break;
+            }
+            if (args->agno == sagno &&
+                type == XFS_ALLOCTYPE_START_BNO)
+                args->type = XFS_ALLOCTYPE_THIS_AG;
+<font color="blue">
+            /*
+             * Reached the starting a.g., must either be done
+             * or switch to non-trylock mode.
+             */
+</font>
+            if (args->agno == sagno) {
+                if (flags == 0) {
+                    args->agbno = NULLAGBLOCK;
+                    trace_xfs_alloc_vextent_allfailed(args);
+                    break;
+                }
+
+                flags = 0;
+                if (type == XFS_ALLOCTYPE_START_BNO) {
+                    args->agbno = XFS_FSB_TO_AGBNO(mp,
+                        args->fsbno);
+                    args->type = XFS_ALLOCTYPE_NEAR_BNO;
+                }
+            }
+            xfs_perag_put(args->pag);
+        }
+        break;
+    default:
+        ASSERT(0);
+        /* NOTREACHED */
+    }
+<font color="blue">
+    //Finally, the allocation successes or not
+</font>
+    if (args->agbno == NULLAGBLOCK)
+        args->fsbno = NULLFSBLOCK;
+    else {
+        args->fsbno = XFS_AGB_TO_FSB(mp, args->agno, args->agbno);
+    }
+
+---
 
 </pre>
 </font>
@@ -153,34 +338,6 @@ xfs_buf_t -> xfs_buf_map [block num, size]
 </pre>
 </font>
 </p>
-
-<h4><a name="pag_metadata_buffer_lock">lock</a></h4>
-<p>
-<font size="2">
-<B>Per xfs_buf_t semaphore</B>
-<pre>
-xfs_buf_get_maps
-  -> xfs_buf_find
-    if find
-    -> xfs_buf_trylock
-      -> down_trylock(&bp->b_sema)
-
-   if no ?
-  -> _xfs_buf_alloc
-    -> sema_init(&bp->b_sema, 0); <font color="blue">/* held, no waiters */</font>
-       XB_SET_OWNER(bp);
-   if present
-
-
-</pre>
-<B>per-ag buf hash spin_lock</B>
-<pre>
-Refer to xfs_buf_find
-</pre>
-
-</font>
-</p>
-
 
 <h4><a name="pag_metadata_buffer_read_in">read in</a></h4>
 <p>
@@ -349,6 +506,31 @@ xfs_buf_find
     }
 ---
 
+Or
+
+xfs_buf_get_maps
+  -> _xfs_buf_alloc
+    -> sema_init(&bp->b_sema, 0); <font color="red">/* held, no waiters */</font>
+  -> xfs_buf_find
+  ---
+    spin_lock(&pag->pag_buf_lock);
+    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                    xfs_buf_hash_params);
+    if (bp) {
+        atomic_inc(&bp->b_hold);
+        goto found;
+    }
+    ...
+    rhashtable_insert_fast(&pag->pag_buf_hash, &new_bp->b_rhash_head,
+                   xfs_buf_hash_params);
+    spin_unlock(&pag->pag_buf_lock);
+    *found_bp = new_bp;
+    return 0;
+  ---
+<font color="red">
+A newly allocated xfs_buf is locked and also reference one.
+</font>
+
 xfs_buf_find  xfs_buf_incore
               xfs_buf_get_map xfs_buf_read_map xfs_buf_readahead_map  [1]
                                                xfs_buf_read           xlog_recover_buffer_pass2 [2]
@@ -424,7 +606,7 @@ Due to the XBF_ASYNC, it will be unlocked by xfs_buf_ioend
         -> lip->li_ops->iop_unlock
            xfs_buf_item_unlock
 
-    In addition, the bp could be unlocked by xfs_trans_brelse.
+    In addition, the bp could be unlocked by xfs_trans_brelse if it not dirty
     xfs_trans_brelse
     ---
     /*
@@ -444,6 +626,496 @@ Due to the XBF_ASYNC, it will be unlocked by xfs_buf_ioend
 
 </font>
 </p>
+
+<h3><a name="xfs_buf_b_hold">b_hold</a></h3>
+<p>
+<font size="2">
+The xfs_buf->b_hold decides the life of a xfs_buf, who will hold and free it ?
+<ul>
+<li> Initial state
+<pre>
+<font color="red">
+<B>
+The initial reference of a xfs_buf is zero.
+</B>
+</font>
+Even though we could see it is set to 1 when initialized,
+_xfs_buf_alloc
+ -> atomic_set(&bp->b_hold, 1)
+
+but when we use xfs_buf_find to insert a newly allocated xfs_buf into pag->pag_buf_hash,
+it will not be referenced again even locked.
+
+xfs_buf_get_maps
+  -> _xfs_buf_alloc
+    -> sema_init(&bp->b_sema, 0); /* held, no waiters */
+  -> xfs_buf_find
+  ---
+    spin_lock(&pag->pag_buf_lock);
+    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                    xfs_buf_hash_params);
+    if (bp) {
+        atomic_inc(&bp->b_hold);
+        goto found;
+    }
+    ...
+    rhashtable_insert_fast(&pag->pag_buf_hash, &new_bp->b_rhash_head,
+                   xfs_buf_hash_params);
+    spin_unlock(&pag->pag_buf_lock);
+    *found_bp = new_bp;
+    return 0;
+  ---
+</pre>
+<li> xfs_buf_find
+<pre>
+<font color="blue">
+One reference will be hold when it is got by xfs_buf_find, and also it will
+locked.
+</font>
+xfs_buf_find
+---
+    spin_lock(&pag->pag_buf_lock);
+    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                    xfs_buf_hash_params);
+    if (bp) {
+        <font color="red">atomic_inc(&bp->b_hold); </font>
+        goto found;
+    }
+...
+found:
+    spin_unlock(&pag->pag_buf_lock);
+    xfs_perag_put(pag);
+
+    if (!xfs_buf_trylock(bp)) {
+        if (flags & XBF_TRYLOCK) {
+            xfs_buf_rele(bp); //<font color="blue">If nowait, put the reference</font>
+            return -EAGAIN;
+        }
+        xfs_buf_lock(bp);
+    }
+...
+---
+The buf lock and reference will be both released by xfs_buf_relse.
+The typical caller of xfs_buf_relse for this case is the xfs_buf_item_unlock.
+
+</pre>
+<li> delwri queue
+<pre>
+<font color="blue">
+One reference will be held when the xfs_buf is added on the delwri_queue
+</font>
+xfs_buf_delwri_queue
+---
+    bp->b_flags |= _XBF_DELWRI_Q;
+    if (list_empty(&bp->b_list)) {
+        atomic_inc(&bp->b_hold);
+        list_add_tail(&bp->b_list, list);
+    }
+---
+For the async case, it will be released by the xfs_buf_ioend.
+For the sync case, the caller will do it, such as,
+xfs_buf_delwri_submit
+---
+    xfs_buf_delwri_submit_buffers(buffer_list, &wait_list);
+
+    /* Wait for IO to complete. */
+    while (!list_empty(&wait_list)) {
+        bp = list_first_entry(&wait_list, struct xfs_buf, b_list);
+
+        list_del_init(&bp->b_list);
+
+        /*
+         * Wait on the locked buffer, check for errors and unlock and
+         * release the delwri queue reference.
+         */
+        error2 = xfs_buf_iowait(bp);
+        xfs_buf_relse(bp);
+<font color="blue">
+        // The xfs_buf_delwri_submit_buffers will lock the buf.
+        // We will release both the lock and reference here.
+</font>
+    }
+---
+
+A special case here is:
+__xfs_buf_submit
+---
+<font color="blue">
+    /*
+     * Grab a reference so the buffer does not go away underneath us. For
+     * async buffers, I/O completion drops the callers reference, which
+     * could occur before submission returns.
+     */
+</font>
+    xfs_buf_hold(bp);
+    ...
+    _xfs_buf_ioapply(bp);
+    ...
+<font color="blue">
+    /*
+     * Release the hold that keeps the buffer referenced for the entire
+     * I/O. Note that if the buffer is async, it is not safe to reference
+     * after this release.
+     */
+</font>
+    xfs_buf_rele(bp);
+---
+</pre>
+<li> buf log item
+<pre>
+The buf's log item will hold one reference.
+
+xfs_buf_item_init
+---
+    bp->b_log_item = bip;
+    xfs_buf_hold(bp);
+---
+
+<font color="blue">
+This is the iodone() function for buffers which have been
+logged.  It is called when they are eventually flushed out.
+</font>
+xfs_buf_iodone
+---
+    xfs_buf_rele(bp);
+
+    spin_lock(&ailp->ail_lock);
+    xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
+    xfs_buf_item_free(BUF_ITEM(lip));
+---
+</pre>
+<li> buf LRU
+<pre>
+When the buf->b_hold reaches zero, it will first add to the buf LRU list.
+xfs_buf_rele
+---
+    release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
+    ...
+    /* the last reference has been dropped ... */
+    if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
+        if (list_lru_add(&bp->b_target->bt_lru, &bp->b_lru)) {
+            bp->b_state &= ~XFS_BSTATE_DISPOSE;
+            <font color="red">atomic_inc(&bp->b_hold);</font>
+        }
+        spin_unlock(&pag->pag_buf_lock);
+---
+
+Then the shrinker callback will release the reference again.
+
+xfs_buftarg_shrink_scan
+---
+    freed = list_lru_shrink_walk(&btp->bt_lru, sc,
+                     xfs_buftarg_isolate, &dispose);
+
+    while (!list_empty(&dispose)) {
+        struct xfs_buf *bp;
+        bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+        list_del_init(&bp->b_lru);
+        <font color="red">xfs_buf_rele(bp); </font>
+    }
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="lifecyle_of_bli">lifecycle of buf log item</a></h4>
+<p>
+<font size="2">
+When a xfs_buf is written, its log item will hold a reference.
+<pre>
+_xfs_trans_bjoin
+  -> xfs_buf_item_init
+    -> xfs_buf_hold(bp)
+  -> xfs_trans_add_item
+
+It will be released when the log item is freed.
+xfs_buf_item_put
+  -> xfs_buf_item_relse
+    -> xfs_buf_rele(bp)
+    -> xfs_buf_item_free
+</pre>
+This will introduce another topic about the xfs_buf log item's bli_refcount.
+<br/>
+A xfs_buf_log_item's bli_refcount is held by
+<ul>
+<li> An active transaction
+<pre>
+_xfs_trans_bjoin
+---
+    atomic_inc(&bip->bli_refcount);
+    xfs_trans_add_item(tp, &bip->bli_item); // add the lp on tp->t_items
+---
+
+<font color="blue">If the buf is dirty</font>
+xfs_log_commit_cil
+  -> xfs_trans_free_items
+    -> xfs_trans_del_item // clear XFS_LI_DIRTY and dequeue from tp->t_items
+    -> .iop_unlock
+       xfs_buf_item_unlock
+         -> xfs_buf_item_put
+         -> <font color="red">xfs_buf_relse</font>
+<font color="blue">else</font>
+xfs_trans_brelse // <font color="red">if no XFS_LI_DIRTY set </font>
+  -> xfs_buf_item_put
+  -> <font color="red">xfs_buf_relse</font>
+---
+    if (!atomic_dec_and_test(&bip->bli_refcount))
+        return false;
+---
+
+<U>The buf log item will only be released at the two cases above under buf's
+lock.</U>
+
+</pre>
+<li> A pined log
+<pre>
+xfs_log_commit_cil
+  -> xlog_cil_insert_items
+    -> xlog_cil_insert_format_items
+      -> lip->li_ops->iop_format(lip, lv)
+      -> xfs_cil_prepare_item
+        -> lv->lv_item->li_ops->iop_pin(lv->lv_item);
+           xfs_buf_item_pin
+           ---
+           atomic_inc(&bip->bli_refcount);
+           atomic_inc(&bip->bli_buf->b_pin_count);
+           ---
+This reference will be released when unpin.
+
+xlog_cil_committed
+  -> xfs_trans_committed_bulk
+    -> .iop_unpin
+       xfs_buf_item_unpin
+---
+    freed = atomic_dec_and_test(&bip->bli_refcount);
+---
+
+<U>In normal case, the buf log item will not be released at this case, even though
+its refcount has reached zero.</U>
+</pre>
+</ul>
+The path that could release a buf log item
+<ul>
+<li> xfs_buf_iodone
+<pre>
+[ 1803.455740]  xfs_buf_item_free+0xe/0x40 [xfs]
+[ 1803.455829]  xfs_buf_do_callbacks+0x1c/0x70 [xfs]
+[ 1803.455919]  xfs_buf_iodone_callbacks+0xef/0x470 [xfs]
+[ 1803.455933]  process_one_work+0x1e9/0x610
+[ 1803.455951]  worker_thread+0x4c/0x430
+[ 1803.455974]  kthread+0x101/0x140
+[ 1803.455994]  ret_from_fork+0x24/0x30
+</pre>
+<li> got by a transaction but not dirtied
+<pre>
+[ 1805.943251]  xfs_buf_item_free+0xe/0x40 [xfs]
+[ 1805.943349]  xfs_buf_item_put+0x4d/0x90 [xfs]
+[ 1805.943449]  xfs_trans_brelse+0x112/0x180 [xfs]
+[ 1805.943523]  xfs_btree_del_cursor+0x2b/0x70 [xfs]
+[ 1805.943602]  xfs_dialloc_ag+0x230/0x270 [xfs]
+[ 1805.943694]  xfs_dialloc+0x47/0x230 [xfs]
+[ 1805.943794]  xfs_ialloc+0x5d/0x560 [xfs]
+[ 1805.943897]  xfs_dir_ialloc+0x4f/0x1c0 [xfs]
+[ 1805.943996]  xfs_create+0x48e/0x740 [xfs]
+[ 1805.944096]  xfs_generic_create+0x20f/0x2d0 [xfs]
+[ 1805.944128]  lookup_open+0x677/0x750
+[ 1805.944167]  path_openat+0x2ff/0xbd0
+[ 1805.944193]  do_filp_open+0x8a/0xf0
+[ 1805.944286]  do_sys_open+0x11c/0x1f0
+[ 1805.944307]  do_syscall_64+0x54/0x190
+[ 1805.944315]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+</pre>
+</ul>
+
+
+</font>
+</p>
+
+<h4><a name="xfs_trans_binval">xfs_trans_binval</a></h4>
+<p>
+<font size="2">
+
+Quote from comment of xfs_trans_binval.
+<pre>
+Invalidate a buffer that is being used within a transaction.
+Typically this is because the blocks in the buffer are being freed, so we
+need to prevent it from being written out when we're done.  Allowing it
+to be written again might overwrite data in the free blocks if they are
+reallocated to a file.
+</pre>
+
+
+free an unused block on the bt
+<pre>
+xfs_btree_free_block
+  -> cur->bc_ops->free_block(cur, bp)
+<font color="blue">
+    // At this point, the buf is locked by ourself, but it could be pinned by others.
+    // And the buf maybe under IO to log or disk.
+</font>
+  -> xfs_trans_binval(cur->bc_tp, bp)
+
+Process of free a block
+<font size="1">
+xfs_bmbt_ops.free_block
+xfs_bmbt_free_block
+  -> xfs_bmap_add_free
+    -> __xfs_bmap_add_free
+      -> xfs_defer_add(tp, XFS_DEFER_OPS_TYPE_FREE, &new->xefi_list)
+
+xfs_extent_free_defer_type.finish_item
+
+xfs_extent_free_finish_item
+  -> xfs_trans_free_extent
+    -> __xfs_free_extent
+      -> xfs_free_extent_fix_freelist
+      -> xfs_free_ag_extent
+      -> xfs_extent_busy_insert
+</font>
+</pre>
+
+<ul>
+<li> mark it stable
+<pre>
+    - bp->b_flags |= XBF_STALE;
+    - bip->bli_flags |= XFS_BLI_STALE;
+
+</pre>
+<li> keep the buffer locked, prevent others from reusing this buffer.
+<pre>
+xfs_buf_item_unlock
+---
+    bool            stale = bip->bli_flags & XFS_BLI_STALE;
+    ...
+    released = xfs_buf_item_put(bip);
+<font color="blue">
+    // the buffer will be locked until the final unpin.
+</font>
+    if (hold || (stale && !released))
+        return;
+---
+
+<U>What if others wait for this buffer on xfs_buf_find ?</U>
+</pre>
+<li> set XFS_BLF_CANCEL
+<pre>
+We also set the XFS_BLF_CANCEL flag in the buf log format structure and log
+the buf item.  This will be used at recovery time to determine that copies
+of the buffer in the log before this should not be replayed.
+
+xfs_buf_item_format
+  -> xfs_buf_item_format_segment
+  ---
+    if (bip->bli_flags & XFS_BLI_STALE) {
+<font color="blue">
+        /*
+         * The buffer is stale, so all we need to log
+         * is the buf log format structure with the
+         * cancel flag in it.
+         */
+</font>
+        return;
+    }
+  ---
+</pre>
+<li> set_bit(XFS_LI_DIRTY, &bip->bli_item.li_flags)
+<pre>
+This buffer will be logged and pined, then others will not try to push it to disk.
+And we have locked the buffer, so nobody else could pin it again.
+
+xfs_buf_item_unpin
+---
+    freed = atomic_dec_and_test(&bip->bli_refcount);
+
+    if (atomic_dec_and_test(&bp->b_pin_count))
+        wake_up_all(&bp->b_waiters);
+
+    if (freed && stale) {
+        ...
+        if (bip->bli_flags & XFS_BLI_STALE_INODE) {
+            xfs_buf_do_callbacks(bp);
+            bp->b_log_item = NULL;
+            list_del_init(&bp->b_li_list);
+            bp->b_iodone = NULL;
+        } else {
+            spin_lock(&ailp->ail_lock);
+<font color="red">
+            xfs_trans_ail_delete(ailp, lip, SHUTDOWN_LOG_IO_ERROR);
+</font>
+            xfs_buf_item_relse(bp);
+        }
+<font color="blue">
+        // unlock and release the reference.
+        // we lock the buffer before xfs_trans_binval
+        // during this, nobody could reuse it again.
+</font>
+        xfs_buf_relse(bp);
+    } 
+---
+</pre>
+</ul>
+
+xfs_trans_binval will prevent the metadata buffer whose block has been released
+to block free space from being written to disk.
+<pre>
+A btree update removes a block from the btree.
+
+xfs_btree_free_block
+  -> cur->bc_ops->free_block(cur, bp)
+    -> xfs_bmbt_free_block
+      -> xfs_bmap_add_free
+        -> xfs_defer_add(tp, XFS_DEFER_OPS_TYPE_FREE, &new->xefi_list);
+  -> xfs_trans_binval(cur->bc_tp, bp)
+
+
+        [1]                         [2]                       [3]                 [4]
+EFI log -> EFD log                  -> agl, agfl, cntbt bnobt -> remove from busy  -> flush update on
+           Update free space bt        components buffer log     extent list          agl, agfl, cntbt   
+           bnobt & cntbt               EFD log                                        bnobt to disk
+           insert to busy extent list                            
+           [5]                                                   
+\___ ___/\________________________ ____________________________/ 
+    V                             V                              
+  Trans0                        Trans1                           
+\____________________________ _________________________________/\_________ ________/\______ ______/
+                             V                                            V                V
+                 Context of fs operations                           log IO complete   AIL push context
+                                                                     context
+[1] xfs_trans_roll
+[2] commit log
+[3] log IO complete
+[4] insert log item into AIL
+[5] xfs_extent_free_finish_item
+      -> xfs_trans_free_extent
+        -> __xfs_free_extent
+          -> xfs_free_ag_extent
+          -> xfs_extent_busy_insert
+
+When the xfs_btree_free_block is invoked, the update on the btree has been
+completed, IOW, nobody could get the block from the btree anymore.
+
+Moreover, when we update the btree, what to preserve the serialisation ?
+
+<U>xfs_bmapi_write is invoked under xfs_ilock(ip, XFS_ILOCK_EXCL)</U>
+
+If the block used to be a block in a block map btree,
+ - all the udpate saved in the buffer will not be flushed to disk
+ - all the log recorded will not be replayed during recovery.
+ - no one could get it again in the block map btree
+
+There maybe someone gets this buffer of the freed block.
+xfs_buf_find
+---
+    if (bp->b_flags & XBF_STALE) {
+        bp->b_flags &= _XBF_KMEM | _XBF_PAGES;
+        <font color="red">bp->b_ops = NULL; </font>
+    }
+---
+</pre>
+</font>
+</p>
+
 
 
 
@@ -2252,6 +2924,153 @@ be release finally.
 
 </font>
 </p>
+<h3><a name="delayed_log">Delayed log</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+
+<B>Delayed log on CIL</B><br/>
+We have two points about the delayed log
+<ul>
+<li> Accumulate
+<pre>
+xfs_log_commit_cil // under read cil->xc_ctx_lock, lock out background commit
+  -> xlog_cil_insert_items
+    -> xlog_cil_insert_format_items
+    ---
+    if (lip->li_lv && shadow->lv_size <= lip->li_lv->lv_size) {
+            /* same or smaller, optimise common overwrite case */
+            ...
+            /* reset the lv buffer information for new formatting */
+            lv->lv_buf_len = 0;
+            lv->lv_bytes = 0;
+            lv->lv_buf = (char *)lv +
+                    xlog_cil_iovec_space(lv->lv_niovecs);
+        } else {
+            /* switch to shadow buffer! */
+            lv = shadow;
+            lv->lv_item = lip;
+        }
+<font color="blue">
+        // format log on the previous lv, so the previous log will be over-written.
+</font>
+        lip->li_ops->iop_format(lip, lv);
+    ---
+<font color="red">
+Does the new log contain the previous log ? (The answer should be YES)
+</font>
+
+Let's take buf log item as example.
+
+The buf will be logged based on a dirty data bitmap.
+xfs_buf_item_format
+  -> xfs_buf_item_format_segment
+
+This dirty data bitmap is set by
+
+xfs_trans_log_buf
+  -> xfs_buf_item_log
+    -> xfs_buf_item_log_segment
+
+When we dirty a buf and format the log again, the new formatted log contains the
+previous one, because <font color="red">nobody clears the dirty data bitmap.</font>
+
+Note:
+The buf log item's blf_data_map will not be cleared during the whole life time
+of the buf log item. The buf log item will be released by xfs_buf_iodone. When a
+buf log item is reallocated, the blf_data_map is clean.
+
+</pre>
+<li> Delayed
+<pre>
+Delayed log could accumulate multiple log on a same object together and <font color="red">reduce the
+final IO to disk.</font> That's the key.
+
+After we format the log and put the lvs on ctx->xc_cil list,
+we will try to push the background log writting.
+xlog_cil_push_background
+---
+<font color="blue">
+    /*
+     * don't do a background push if we haven't used up all the
+     * space available yet.
+     */
+</font>
+    if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log))
+        return;
+
+    spin_lock(&cil->xc_push_lock);
+    if (cil->xc_push_seq < cil->xc_current_sequence) {
+        cil->xc_push_seq = cil->xc_current_sequence;
+        queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+    }
+    spin_unlock(&cil->xc_push_lock);
+---
+
+</pre>
+</ul>
+
+
+<B>Delayed metadata writeout on AIL</B><br/>
+<pre>
+xfs_log_reserve/regrant
+  -> xlog_grant_push_ail
+<font color="red">
+  // push on the buffer cache code if we ever use more 
+  // than 75% of the on-disk log space
+</font>
+    -> xfs_ail_push
+      -> wake_up_process(ailp->ail_task)
+
+xfsaild
+  -> xfsaild_push
+  ---
+    while ((XFS_LSN_CMP(lip->li_lsn, target) <= 0)) {
+        lock_result = xfsaild_push_item(ailp, lip);
+        switch (lock_result) {
+        case XFS_ITEM_SUCCESS:
+            ailp->ail_last_pushed_lsn = lsn;
+            break;
+
+        case XFS_ITEM_FLUSHING:
+            flushing++;
+            ailp->ail_last_pushed_lsn = lsn;
+            break;
+
+        case XFS_ITEM_PINNED:
+            stuck++;
+            ailp->ail_log_flush++;
+            break;
+        case XFS_ITEM_LOCKED:
+            stuck++;
+            break;
+        default:
+            ASSERT(0);
+            break;
+        }
+
+        count++;
+
+        if (stuck > 100)
+            break;
+
+        lip = xfs_trans_ail_cursor_next(ailp, &cur);
+        if (lip == NULL)
+            break;
+        lsn = lip->li_lsn;
+    }
+    xfs_trans_ail_cursor_done(&cur);
+    spin_unlock(&ailp->ail_lock);
+
+<font color="blue">
+    //accumulate the IOs and write out together
+</font>
+    if (xfs_buf_delwri_submit_nowait(&ailp->ail_buf_list))
+        ailp->ail_log_flush++;
+  ---
+</pre>
+</font>
+</p>
 
 <h3><a name="log_miscs">miscs</a></h3>
 <hr style="height:5px;border:none;border-top:2px solid black;" />
@@ -2739,6 +3558,165 @@ jbd2_journal_commit_transaction
 </font>
 </p>
 
+
+<h2><a name="AG_free_inode_managment">AG free inode managment</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2"
+The key that xfs could support <U>Large Number</U> of files
+<ul>
+<li> 64 bit inode number
+<pre>
+AG relative inode numbers always fit within 32 bits.
+
+Relative inode number
+
+                      sb_agblkg      sb_inoplog
+                   |---------------|------------|
+
+Absolute inode number
+
+       AG number
+  |----------------|---------------|-------------|
+
+
+sb_agblkg     log 2 value of sb_agblocks
+              sb_agblocks is size of each AG in blocks
+
+sb_inopblog   log 2 value of sb_inopblock.
+              sb_inopblock is number of inodes per block.
+              This is equivalent to sb_blocksize /sb_inodesize.
+
+sb_blocksize  The size of a basic unit of space allocation in bytes.
+              Typically, this is 4096 (4KB) but can range from 512 to
+              65536 bytes.
+
+sb_inodesize  Size of the inode in bytes. The default is 256 (2 inodes
+              per standard sector) but can be made as large as 2048 bytes
+              when creating the filesystem. On a v5 filesystem, the default
+              and minimum inode size are both 512 bytes
+
+Actually, the inode number is related the block that contains the on-disk inode strcuture.
+<font color="red">
+      inode number = AG relative block number << sb_inoplog | index in the block
+</font>
+
+So the maxinum of inode number in a AG is related with the size of block and inode.
+</pre>
+ 
+<li> Dynamically allocates inodes as needed
+<pre>
+Rather than statically pre-allocating the inodes (eg. EXT4)for all of these files, XFS
+dynamically allocates inodes as needed.
+
+Inodes are traditionally allocated in chunks of 64. The inode allocation B+ tree in each
+AG keeps track of these chunks and whether each inode within a chunk is in use. 
+
+The inode location is actually the inode number, namely, <font color="red">We could get the
+position of the inode from its inode id</font>
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="Inode_allocation">Inode allocation</a></h3>
+<p>
+<font size="2">
+<pre>
+xfs_dialloc
+---
+    xfs_ialloc_ag_select //<font color="blue">select an AG</font>
+
+    for (;;) {
+        xfs_ialloc_read_agi(mp, tp, agno, &agbp);
+        if (pag->pagi_freecount) {
+            xfs_perag_put(pag);
+            goto out_alloc;
+        }
+        xfs_ialloc_ag_alloc(tp, agbp, &ialloced);
+        if (ialloced) {
+<font color="blue">
+            /*
+             * We successfully allocated some inodes, return
+             * the current context to the caller so that it
+             * can commit the current transaction and call
+             * us again where we left off.
+             */
+</font>
+            ASSERT(pag->pagi_freecount > 0);
+            xfs_perag_put(pag);
+
+            *IO_agbp = agbp;
+            *inop = NULLFSINO;
+            return 0;
+        }
+    }
+
+out_alloc:
+    *IO_agbp = NULL;
+    return xfs_dialloc_ag(tp, agbp, parent, inop);
+---
+
+Firstly, we need to allocate chunk of inodes (64) and insert them into the inode
+allocation btree. Then xfs_dialloc_ag will be invoked to allocated inode from
+the btree.
+
+As the allocate and free go on repeatedly, there will be holes in the chunk.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="Policy_to_select_AG">Policy to select AG</a></h3>
+<p>
+<font size="2">
+The policy to select AG
+<ul>
+<li> Trying to distribute the inode of <U>directories</U> across all the AGs.
+<li> For other files, such as regular files, symlink, their inodes will be
+     allocated from the AG same with its parent's (a directory)one.
+<pre>
+xfs_dialloc
+  -> xfs_ialloc_ag_select
+  ---
+    if (S_ISDIR(mode))
+        pagno = xfs_ialloc_next_ag(mp);
+    else {
+        pagno = XFS_INO_TO_AGNO(mp, parent);
+        if (pagno >= agcount)
+            pagno = 0;
+    }
+  ---
+For the policy of directories, <U>it is good for parallelism in managment of free
+space and inode allocation.</U>
+
+For the 2nd policy, it works well for keeping directories of small files clustered
+together on disk. 
+
+</pre>
+</ul>
+
+<pre>
+For large files, we try to
+allocate extents initially near the inode and afterwards
+near the existing block in the file which is closest to
+the offset in the file for which we are allocating space
+
+That implies blocks will be allocated near the last
+block in the file for sequential writers and near blocks
+in the middle of the file for processes writing into
+holes
+
+Files and directories are not limited to allocating
+space within a single allocation group, however
+</pre>
+
+
+
+</font>
+</p>
+
 <h2><a name="BT">B Tree</a></h2>
 <hr style="height:5px;border:none;border-top:2px solid black;" />
 
@@ -2783,6 +3761,20 @@ xfs_btree_lookup
 ---
 </pre>
 <li> key_diff, compare the key
+
+<li> update_lastrec
+<pre>
+bnobt and cntbt, or more strictly, only cntbt use this callback to update
+the agf_longest, which indicates the longest free block extent in this ag.
+(bnobt and cntbt have the same callabck, but only cntbt has
+ XFS_BTREE_LASTREC_UPDATE based on xfs_allocbt_init_cursor, then xfs_btree_is_lastrec
+ will return false for bnobt)
+
+It is easily understood that the last record of cntbt is the longest free block
+extent. xfs_allocbt_update_lastrec will update the agf->agf_longest.
+
+
+</pre>
 </ul>
 
 </font>

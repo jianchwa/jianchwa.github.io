@@ -18,6 +18,7 @@
 <li><a href="#cpu_mask">cpu_mask</a>
 <li><a href="#managed_irq">managed irq</a>
 <li><a href="#irqbalance">irqbalance</a>
+<li><a href="#x86_irq_vector">x86 irq vector</a>
 </ul>
 </ul>
 </font>
@@ -623,6 +624,61 @@ rebalanced from top to down.
 
 </font>
 </p
+
+<h2><a name="x86_irq_vector">x86 irq vector</a></h2>
+<p>
+<font size="2">
+<pre>
+x86 assign irq vector
+
+For managed vector,
+assign_managed_vector
+---
+    cpumask_and(vector_searchmask, vector_searchmask, affmsk);
+    cpu = cpumask_first(vector_searchmask);
+    ...
+    vector = irq_matrix_alloc_managed(vector_matrix, cpu);
+    if (vector < 0)
+        return vector;
+    apic_update_vector(irqd, vector, cpu);
+    apic_update_irq_cfg(irqd, vector, cpu);
+---
+
+For other,
+assign_vector_locked
+  -> irq_matrix_alloc
+---
+<font color="blue">
+    // select the cpu with least irq assigned.
+</font>
+    for_each_cpu(cpu, msk) {
+        cm = per_cpu_ptr(m->maps, cpu);
+
+        if (!cm->online || cm->available <= maxavl)
+            continue;
+
+        best_cpu = cpu;
+        maxavl = cm->available;
+    }
+    if (maxavl) {
+        cm = per_cpu_ptr(m->maps, best_cpu);
+        bit = matrix_alloc_area(m, cm, 1, false);
+        if (bit < m->alloc_end) {
+            cm->allocated++;
+            cm->available--;
+            m->total_allocated++;
+            m->global_available--;
+            if (reserved)
+                m->global_reserved--;
+            *mapped_cpu = best_cpu;
+            trace_irq_matrix_alloc(bit, best_cpu, m, cm);
+            return bit;
+        }
+    }
+---
+</pre>
+</font>
+</p>
 
 </body>
 </html>
