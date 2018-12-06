@@ -10,6 +10,7 @@
 </div>
 <p>
 <font size="2">
+<a href="#writeback">writeback</a><br/>
 <a href="#BH">BH</a>
 <ul>
 <li><a href="#bh2bio">bh to bio</a>
@@ -33,6 +34,170 @@
 </font>
 </p>
 
+<h2><a name="writeback">writeback</a></h2>
+<p>
+<font size="2">
+<pre>
+wb_do_writeback
+<ul>
+<li> work item queued by wb_queue_work
+<pre>
+__writeback_inodes_sb_nr // input wb_writeback_work.nr_pages
+OR
+sync_inodes_sb // wb_writeback_work.nr_pages is LONG_MAX
+               // for_sync = 1
+  -> bdi_split_work_to_wbs
+    -> wb_queue_work
+
+Both of above push the writeback on the sb (a fs)
+
+Some filesystem interfaces will invoke them with WB_REASON_FS_FREE_SPACE.
+</pre>
+<li> start_all
+<pre>
+
+laptop_mode_timer_fn
+  -> wakeup_flusher_threads_bdi
+    -> __wakeup_flusher_threads_bdi
+      -> wb_start_writeback
+        -> set WB_start_all
+        -> wb_wakeup
+
+SYSCALL sync / pm_suspend->enter_state
+  -> ksys_sync
+OR
+<font color="red">
+shrink_inactive_list  // WB_REASON_VMSCAN
+</font>
+    -> wakeup_flusher_threads //iterate bdi_list
+      -> __wakeup_flusher_threads_bdi //iterate all the dirty wb
+        -> wb_start_writeback
+          -> set WB_start_all
+          -> wb_wakeup
+
+Start flush on all of bdi
+</pre>
+<li> periodic (kupdate style)
+<pre>
+__mark_inode_dirty
+<font color="blue">
+    // If this is the first dirty inode for this bdi,
+    // we have to wake-up the corresponding bdi thread
+    // to make sure background write-back happens
+    // later.
+</font>
+  -> wb_wakeup_delayed
+
+wb_workfn
+---
+    if (!list_empty(&wb->work_list))
+        wb_wakeup(wb);
+    else if (wb_has_dirty_io(wb) && dirty_writeback_interval)
+        wb_wakeup_delayed(wb);
+---
+
+unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
+
+5s
+
+</pre>
+<li> background
+<pre>
+Actually, no explicit background writeback trigger.
+Just need to wb_wakeup.
+Then wb_do_writeback will check itself.
+wb_do_writeback
+  -> wb_check_background_flush
+---
+    if (wb_over_bg_thresh(wb)) {
+
+        struct wb_writeback_work work = {
+            .nr_pages    = LONG_MAX,
+            .sync_mode    = WB_SYNC_NONE,
+            .for_background    = 1,
+            .range_cyclic    = 1,
+            .reason        = WB_REASON_BACKGROUND,
+        };
+
+        return wb_writeback(wb, &work);
+    }
+---
+
+balance_dirty_pages will try to trigger background writeback.
+balance_dirty_pages
+  -> wb_start_background_writeback
+    -> wb_wakeup
+</pre>
+</ul>
+
+The main difference between such writeback method is how many pages that can be
+written out.
+For example,
+<ul>
+<li> period (kupdate)
+<pre>
+It will try to write out the dirtied inode that has been expired.
+wb_writeback
+---
+    oldest_jif = jiffies;
+    work->older_than_this = &oldest_jif;
+
+    blk_start_plug(&plug);
+    spin_lock(&wb->list_lock);
+    for (;;) {
+        ...
+        if (work->for_kupdate) {
+            oldest_jif = jiffies -
+                <font color="red">msecs_to_jiffies(dirty_expire_interval * 10); </font>
+        }
+        ...
+        if (list_empty(&wb->b_io))
+            queue_io(wb, work);
+             -> move_expired_inodes(&wb->b_dirty, &wb->b_io, 0, work);
+             ---
+             if ((flags & EXPIRE_DIRTY_ATIME) == 0)
+                 older_than_this = work->older_than_this;
+             ...
+             while (!list_empty(delaying_queue)) {
+                 inode = wb_inode(delaying_queue->prev);
+                 if (older_than_this &&
+                     inode_dirtied_after(inode, *older_than_this))
+                     break;
+                 list_move(&inode->i_io_list, &tmp);
+                 moved++;
+                 ...
+             }
+             ---
+
+unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+
+3s
+
+So the dirty expire time is 30s
+
+</pre>
+<li> background
+<pre>
+For background, wb_writeback will update oldest_jif every time, so all of the
+dirtied inode could be moved to wb->b_io.
+The key point here is
+wb_writeback
+---
+<font color="blue">
+        /*
+         * For background writeout, stop when we are below the
+         * background dirty threshold
+         */
+</font>
+        if (work->for_background && !wb_over_bg_thresh(wb))
+            break;
+---
+</pre>
+</ul>
+
+</pre>
+</font>
+</pre>
 
 <h2><a name="BH">BH</a></h2>
 <p>

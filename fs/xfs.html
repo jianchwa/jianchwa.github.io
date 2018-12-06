@@ -13,6 +13,7 @@
 <a href="#block_map">block map</a>
 <ul>
 <li><a href="#allocate_block">allocate block</a>
+<li><a href="#speculative_preallocation">speculative preallocation</a>
 </ul>
 <a href="#per-ag_metadata_buffer">per-ag metadata buffer</a>
 <ul>
@@ -51,6 +52,7 @@
 <li><a href="#intent_log_recover">intent log recover</a>
 </ul>
 <li><a href="#delayed_log">Delayed log</a>
+<li><a href="#push_log">push log</a>
 <li><a href="#log_miscs">miscs</a>
 </ul>
 <a href="#AG_free_space_management">AG free space management</a>
@@ -73,6 +75,12 @@
 <li><a href="#xfs_btree_lookup">xfs_btree_lookup</a>
 </ul>
 <a href="#reflink">reflink</a><br/>
+<ul>
+<li><a href="#work_process">work process</a>
+<li><a href="#orphan_records">orphan records</a>
+<li><a href="#speculative_preallocation_2">speculative preallocation on COW</a>
+<li><a href="#COW_Unwritten">COW Unwritten</a>
+</ul>
 
 </font>
 </p>
@@ -311,6 +319,166 @@ Look at the code of xfs_alloc_vextent
     }
 
 ---
+
+</pre>
+</font>
+</p>
+
+<h4><a name="speculative_preallocation">speculative preallocation</a></h4>
+<p>
+<font size="2">
+<ul>
+<li> extent size hint
+<pre>
+xfs_bmap_btalloc
+---
+    if (ap->flags & XFS_BMAPI_COWFORK)
+<font color="red">
+        align = xfs_get_cowextsz_hint(ap->ip);
+</font>
+    else if (xfs_alloc_is_userdata(ap->datatype))
+        align = xfs_get_extsz_hint(ap->ip);
+
+    if (align) {
+        error = xfs_bmap_extsize_align(mp, &ap->got, &ap->prev,
+                        align, 0, ap->eof, 0, ap->conv,
+<font color="red">
+                        &ap->offset, &ap->length);
+</font>
+<font color="blue">
+        // ap->offset and ap->length will be adjusted here.
+        // ap->got and ap->prev are separately the next and previous extent.
+        // xfs_bmap_extsize_align will ensure there is no overlap between the
+        // new extent and the originally next and previous extent.
+</font>
+    }
+---
+</pre>
+<li> EOF preallocation
+<pre>
+xfs_file_iomap_begin_delay
+---
+    if (eof) {
+        prealloc_blocks = xfs_iomap_prealloc_size(ip, offset, count,
+                &icur);
+        if (prealloc_blocks) {
+            xfs_extlen_t    align;
+            xfs_off_t    end_offset;
+            xfs_fileoff_t    p_end_fsb;
+
+            end_offset = XFS_WRITEIO_ALIGN(mp, offset + count - 1);
+            p_end_fsb = XFS_B_TO_FSBT(mp, end_offset) +
+                    prealloc_blocks;
+
+            align = xfs_eof_alignment(ip, 0);
+            if (align)
+                p_end_fsb = roundup_64(p_end_fsb, align);
+
+            p_end_fsb = min(p_end_fsb, maxbytes_fsb);
+            ASSERT(p_end_fsb > offset_fsb);
+            prealloc_blocks = p_end_fsb - end_fsb;
+        }
+    }
+
+retry:
+    error = xfs_bmapi_reserve_delalloc(ip, XFS_DATA_FORK, offset_fsb,
+            end_fsb - offset_fsb, prealloc_blocks, &got, &icur,
+            eof);
+---
+
+   original file    preallocated
+     ____^____     ______^_______
+    /         \   /              \
+    |_________|_ _|_ _ _ _ _ _ _ |
+              \_ _/
+                v
+            want write
+
+    When flush the pagecache to disk, real blocks will be allocated.
+
+     original file 
+     ____^____ 
+    /         \
+    |_________|__________________|
+              \________ _________/
+                       v
+              more contiguous blocks
+
+<font color="blue">
+    // A bigger extent will be added and when write the pages to disk and
+    // allocate real blocks for it, more blocks will be allocated and hence less
+    // fragmentation when there are multiple <U>concurrent writters.</U>
+</font>
+</pre>
+</ul>
+Reclaim of EOF blocks,
+<pre>
+xfs_icache_free_eofblocks
+  -> __xfs_icache_free_eofblocks
+    -> xfs_inode_ag_iterator_tag
+      -> xfs_inode_ag_walk //iterate radix tree pag->pag_ici_root
+        -> xfs_inode_free_eofblocks
+          -> xfs_free_eofblocks // under XFS_IOLOCK_EXCL
+            -> xfs_itruncate_extents_flags(&tp, ip, XFS_DATA_FORK,
+                    XFS_ISIZE(ip), XFS_BMAPI_NODISCARD)
+<font color="red">
+Free any blocks beyond EOF.
+</font>
+</pre>
+The time that triggers xfs_icache_free_eofblocks
+<ul>
+<li> xfs_file_buffered_aio_write (directly reclaim)
+<pre>
+xfs_file_buffered_aio_write
+---
+write_retry:
+    iolock = XFS_IOLOCK_EXCL;
+    xfs_ilock(ip, iolock);
+    ...
+    ret = iomap_file_buffered_write(iocb, from, &xfs_iomap_ops);
+    if (likely(ret >= 0))
+        iocb->ki_pos += ret;
+<font color="blue">
+    /*
+     * If we hit a space limit, try to free up some lingering preallocated
+     * space before returning an error. In the case of ENOSPC, first try to
+     * write back all dirty inodes to free up some of the excess reserved
+     * metadata space.
+     */
+</font>
+    if (ret == -EDQUOT && !enospc) {
+        xfs_iunlock(ip, iolock);
+        enospc = xfs_inode_free_quota_eofblocks(ip);
+        if (enospc)
+            goto write_retry;
+        enospc = xfs_inode_free_quota_cowblocks(ip);
+        if (enospc)
+            goto write_retry;
+        iolock = 0;
+    } else if (ret == -ENOSPC && !enospc) {
+        struct xfs_eofblocks eofb = {0};
+
+        enospc = 1;
+        xfs_flush_inodes(ip->i_mount);
+
+        xfs_iunlock(ip, iolock);
+        eofb.eof_flags = XFS_EOF_FLAGS_SYNC;
+        xfs_icache_free_eofblocks(ip->i_mount, &eofb);
+        xfs_icache_free_cowblocks(ip->i_mount, &eofb);
+        goto write_retry;
+    }
+---
+</pre>
+<li> periodic background
+<pre>
+xfs_eofblocks_worker
+---
+    xfs_icache_free_eofblocks(mp, NULL);
+    xfs_queue_eofblocks(mp);
+---
+</pre>
+<li> ioctl XFS_IOC_FREE_EOFBLOCKS
+</ul>
 
 </pre>
 </font>
@@ -3072,6 +3240,166 @@ xfsaild
 </font>
 </p>
 
+<h3><a name="push_log">push log</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+cil->xc_push_seq  //The seq need to be pushed.
+<ul>
+<li> xlog_cil_push_now
+<pre>
+xlog_cil_force_lsn
+  -> xlog_cil_push_now
+---
+    /* start on any pending background push to minimise wait time on it */
+    flush_work(&cil->xc_push_work);
+
+    /*
+     * If the CIL is empty or we've already pushed the sequence then
+     * there's no work we need to do.
+     */
+    spin_lock(&cil->xc_push_lock);
+    if (list_empty(&cil->xc_cil) || push_seq <= cil->xc_push_seq) {
+        spin_unlock(&cil->xc_push_lock);
+        return;
+    }
+<font color="red">
+    cil->xc_push_seq = push_seq;
+</font>
+    queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+    spin_unlock(&cil->xc_push_lock);
+---
+</pre>
+<li >xlog_cil_push_background
+<pre>
+<font color="blue">
+    // don't do a background push if we haven't used up all the
+    // space available yet.
+    // note !
+    // cil->xc_ctx is the current xfs_cil_ctx that could receive lvs.
+    // cil->xc_current_sequence is the seq of this ctx.
+    
+</font>
+    if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log))
+        return;
+
+    spin_lock(&cil->xc_push_lock);
+    if (cil->xc_push_seq < cil->xc_current_sequence) {
+        cil->xc_push_seq = cil->xc_current_sequence;
+        queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+    }
+    spin_unlock(&cil->xc_push_lock)
+</pre>
+</ul>
+
+Every time xlog_cil_push runs, it will do following things,
+<pre>
+[1] under down_write of cil->xc_ctx_lock
+[2] under spin_lock of cil->xc_push_lock
+</pre>
+<ul>
+<li> check whether we need to run [1][2]
+<pre>
+    cil->xc_push_seq < cil->xc_ctx->sequence ?
+
+    cil->xc_cil empty ?
+</pre>
+<li> add cil->xc_ctx to cil->xc_committing [1][2]
+<pre>
+    as we know, cil->xc_ctx is the current ctx that could receive lvs,
+    cil->xc_committing contains the ctx's that are being committing.
+</pre>
+<li> take down the lvs from the log items linked on cil->xc_cil. [1]
+<pre>
+    The log items are queued on cil->xc_cil by __xfs_trans_commit.
+    __xfs_trans_commit
+      -> xfs_log_commit_cil //<font color="red">down_read cil->xc_ctx_lock</font>
+        -> xlog_cil_insert_items
+        ---<font color="blue">//under cil->xc_cil_lock</font>
+        list_for_each_entry(lip, &tp->t_items, li_trans) {
+        if (!list_is_last(&lip->li_cil, &cil->xc_cil))
+            list_move_tail(&lip->li_cil, &cil->xc_cil);
+        }
+        ---
+<font color="blue">
+    Therefore, the log items committed by __xfs_trans_commit must be in one ctx.
+    In the other word, the log items in one transaction must be in one ctx.
+    <U>But an exception is xfs_trans_roll which amount to a transaction commit.</U>
+</font>
+    The transaction rolling is mainly used by xfs_defer_finish.
+    And xfs_defer_finish mainly used in following scenarios,
+     - xfs_itruncate_extents_flags
+     - xfs_reflink_end_cow
+     - xfs_reflink_remap_extent
+</pre>
+<li> install a new ctx [1]
+<pre>
+    Get a sequence from the pervious one. (ctx->seqeunce + 1)
+    Install the new one on cil->xc_ctx
+</pre>
+<li> update cil->xc_current_sequence [1][2]
+<li> write log
+<pre>
+Log format of a transaction
+
+      < start-oph >< oph >< trans-hdr >< oph >< reg1 >< oph >...< commit-oph >
+      [1]                                                         [2]
+
+[1]
+   xlog_cil_push
+     -> xlog_write
+       -> xlog_write_start_rec
+          clear XLOG_TIC_INITED of ctx->ticket
+
+[2]
+   xlog_cil_push
+     -> xfs_log_done //ctx->ticket->t_flags & XLOG_TIC_INITED == 0
+       -> xlog_commit_record
+
+All of the oph's have a same oh_tid, <font color="red">Transaction ID</font>
+This transaction id comes from,
+     xlog_cil_push
+       -> xlog_cil_ticket_alloc
+         -> xlog_ticket_alloc
+         ---
+<font color="red">
+        tic->t_tid        = prandom_u32();
+</font>
+         ---
+
+    xfs_trans_roll
+      -> __xfs_trans_commit
+      -> xfs_trans_reserve
+        -> xfs_log_regrant
+        ---
+<font color="blue">
+    /*
+     * This is a new transaction on the ticket, so we need to change the
+     * transaction ID so that the next transaction has a different TID in
+     * the log. Just add one to the existing tid so that we can see chains
+     * of rolling transactions in the log easily.
+     */
+</font>
+    tic->t_tid++;
+        ---
+
+And only XLOG_COMMIT_TRANS, the log could be recovered by the recovery process.
+    xlog_recovery_process_trans
+    ---
+    case XLOG_COMMIT_TRANS:
+        error = xlog_recover_commit_trans(log, trans, pass,
+                          buffer_list);
+        /* success or fail, we are now done with this transaction. */
+        freeit = true;
+        break;
+
+    ---
+</pre>
+</ul>
+</font>
+</p>
+
+
 <h3><a name="log_miscs">miscs</a></h3>
 <hr style="height:5px;border:none;border-top:2px solid black;" />
 <p>
@@ -3931,11 +4259,10 @@ xfs_btree_lookup will iterate the btree and fill the entries fillowing:
 <h2><a name="reflink">reflink</a></h2>
 <p>
 <font size="2">
-refcount B+ tree
+To support the sharing of file data blocks (reflink), there are two new components,
+<ul>
+<li> per-ag reference count B+ tree
 <pre>
-To support the sharing of file data blocks (reflink), each allocation group has
-its own reference count B+ tree. 
-
 Each record in the reference count B+tree has the following structure:
 struct xfs_refcount_rec {
     __be32 rc_startblock;
@@ -3948,117 +4275,651 @@ This data structure tracks reference counts for all shared physical blocks.
  - If a block is owned by a single file, it appears in neither the free space nor the reference count B+trees.
  - If a block is shared, it will appear in the reference count B+tree with a reference count >= 2.
 </pre>
-<B>Set reflink flag and do the map</B>
+<li> in-core COW extent btree
 <pre>
-xfs_reflink_remap_range
-  -> xfs_reflink_set_inode_flag
-  -> xfs_reflink_remap_blocks
-    -> xfs_bmapi_read <font color="blue">//Read extent from the source file</font>
-    -> xfs_reflink_remap_extent
-    ---
-    error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0, &tp);
-
-    xfs_ilock(ip, XFS_ILOCK_EXCL);
-    xfs_trans_ijoin(tp, ip, 0);
-
-    while (rlen) {
-        error = __xfs_bunmapi(tp, ip, destoff, &rlen, 0, 1,
-                &firstfsb, &dfops);
-    
-        <font color="blue">/* Update the refcount tree */</font>
-        error = xfs_refcount_increase_extent(mp, &dfops, &uirec);
-    
-        <font color="blue">/* Map the new blocks into the data fork. */</font>
-        error = xfs_bmap_map_extent(mp, &dfops, ip, &uirec);
-    }
-
-    error = xfs_trans_commit(tp);
-    xfs_iunlock(ip, XFS_ILOCK_EXCL);
-    
-    ---
+The COW in-core extent fork is for storing delalloc reservations and allocated
+extents that are in process of being written out.
+<font color="red">(It is not on-disk, but in-core)</font>
 </pre>
-
-<B>Check and break shared blocks, reserve space on COW fork</B>
-<pre>
-xfs_file_iomap_begin
-  -> xfs_file_iomap_begin_delay
-  //under XFS_ILOCK_EXCL
-    -> xfs_iext_lookup_extent <font color="blue">// Look up extent in XFS_DATA_FORK. </font>
-       if got.br_startoff <= offset_fsb && <font color="blue">offset_fsb is in the range of the got extent</font>
-          xfs_is_reflink_inode
-          -> xfs_reflink_reserve_cow
-          ---
-<font color="blue">
-          // try to find the associated exten in the XFS_COW_FORK first.
-          // if found, just trim the imap to the extent got from COW fork.
+</ul> 
 </font>
-          if (!xfs_iext_lookup_extent(ip, ifp, imap->br_startoff, &icur, &got))
-                eof = true;
+</p>
+
+<h3><a name="work_process">work process</a></h3>
+<p>
+<font size="2">
+Write on the reflinked range page cache
+<pre>
+xfs_file_iomap_begin_delay
+  -> xfs_iext_lookup_extent // <font color="blue">XFS_DATA_FORK</font>
+  ---
+<font color="blue">
+    // We only support COW on real extent.
+    // Before this we have checked the got.br_startoff <= offset_fsb
+    // The 'got' is from the in-core data extent list fork.
+</font>
+    if (xfs_is_reflink_inode(ip) && ((flags & IOMAP_WRITE) ||
+         got.br_state != XFS_EXT_UNWRITTEN)) {
+<font color="blue">
+        // We may get a extent bigger than what we want.
+        // We must trim it because we my do COW on that range.
+</font>
+        xfs_trim_extent(&got, offset_fsb, end_fsb - offset_fsb);
+        error = xfs_reflink_reserve_cow(ip, &got);
+          -> xfs_iext_lookup_extent //<font color="blue">XFS_COW_FORK</font>
+<font color="blue">
+                //Has been on the COW in-core extent list ?
+</font>
           if (!eof && got.br_startoff <= imap->br_startoff) {
-                xfs_trim_extent(imap, got.br_startoff, got.br_blockcount);
-                                                                                  
-                *shared = true;
-                return 0;
+              xfs_trim_extent(imap, got.br_startoff, got.br_blockcount);
+              return 0;
           }
 <font color="blue">
-          //Find the associated extent in the refcount B+ tree.
+          //Trim the mapping to the nearest shared extent boundary.
 </font>
-          error = xfs_reflink_trim_around_shared(ip, imap, shared, &trimmed);
-          if (error)
-              return error;
-                                                                                  
-          /* Not shared?  Just report the (potentially capped) extent. */
-          if (!*shared)
-              return 0;
-                                                                                  
-<font color="blue">
-          /*
-           * Fork all the shared blocks from our write offset until the end of
-           * the extent.
-           */
-</font>
-          ...
-          error = xfs_bmapi_reserve_delalloc(ip, XFS_COW_FORK, imap->br_startoff,
+          -> xfs_reflink_trim_around_shared
+            -> xfs_reflink_find_shared
+
+          ->  xfs_bmapi_reserve_delalloc(ip, XFS_COW_FORK, imap->br_startoff, 
                   imap->br_blockcount, 0, &got, &icur, eof);
-          ---
+<font color="blue">
+          //The process looks similar with normal delayed-allocation.
+          // - Insert the written shared extent into COW in-core extent fork.
+                ---
+                got->br_startoff = aoff;
+                got->br_startblock = <font color="red">nullstartblock(indlen);</font>
+                got->br_blockcount = alen;
+                got->br_state = XFS_EXT_NORM;
+
+                xfs_bmap_add_extent_hole_delay(ip, whichfork, icur, got);
+                ---
+          // - And also reserve space for it with both xfs_mod_fdblocks and quota.
+</font>
+    }
+  ---
 </pre>
 
-<B>Do the real allocation</B>
+Writeback to disk
 <pre>
-xfs_do_writepage
-  -> xfs_writepage_map
+xfs_map_blocks
 ---
+    if (xfs_inode_has_cow_data(ip) &&
+        xfs_iext_lookup_extent(ip, ip->i_cowfp, offset_fsb, &icur, &imap))
+        cow_fsb = imap.br_startoff;
+    if (cow_fsb != NULLFILEOFF && cow_fsb <= offset_fsb) {
+        wpc->cow_seq = READ_ONCE(ip->i_cowfp->if_seq);
+        xfs_iunlock(ip, XFS_ILOCK_SHARED);
+        ...
+        whichfork = XFS_COW_FORK;
+        wpc->io_type = XFS_IO_COW;
+        goto allocate_blocks;
+        ...
+allocate_blocks:
+    error = xfs_iomap_write_allocate(ip, whichfork, offset, &imap,
+            &wpc->cow_seq);
 
+xfs_iomap_write_allocate
+  -> xfs_bmapi_write
+    -> xfs_bmapi_allocate
+---
+    error = xfs_bmap_alloc(bma); //<font color="blue">Allocate blocks</font>
+    ...
 <font color="blue">
-        // If this inode is reflinked, map the extent on the extent cow fork.
-        // It will firstly check whether there is reservation mapping in the cow
-        // fork, if yes, allocate real space for it.
+    // For the COW in-core extents list, there is no XFS_IFBROOT on it.
+    // So finally, bma->cur will be NULL for XFS_BMAPI_COWFORK and
+    // xfs_bmap_add_extent_hole_real will <U>not update on-disk bmbtree </U>
+    // due to a NULL bma->cur.
 </font>
-        if (xfs_is_reflink_inode(XFS_I(inode))) {
-            error = xfs_map_cow(wpc, inode, offset, &new_type);
+    if ((ifp->if_flags & XFS_IFBROOT) && !bma->cur)
+        bma->cur = xfs_bmbt_init_cursor(mp, bma->tp, bma->ip, whichfork);
+    ..
+    bma->got.br_startoff = bma->offset;
+    bma->got.br_startblock = bma->blkno;
+    bma->got.br_blockcount = bma->length;
+    bma->got.br_state = XFS_EXT_NORM;
+    ...
+    if (bma->wasdel)
+        error = xfs_bmap_add_extent_delay_real(bma, whichfork);
+    else
+        error = xfs_bmap_add_extent_hole_real(bma->tp, bma->ip,
+                whichfork, &bma->icur, &bma->cur, &bma->got,
+                &bma->logflags, bma->flags);
+---
+</pre>
+
+Write complete
+<pre>
+xfs_reflink_end_cow
+---
+    if (!xfs_iext_lookup_extent_before(ip, ifp, &end_fsb, &icur, &got))
+        goto out_cancel;
+
+    /* Walk backwards until we're out of the I/O range... */
+    while (got.br_startoff + got.br_blockcount > offset_fsb) {
+        del = got;
+        xfs_trim_extent(&del, offset_fsb, end_fsb - offset_fsb);
+
+        /* Extent delete may have bumped ext forward */
+        if (!del.br_blockcount)
+            goto prev_extent;
+
+        if (!xfs_bmap_is_real_extent(&got))
+            goto prev_extent;
+<font color="blue">
+        // Step 1 Unmap the old blocks in the data fork.
+</font>
+        rlen = del.br_blockcount;
+        error = __xfs_bunmapi(tp, ip, del.br_startoff, &rlen, 0, 1);
+        ...
+<font color="blue">
+        /* Trim the extent to whatever got unmapped. */
+</font>
+        if (rlen) {
+            xfs_trim_extent(&del, del.br_startoff + rlen,
+                del.br_blockcount - rlen);
         }
         ...
-        if (!wpc->imap_valid) {
-            error = xfs_map_blocks(inode, offset, &wpc->imap,
-                         wpc->io_type);
-            ...
-        }
-        if (wpc->imap_valid) {
-            lock_buffer(bh);
-            if (wpc->io_type != XFS_IO_OVERWRITE)
-                xfs_map_at_offset(inode, bh, &wpc->imap, offset);
-                  -> xfs_map_buffer
-                    -> bh->b_blocknr will be set
-        }
-    ...
-    -> xfs_submit_ioend
-      -> <font color="red">xfs_reflink_convert_cow</font>
-      -> submit_bio
+<font color="blue">
+        // Step 2. Map the new blocks into the data fork.
+</font>
+        error = xfs_bmap_map_extent(tp, ip, &del);
+        ...
+<font color="blue">
+        // Step 3. Remove the mapping from the CoW fork.
+</font>
+        xfs_bmap_del_extent_cow(ip, &icur, &got, &del);
+
+        error = xfs_defer_finish(&tp);
+        ...
+        if (!xfs_iext_get_extent(ifp, &icur, &got))
+            break;
+        continue;
+prev_extent:
+        if (!xfs_iext_prev_extent(ifp, &icur, &got))
+            break;
+    }
 ---
 </pre>
 </font>
 </p>
 
-       
+<h3><a name="orphan_records">orphan record</a></h3>
+<p>
+<font size="2">
+Let's look at the following scenario,
+When write the data in a range of shared blocks out to disk, we need to do the COW,
+but what if poweroff occurs during that ?<br/>
+For example,
+<pre>
+writeback
+    allocate blocks (update agf, agfl, bnobt, cntbt ...)
+    update in-core COW extent fork
+                                    
+    write data out            <-.  /\  /\  .-- POWROFF!!!
+                                 \/  \/  \/
+    complete,
+      unmap old blocks from data fork
+      map new blocks into data fork
+      remove the extent from in-core COW fork.
+</pre>
+Then the allocated extents will be leaked.
+How to handle this ?
+<pre>
+xfs_bmapi_write
+---
+            error = xfs_bmapi_allocate(&bma);
+            ...
+<font color="blue">
+            /*
+             * If this is a CoW allocation, record the data in
+             * the refcount btree for orphan recovery.
+             */
+</font>
+            if (whichfork == XFS_COW_FORK) {
+                error = xfs_refcount_alloc_cow_extent(tp,
+                        bma.blkno, bma.length);
+            }
+---
+<font color="blue">
+Extents that are being used to stage a copy on write are stored
+in the refcount btree with a refcount of 1 and <U>the upper bit set
+on the startblock</U>.  This speeds up mount time deletion of stale
+staging extents because they're all at the right side of the tree.
+</font>
+xfs_refcount_finish_one
+  -> __xfs_refcount_cow_alloc
+    -> xfs_refcount_adjust_cow
+---
+<font color="red">
+    agbno += XFS_REFC_COW_START;
+</font>
+---
+<font color="blue">
+Find and remove leftover CoW reservations.
+</font>
+xfs_mountfs
+  -> xfs_reflink_recover_cow
+    -> xfs_refcount_recover_cow_leftovers
+</pre>
+
+Then we could get,
+
+<pre>
+writeback
+    allocate blocks (update agf, agfl, bnobt, cntbt ...)
+    update in-core COW extent fork
+    record COW allocation in refcount tree (<font color="red">deferred operation</font>)
+                                    
+    write data out            <-.  /\  /\  .-- POWROFF!!!
+                                 \/  \/  \/
+    complete,
+      unmap old blocks from data fork
+      map new blocks into data fork
+      remove the extent from in-core COW fork.
+
+
+</pre>
+Even if it is a deferred operation, <font color="red">the CUI log is in the same <br/>
+transaction with block allocation logs.</font> If poweroff comes before the CUD and <br/>
+real refcount operations, the CUI could be replayed. 
+</font>
+</p>
+    
+<h3><a name="speculative_preallocation_2">speculative preallocation on COW</a></h3>
+<p>
+<font color="2">
+Darrick Wong points out that
+<pre>
+There are two forks in play here
+ - the data fork that's written to disk
+ - the CoW fork that only exists in memory
+We don't coordinate extent overlap between the two forks; indeed, we use
+this lack of overlap-coordination as part of speculative preallocation
+to defragment shared files.
+</pre>
+Let's first look at where does the speculative preallocation happen.
+<ul>
+<li> reserve on in-core COW fork
+<pre>
+xfs_bmapi_reserve_delalloc
+---
+    if (whichfork == XFS_COW_FORK) {
+        struct xfs_bmbt_irec    prev;
+        xfs_extlen_t        extsz = xfs_get_cowextsz_hint(ip);
+
+        if (!xfs_iext_peek_prev_extent(ifp, icur, &prev))
+            prev.br_startoff = NULLFILEOFF;
+
+        error = xfs_bmap_extsize_align(mp, got, &prev, extsz, 0, eof,
+                           1, 0, &aoff, &alen);
+    }
+---
+</pre>
+<li> allocate real blocks
+<pre>
+xfs_bmap_btalloc
+---
+    if (ap->flags & XFS_BMAAI_COWFORK)
+        align = xfs_get_cowextsz_hint(ap->ip);
+    else if (xfs_alloc_is_userdata(ap->datatype))
+        align = xfs_get_extsz_hint(ap->ip);
+    if (align) {
+        error = xfs_bmap_extsize_align(mp, &ap->got, &ap->prev,
+                        align, 0, ap->eof, 0, ap->conv,
+                        &ap->offset, &ap->length);
+    }
+---
+</pre>
+</ul>
+So when we really want to allocate,
+<pre>
+cowextsz = 10
+
+   012345678901234567890123456789
+D: SSSSSSSSSSSSRRRRRRRRRRRRRRRRRR
+C: -----AAAAAAA------------------
+   ^         ^         ^
+</pre>
+we actually allocate.
+<pre>
+cowextsz = 10
+
+   012345678901234567890123456789
+D: SSSSSSSSSSSSRRRRRRRRRRRRRRRRRR
+C: AAAAAAAAAAAAAAAAAAAA----------
+   ^         ^         ^
+</pre>
+When the IO on blocks 5-13, xfs_reflink_end_cow remaps the blocks as:
+<pre>
+   012345678901234567890123456789
+D: SSSSSAAAAAAAAARRRRRRRRRRRRRRRR
+C: UUUUU---------UUUUUU----------
+   ^         ^         ^
+</pre>
+
+If we issue <B><font color="red">write</font></B> IO on blocks 16, the COW fork will be used.
+<pre>
+xfs_file_iomap_begin_delay
+---
+    eof = !xfs_iext_lookup_extent(ip, ifp, offset_fsb, &icur, &got);
+    if (eof)
+        got.br_startoff = end_fsb; /* fake hole until the end */
+
+    if (got.br_startoff <= offset_fsb) {
+        if (xfs_is_reflink_inode(ip) &&
+            ((flags & IOMAA_WRITE) ||
+             got.br_state != XFS_EXT_UNWRITTEN)) {
+            xfs_trim_extent(&got, offset_fsb, end_fsb - offset_fsb);
+            error = xfs_reflink_reserve_cow(ip, &got);
+<font color="blue">
+            // Try to find the got->br_startoff in COW fork, if there,
+            // return and use it directly
+</font>
+        }
+        goto done;
+    }
+
+---
+</pre>
+It'll convert block 16 in the COW fork before issuing the write IO:
+<pre>
+   012345678901234567890123456789
+D: SSSSSAAAAAAAAARRRRRRRRRRARRRRR
+C: UUUUU---------UUAUUU----------
+   ^         ^         ^
+</pre>
+and then remap it when it's done:
+<pre>
+   012345678901234567890123456789
+D: SSSSSAAAAAAAAARRARRRRRRRARRRRR
+C: UUUUU---------UU-UUU----------
+   ^         ^         ^
+</pre>
+
+Therefore, in normal case, the whole range will be remapped into a
+contiguous blocks. This is the <B><font color="red">defragment</font></B>
+</font>
+</p>
+
+<h3><a name="COW_Unwritten">COW Unwritten</a></h3>
+<p>
+<font color="2">
+The preallocated extents are firstly set to UNWRITTEN state.
+<pre>
+xfs_bmapi_allocate
+---
+    error = xfs_bmap_alloc(bma);
+    ...
+    bma->got.br_startoff = bma->offset;
+    bma->got.br_startblock = bma->blkno;
+    bma->got.br_blockcount = bma->length;
+    bma->got.br_state = XFS_EXT_NORM;
+    if ((!bma->wasdel || (bma->flags & XFS_BMAPI_COWFORK)) &&
+        (bma->flags & XFS_BMAPI_PREALLOC))
+        bma->got.br_state = XFS_EXT_UNWRITTEN;
+
+    if (bma->wasdel)
+        error = xfs_bmap_add_extent_delay_real(bma, whichfork);
+    else
+        error = xfs_bmap_add_extent_hole_real(bma->tp, bma->ip,
+                whichfork, &bma->icur, &bma->cur, &bma->got,
+                &bma->logflags, bma->flags);
+---
+</pre>
+Why do we need this ?
+<br/>
+When we write IO on a range
+<ul>
+<li> span boundary of regular and shared extents
+<li> boundary of regular and shared extents are not aligned with cowextsz.
+</ul>
+<pre>
+cowextsz 10
+
+   012345678901234567890123456789
+D: RRRRRRRRRRRRRRRSSSSSSSSSSSSSSS
+C: ------------------------------
+   ^         ^         ^
+
+<B>direct write on block 10 ~ 19</B>
+</pre>
+Two IO will be generated.
+<ul>
+<li> A regular IO on block 10 ~ 14
+<pre>
+The original big IO will be split into two IO due to the boundary.
+xfs_file_iomap_begin
+  -> xfs_reflink_allocate_cow
+---
+    error = xfs_find_trim_cow_extent(ip, imap, shared, &found);
+    if (error || !*shared)
+        return error;
+---
+</pre>
+<li> A COW IO on block 15 ~ 19
+<pre>
+We will allocate new blocks for it.
+But due to the <B>cowextsz</B>, the finally allocated blocks are as
+
+cowextsz 10
+
+   012345678901234567890123456789
+D: RRRRRRRRRRRRRRRSSSSSSSSSSSSSSS
+C: ----------AAAAAAAAAA----------
+   ^         ^         ^
+
+We see that the newly allocated blocks on COW has overlapped with the
+IO on blocks 10 ~ 14.
+</pre>
+</ul>
+This IO with regular and COW IO will cause the dio->flags gain a IOMAP_DIO_COW.
+<pre>
+iomap_dio_bio_actor
+---
+    if (iomap->flags & IOMAP_F_SHARED)
+        dio->flags |= IOMAP_DIO_COW
+---
+</pre>
+When IO completes,
+<pre>
+xfs_dio_write_end_io
+  -> xfs_reflink_end_cow //IOMAP_DIO_COW
+
+At the moment, we will try to remap all of the blocks involved in this IO
+on COW fork into data fork.
+
+However, the blocks 10 ~ 14 are newly allocated and not yet initialized.
+If power is lost, we will get data corrupted.
+</pre>
+To fix this, we will set the preallocated blocks into Unwritten state first.
+<pre>
+cowextsz 10
+
+   012345678901234567890123456789
+D: RRRRRRRRRRRRRRRSSSSSSSSSSSSSSS
+C: ----------UUUUUUUUUU----------
+   ^         ^         ^
+</pre>
+And only convert the blocks COWed into real state.
+<pre>
+xfs_file_iomap_begin
+  -> xfs_reflink_allocate_cow
+    -> xfs_reflink_convert_cow_extent
+
+cowextsz 10
+
+   012345678901234567890123456789
+D: RRRRRRRRRRRRRRRSSSSSSSSSSSSSSS
+C: ----------UUUUUAAAAA----------
+   ^         ^         ^
+</pre>
+Then only remap the blocks that not are Unwritten from COW fork into data fork.
+<pre>
+xfs_reflink_end_cow
+---
+<font color="blue">
+        /*
+         * Only remap real extent that contain data.  With AIO
+         * speculatively preallocations can leak into the range we
+         * are called upon, and we need to skip them.
+         */
+</font>
+        if (!xfs_bmap_is_real_extent(&got))
+            goto prev_extent;
+---
+</pre>
+Here is test code and log in kernel.
+<pre>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+
+
+int main()
+{
+    int fd_in, fd_out, len, ret;
+    unsigned long long off_in, off_out;
+    char *buf;
+    int i;
+
+    buf = aligned_alloc(4096, 4096);
+    if (!buf) {
+        printf("allocate buffer failed %d\n", errno);
+        return -1;
+    }
+
+    fd_out = open("./cfr_out", O_DIRECT | O_RDWR | O_CREAT);
+    if (fd_in < 0) {
+        printf("open cfr_out failed %d\n", errno);
+        return -1;
+    }
+
+    /*
+     * Set file cfr_out to 0xa, 0xb, 0xc, 0xd
+     */
+    memset(buf, 0xa, 4096);
+    for (i=0; i<2048; i++) {
+        ret = write(fd_out, buf, 4096);
+    }
+
+    memset(buf, 0xb, 4096);
+    for (i=0; i<2048; i++) {
+        ret = write(fd_out, buf, 4096);
+    }
+
+    memset(buf, 0xc, 4096);
+    for (i=0; i<2048; i++) {
+        ret = write(fd_out, buf, 4096);
+    }
+
+    memset(buf, 0xd, 4096);
+    for (i=0; i<2048; i++) {
+        ret = write(fd_out, buf, 4096);
+    }
+
+    fd_in = open("./cfr_in", O_DIRECT| O_RDWR | O_CREAT);
+    if (fd_in < 0) {
+        printf("open cfr_in failed %d\n", errno);
+        return -1;
+    }
+
+    /*
+     * Set file cfr_dst to 0
+     */
+    memset(buf, 0, 4096);
+    for (i=0; i<2048; i++) {
+        write(fd_in, buf, 4096);
+    }
+
+    free(buf);
+    /*
+     * cowextsz 0x20000
+     * 
+     * cfr_in                    |------|              0x800000
+     *
+     * cfr_out |-----------------|------------------|  0x2000000
+     *                           ^
+     *                           |
+     *                       0x1010000
+     */
+    off_out = 0x1010000;
+    off_in = 0;
+    len = 0x100000; //1M
+#if 1
+    ret = syscall(326, fd_in, &off_in, fd_out, &off_out, len, 0);
+    if (errno) {
+        printf("copy_file_range failed %d\n", errno);
+        return ret;
+    }
+#endif
+    buf = aligned_alloc(4096, 0x20000);
+    if (!buf) {
+        printf("allocate 1M buffer failed %d\n", errno);
+        return -1;
+    }
+    /*
+     *                 0x1010000 0x1110000
+     *                     |   .---'
+     *                     v   v
+     * cfr_out  |----------|sss|-----|    32M
+     *                   |   |  
+     *                    IO
+     *                   0x20000 (128K)
+     */
+    memset(buf, 0xf, 0x20000);
+    /*
+      * Write to 0x1000000
+     */
+    ret = pwrite(fd_out, buf, 0x20000, 0x1000000);
+    if (ret != 0x20000)
+        printf("pwrite failed %d\n", errno);
+
+    free(buf);
+    close(fd_in);
+    close(fd_out);
+    return 0;
+}
+gcc -D_GNU_SOURCE  copy_file_range.c -o cfr
+
+root@will-ThinkCentre-M93p:/home/will/Desktop/xfs/mount# hexdump -C cfr_out 
+00000000  0a 0a 0a 0a 0a 0a 0a 0a  0a 0a 0a 0a 0a 0a 0a 0a  |................|
+*
+00800000  0b 0b 0b 0b 0b 0b 0b 0b  0b 0b 0b 0b 0b 0b 0b 0b  |................|
+*
+01000000  0f 0f 0f 0f 0f 0f 0f 0f  0f 0f 0f 0f 0f 0f 0f 0f  |................|
+*
+01020000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+01110000  0c 0c 0c 0c 0c 0c 0c 0c  0c 0c 0c 0c 0c 0c 0c 0c  |................|
+*
+01800000  0d 0d 0d 0d 0d 0d 0d 0d  0d 0d 0d 0d 0d 0d 0d 0d  |................|
+*
+02000000
+
+cfr-1755  [001] ....  3442.372122: xfs_reflink_allocate_cow: 1 o 1000 b 1013 l 10 s 0
+cfr-1755  [001] ....  3442.372147: xfs_reflink_allocate_cow: 2 o 1000 b 1013 l 10 s 0 f 0 sh 0
+cfr-1755  [001] ....  3442.372157: xfs_reflink_allocate_cow: 1 o 1010 b 2013 l 10 s 0
+cfr-1755  [001] ....  3442.372160: xfs_reflink_allocate_cow: 2 o 1010 b 2013 l 10 s 0 f 0 sh 1
+cfr-1755  [001] ....  3442.372161: xfs_reflink_allocate_cow: cowextsz 20
+cfr-1755  [001] ....  3442.372166: xfs_reflink_allocate_cow: 3 o 1010 b 2013 l 10 s 0
+cfr-1755  [001] ....  3442.372177: xfs_bmapi_write: o 1000 b 1023 l 20
+cfr-1755  [001] ....  3442.372178: xfs_reflink_allocate_cow: 4 o 1010 b 1033 l 10 s 1
+
+o - offset
+b - block
+l - length
+f - found
+sh- shared
+</pre>
+</font>
+</p>
+
+
 </body>
 </html>
