@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BCACHE</title>
+</head>
+<body>
+<div>
+    <h1>BCACHE</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#Infrastructure">Infrastructure</a>
+<ul>
+<li> <a href="#closure_dance">closure dance</a>
+<li> <a href="#binary_tree_search">binary tree search</a>
+</ul>
+
+<a href="#metadata">metadata</a>
+<ul>
+<li> <a href="#bkey">bkey</a>
+</ul>
+
+<a href="#btree">btree</a>
+<ul>
+<li> <a href="#btree_node">btree node</a>
+<li> <a href="#COWed_btree">COWed btree</a>
+<li> <a href="#sort_of_bkey">sort_of_bkey</a>
+</ul>
+
+<a href="#buckets_management">bucket management</a>
+<ul>
+<li><a href="#buckets_allocation">bucket allocation</a>
+<li><a href="#buckets_generation">buckets generation</a>
+</ul>
+
+<a href="#cache_data">cached data</a>
+<ul>
+<li><a href="#COWed_cache_data">COWed cache data</a>
+</ul>
+</font>
+</p>
+
+
+<h2><a name="Infrastructure">Infrastructure</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+
+<h3><a name="closure_dance">closure dance</a></h3>
+<p>
+<font size="2">
+<pre>
+closure_call // initialize the cl->remaining to CLOSURE_RUNNING + 1 and execute .fn
+
+closure_bio_submit // closure_get and generic_make_request
+                   // the associated closure_put is invoked in endio callback.
+
+continue_at //sub CLOSURE_RUNNING + 1 from cl->remaining and queue a new .fn
+
+closure_put_after_sub
+---
+if (!r) {
+        if (cl->fn && !(flags & CLOSURE_DESTRUCTOR)) {
+            atomic_set(&cl->remaining,
+                   CLOSURE_REMAINING_INITIALIZER);
+<font color="red">
+            // #define CLOSURE_REMAINING_INITIALIZER    (1|CLOSURE_RUNNING)
+</font>
+            closure_queue(cl);
+        }
+        ...
+}
+---
+
+CLOSURE_RUNNING means the .fn is running.
+
+
+closure_wait // add CLOSURE_WAITING + 1, llist_add (lockless)
+
+__closure_wake_up // dec CLOSURE_WAITING + 1
+
+</pre>
+</font>
+</p>
+
+<h3><a name="binary_tree_search">binary tree search</a></h3>
+<p>
+<font size="2">
+<pre>
+          +--+--+--+--+--+
+  Array   |11| 7|25|14| 1|
+          +--+--+--+--+--+
+
+             11 (0)
+           /       \
+        7 (1)     25 (2)
+       /     \
+   14 (3)   1 (4)
+
+  value (index)
+
+As the diagram above, every flat array could seen as a binary tree.
+                   
+                       n
+                    /     \
+                2n + 1  2n + 2
+
+If we want to select the least/biggest value in one array, just need to iterate
+every non-leaf node in reverse order and take lesser/bigger one of the 3 node above.
+
+For example,
+
+             11 (0)
+           /       \
+        7 (1)     25 (2)
+       /      \
+   14 (3)   1 (4)
+                
+              |
+              v
+
+             11 (0)
+           /       \
+        1 (1)     25 (2)
+       /      \
+   14 (3)   7 (4)
+              
+              |
+              v
+
+             1 (0)
+           /       \
+       11 (1)     25 (2)
+       /      \
+   14 (3)   7 (4)
+
+-------------------------------------------
+A test demo
+
+
+#include <stdio.h>
+
+
+struct heap {
+    int used;
+    int data[10];
+};
+
+#define swap(a, b) \
+    do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)
+#define heap_swap(h, i, j)    swap((h)->data[i], (h)->data[j])
+#define heap_sift(h, i, cmp)                        \
+do {                                    \
+    size_t _r, _j = i;                        \
+                                    \
+    for (; _j * 2 + 1 < (h)->used; _j = _r) {            \
+        _r = _j * 2 + 1;                    \
+        if (_r + 1 < (h)->used &&                \
+            cmp((h)->data[_r], (h)->data[_r + 1]))        \
+            _r++;                        \
+                                    \
+        if (cmp((h)->data[_r], (h)->data[_j]))            \
+            break;                        \
+        heap_swap(h, _r, _j);                    \
+    }                                \
+} while (0)
+
+
+#define heap_pop(h, d, cmp)                        \
+({                                    \
+    int _r = (h)->used;                        \
+    if (_r) {                            \
+        (d) = (h)->data[0];                    \
+        (h)->used--;                        \
+        heap_swap(h, 0, (h)->used);                \
+        heap_sift(h, 0, cmp);                    \
+    }                                \
+    _r;                                \
+})
+
+int compare (int a, int b)
+{
+    return a >= b;
+}
+
+int main()
+{
+    int i, p;
+
+    struct heap h = {10, {12, 9, 21, 15, 5, 30, 100, 1, 56, 78}};
+
+    for (i = h.used / 2 - 1; i >= 0; --i)
+        heap_sift(&h, i, compare);
+
+    for (i = 0; i < 10; i++) {
+        heap_pop(&h, p, compare);
+        printf("%u ", p);
+    }
+    printf("\n");
+}
+</pre>
+</font>
+</p>
+
+
+
+<h2><a name="metadata">metadata</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h3><a name="bkey">bkey</a></h3>
+<p>
+<font size="2">
+<pre>
+
+                   +-------+  +-------+  +-------+  +-------+
+   cached dev      |bcache0|  |bcache1|  |bcache2|  |bcache3|
+                   +---^---+  +---^---+  +---^---+  +---^---+
+                       |          |          |          |
+                   +----------------------------------------+
+   cache set       |                CACHE SET               |
+                   +----------------------------------------+
+                       |          |          |          |
+                    +-----+    +-----+    +-----+    +-----+
+   backing dev      | sdb |    | sdc |    | sdd |    | sde |
+                    +-----+    +-----+    +-----+    +-----+
+
+
+63 60 58 56 55                37 36                20                    0
+|--|--|--|-|------------------|-|-----------------|---------------------|    bkey->high
+  |  |  |  |                    |         |                   |
+  |  |  |  |                    |         |                   |
+  |  |  |  |                    |         |                   V
+  |  |  |  |                    |         V                    KEY_INODE
+  |  |  |  |                    V       KEY_SIZE
+  |  |  |  V                  KEY_DIRTY
+  |  |  V KEY_PINNED
+  |  V KEY_CSUM
+  V HEADER_SIZE
+KEY_PTRS
+
+|------------------------------------------------------------------------|    bkey->low
+                                   |
+                                   V
+                               KEY_OFFSET
+
+|--------------|-----------------------------------------------|---------|    bkey->ptr[i]
+
+      |                            |                                |
+      |                            |                                V
+      |                            V                             PTR_GEN
+      V                        PTR_OFFSET
+    PTR_DEV
+
+</pre>
+
+<ul>
+<li> KEY_INODE (cached device id)
+<pre>
+cached_dev_make_request
+  -> search_alloc
+    -> s->iop.inode = d->id
+  -> cached_dev_write
+    -> bch_data_insert
+      -> bch_data_insert_start
+        -> SET_KEY_INODE(k, op->inode);
+
+This cached_dev->id comes from,
+bch_cached_dev_attach
+---
+    u = uuid_find(c, dc->sb.uuid);
+    ---
+    for (u = c->uuids;
+         u < c->uuids + c->nr_uuids; u++)
+        if (!memcmp(u->uuid, uuid, 16))
+            return u;
+    ---
+    ...
+    bcache_device_attach(&dc->disk, c, u - c->uuids);
+---
+So the id here is index in cache_set
+</pre>
+<li> KEY_OFFSET (end block on backing device)
+<li> KEY_SIZE   (size of the cached data)
+<li> PTR_OFFSET (start block on caching device)
+<pre>
+cached_dev_make_request
+  -> cached_dev_write
+    -> bch_data_insert
+      -> bch_data_insert_start
+        -> SET_KEY_OFFSET(k, bio->bi_iter.bi_sector);
+        -> bch_alloc_sectors
+        ---
+        bkey_init(&alloc.key);
+        spin_lock(&c->data_bucket_lock);
+
+        while (!(b = pick_data_bucket(c, k, write_point, &alloc.key))) {
+            unsigned int watermark = write_prio
+                ? RESERVE_MOVINGGC
+                : RESERVE_NONE;
+
+            spin_unlock(&c->data_bucket_lock);
+
+            if (bch_bucket_alloc_set(c, watermark, &alloc.key, 1, wait))
+                return false;
+
+            spin_lock(&c->data_bucket_lock);
+        }
+        ...
+        /* Set up the pointer to the space we're allocating: */
+
+        for (i = 0; i < KEY_PTRS(&b->key); i++)
+            k->ptr[i] = b->key.ptr[i];
+
+        sectors = min(sectors, b->sectors_free);
+
+        SET_KEY_OFFSET(k, KEY_OFFSET(k) + sectors);
+        SET_KEY_SIZE(k, sectors);
+        SET_KEY_PTRS(k, KEY_PTRS(&b->key));
+        ---
+
+bch_data_insert_start
+  -> bch_submit_bbio
+    -> bch_bkey_copy_single_ptr
+    -> __bch_submit_bbio
+    ---
+    bio->bi_iter.bi_sector    = PTR_OFFSET(&b->key, 0);
+    bio_set_dev(bio, PTR_CACHE(c, &b->key, 0)->bdev);
+
+    b->submit_time_us = local_clock_us();
+    closure_bio_submit(c, bio, bio->bi_private);
+    ---
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="btree">btree</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h3><a name="btree_node">btree node</a></h3>
+<p>
+<font size="2">
+<pre>
+btree  ->  keys   ->   set[]   ->  data         -> start
+           btree_keys  bset_tree   bset            bkey
+                                   on-disk format  bkey array
+</pre>
+
+btree->key
+<ul>
+<li> KEY_INODE
+<pre>
+The backing device inode id of the bkeys in it.
+</pre>
+<li> KEY_OFFSET
+<pre>
+The main index in the btree and it is the block offset
+in the backing device.
+</pre>
+<li> PTR_OFFSET
+<pre>
+This is the block address where this btree node locates in caching device.
+The block address is got from __bch_bucket_alloc_set.
+__bch_btree_node_alloc
+  -> __bch_bucket_alloc_set
+---
+        long b = bch_bucket_alloc(ca, reserve, wait);
+
+        if (b == -1)
+            goto err;
+<font color="red">
+        k->ptr[i] = MAKE_PTR(ca->buckets[b].gen,
+                bucket_to_sector(c, b),
+                ca->sb.nr_this_dev);
+</font>
+---
+And certainly, we will use it when we write out the bset in 
+__bch_btree_node_write 
+</pre>
+</ul>
+
+</font>
+</p>
+
+
+<h3><a name="COWed_btree">COWed btree</a></h3>
+<p>
+<font size="2">
+<pre>
+
+COW btree
+<pre>
+              +-----------+                      insert
+              |k0|k1...|kn|    <------------+--------------+
+              +-----------+                 |              |
+               |                            |              |
+               v                            |              |
+        +-----------+                 +-----------+  +-----------+    
+        |k0|k1...|kn|                 |k0|k1...|kn|  |k0         |
+        +-----------+                 +-----------+  +-----------+
+         |                             |   NEW        |   NEW
+         v                             v              v
+    +-----------+               +-----------+  +-----------+
+    |k0|k1...|kn|               |k0|k1...|kn|  |k0         |
+    +-----------+               +-----------+  +-----------+
+                                     NEW           NEW
+
+|
+v : PTR_OFFSET(k, 0)
+
+
+Or
+
+
+          +-----------+ 
+             |k0|k1...|kn| 
+             +-----------+ 
+              |            
+              v            
+       +-----------+               Insert
+       |k0|k1...|kn|<------------+--------------+       
+       +-----------+             |              |
+            |                       |              |
+            v                       |              |
+   +-----------+           +-----------+  +-----------+
+   |k0|k1...|kn|           |k0|k1...|kn|  |k0         |
+   +-----------+           +-----------+  +-----------+
+                                NEW           NEW
+</pre>
+<font color="blue">
+(
+There is only one real insert into the original btree.
+Seems that we could submit all of the newly btree note write together with a
+same closure, then sync on this closure before do the final insert.
+)
+</font>
+The actual case is that every insert operation is synchronous.
+<br/>
+See,
+<pre>
+bch_btree_insert_node
+---
+    if (bch_btree_insert_keys(b, op, insert_keys, replace_key)) {
+        if (!b->level)
+            bch_btree_leaf_dirty(b, journal_ref);
+        else
+            bch_btree_node_write(b, &cl);
+    }
+    ...
+    /* wait for btree node write if necessary, after unlock */
+    closure_sync(&cl);
+---
+And
+bch_btree_insert_node
+  -> btree_split
+---
+    n1 = btree_node_alloc_replacement(b, op);
+    ...
+    split = set_blocks(btree_bset_first(n1),
+               block_bytes(n1->c)) > (btree_blocks(b) * 4) / 5;
+
+    if (split) {
+        ...
+        n2 = bch_btree_node_alloc(b->c, op, b->level, b->parent);
+        ...
+        bkey_copy_key(&n2->key, &b->key);
+
+        bch_keylist_add(&parent_keys, &n2->key);
+<font color="red">
+        bch_btree_node_write(n2, &cl);
+</font>
+        mutex_unlock(&n2->write_lock);
+        rw_unlock(true, n2);
+    } else {
+        mutex_lock(&n1->write_lock);
+        bch_btree_insert_keys(n1, op, insert_keys, replace_key);
+    }
+
+    bch_keylist_add(&parent_keys, &n1->key);
+<font color="red">
+    bch_btree_node_write(n1, &cl);
+</font>
+    mutex_unlock(&n1->write_lock);
+
+    if (n3) {
+        /* Depth increases, make a new root */
+        mutex_lock(&n3->write_lock);
+        bkey_copy_key(&n3->key, &MAX_KEY);
+        bch_btree_insert_keys(n3, op, &parent_keys, NULL);
+        bch_btree_node_write(n3, &cl);
+        mutex_unlock(&n3->write_lock);
+
+<font color="red">
+        closure_sync(&cl);
+</font>
+        bch_btree_set_root(n3);
+        rw_unlock(true, n3);
+    } else if (!b->parent) {
+        /* Root filled up but didn't need to be split */
+<font color="red">
+        closure_sync(&cl);
+</font>
+        bch_btree_set_root(n1);
+    } else {
+        /* Split a non root node */
+<font color="red">
+        closure_sync(&cl);
+</font>
+        make_btree_freeing_key(b, parent_keys.top);
+        bch_keylist_push(&parent_keys);
+
+        bch_btree_insert_node(b->parent, op, &parent_keys, NULL, NULL);
+        BUG_ON(!bch_keylist_empty(&parent_keys));
+    }
+---
+</pre>
+An important scenario need to be handled. That is,
+<pre>
+When the new btree node is inserted into the parent, the old one is still there.
+             +-----------+ 
+             |k0|k1...|kn| 
+             +-----------+ 
+              |            
+              v            
+       +-----------+               Insert
+       |k0|k1...|kn|<------------+--------------+       
+       +-----------+             |              |
+            | It's me !!!           |              |
+            v                       |              |
+   +-----------+           +-----------+  +-----------+
+   |k0|k1...|kn|           |k0|k1...|kn|  |k0         |
+   +-----------+           +-----------+  +-----------+
+                                NEW           NEW
+How does the following caller identify the old one ?
+
+make_btree_freeing_key
+</pre>
+
+
+</pre>
+</font>
+</p>
+
+<h3><a name="sort_of_bkey">sort of bkeys</a></h3>
+<p>
+<font size="2">
+<pre>
+bch_btree_insert_key
+---
+    while (m != bset_bkey_last(i) &&
+           bkey_cmp(k, b->ops->is_extents ? &START_KEY(m) : m) > 0)
+        prev = m, m = bkey_next(m);
+<font color="red">
+    // This says that the bkey in one bset is incremental.
+</font>
+    ...
+    bch_bset_insert(b, m, k);
+copy:    bkey_copy(m, k); // redundant for bch_bset_insert case ?
+merged:
+    return status;
+
+---
+
+btree_keys  ->   set[]  -> data         -> start
+            bset_tree   bset            bkey
+                        on-disk format  bkey array
+
+bch_btree_sort_partial
+  -> __bch_btree_iter_init(b, &iter, NULL, &b->set[start]);
+    // serach is NULL, so all of the bset in btree node will be added into btree_iter
+  -> __btree_sort
+    -> btree_mergesort
+
+    btree_iter
+                      bkeys
+               |-----------------|
+               start             end
+               small  ---->  big
+               ...
+
+    start = bset_tree->data->start
+    end   = bset_bkey_last(bset_tree->data)
+---
+    for (i = iter->used / 2 - 1; i >= 0; --i)
+        heap_sift(iter, i, b->ops->sort_cmp);
+<font color="blue">
+    //binary tree search select the smallest bset (the value of the bset is the
+    //first bkey in it.) Due to the bset is in order, iter->data->k should be
+    // the smallest one among all of bsets.
+</font>
+    while (!btree_iter_end(iter)) {
+        k = NULL;
+
+        if (!k)
+            k = __bch_btree_iter_next(iter, b->ops->sort_cmp);
+            ---
+            if (!btree_iter_end(iter)) {
+                bch_btree_iter_next_check(iter);
+
+                ret = iter->data->k;
+<font color="blue">
+                //push to the next key
+</font>
+                iter->data->k = bkey_next(iter->data->k);
+                ...
+                if (iter->data->k == iter->data->end)
+<font color="blue">
+                // one bset has ended, pop it out and resort the left ones.
+</font>
+                    heap_pop(iter, b, cmp);
+                else
+<font color="blue">
+                // the iter->data[0]'s value has changed, resort
+</font>
+                    heap_sift(iter, 0, cmp);
+            }
+            ---
+<font color="blue">
+        // __bch_tree_iter_next will return the smallest bkey among all of the
+        // bset in the iter.
+</font>
+        if (bad(b, k))
+            continue;
+
+<font color="blue">
+        //We will resort all of bkeys in all bsets and save them into out.
+</font>
+        if (!last) {
+            last = out->start;
+            bkey_copy(last, k);
+        } else if (!bch_bkey_try_merge(b, last, k)) {
+            last = bkey_next(last);
+            bkey_copy(last, k);
+        }
+    }
+---
+ </pre>
+</font>
+</p>
+
+<h2><a name="buckets_management">bucket management</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+The caching device is divided into buckets, which are intended to match the
+physical device's erase blocks.<br/>
+Every bucket has bucket_disk information.
+<pre>
+struct prio_set {
+    __u64            csum;
+    __u64            magic;
+    __u64            seq;
+    __u32            version;
+    __u32            pad;
+
+    __u64            next_bucket;
+
+    struct bucket_disk {
+        __u16        prio;
+        __u8        gen;
+    } __attribute((packed)) data[];
+};
+
+prios_per_bucket(c) =
+    ((bucket_bytes(c) - sizeof(struct prio_set)) / sizeof(struct bucket_disk))
+
+          bucket
+       +----------+
+       | prio_set |
+       +----------+
+       |   b_d    |
+       +----------+
+       |          |
+       .          .
+       .          .
+       |          |
+       +----------+
+
+Note:
+  b_d - bucket_disk
+</pre>
+
+bch_prio_write is used to written out all of this.<br/>
+
+</font>
+</p>
+
+
+<h3><a name="buckets_allocation">bucket allocation</a></h3>
+<p>
+<font size="2">
+There are following fifos to save the free buckets.
+<ul>
+<li> cache->free[]
+<pre>
+A fifo array ordered by priority.
+enum alloc_reserve {
+    RESERVE_BTREE,
+    RESERVE_PRIO,
+    RESERVE_MOVINGGC,
+    RESERVE_NONE,
+    RESERVE_NR,
+};
+</pre>
+<li> cache->free_inc
+<pre>
+buckets that have been invalidated but not exported to users.
+</pre>
+</ul>
+They will be separately assigned with a different size.
+<pre>
+cache_alloc
+---
+    btree_buckets = ca->sb.njournal_buckets ?: 8;
+    free = roundup_pow_of_two(ca->sb.nbuckets) >> 10;
+    if (!init_fifo(&ca->free[RESERVE_BTREE], btree_buckets,
+                        GFP_KERNEL)) {
+        ...
+    }
+
+    if (!init_fifo_exact(&ca->free[RESERVE_PRIO], prio_buckets(ca),
+                            GFP_KERNEL)) {
+        ...
+    }
+
+    if (!init_fifo(&ca->free[RESERVE_MOVINGGC], free, GFP_KERNEL)) {
+        ...
+    }
+
+    if (!init_fifo(&ca->free[RESERVE_NONE], free, GFP_KERNEL)) {
+        ...
+    }
+
+    if (!init_fifo(&ca->free_inc, free << 2, GFP_KERNEL)) {
+        ...
+    }
+---
+</pre>
+But they are all empty and need to be filled by allocator thread.<br/>
+bch_allocator_thread will firstly try to invalidate the bucket then push it on
+free_inc.
+<pre>
+bch_allocator_thread
+  -> invalidate_buckets
+    -> invalidate_buckets_random
+      -> if bch_can_invalidate_bucket
+            ---
+            return (!GC_MARK(b) || GC_MARK(b) == GC_MARK_RECLAIMABLE) && !atomic_read(&b->pin) &&
+        can_inc_bucket_gen(b);
+            ---
+            bch_invalidate_one_bucket
+</pre>
+The question is how does the allocator thread keep away from the used buckets ?<br/>
+<br/>
+The anwser is the <font color="red">gc_mark.</font><br/>
+There are two scenarios that need to be considered.
+<ul>
+<li> Normal allocation
+<pre>
+This normal allocation could be for caching or metadata which will provide
+different alloc_reserve value for bch_bucket_alloc.
+bch_bucket_alloc
+---
+    if (fifo_pop(&ca->free[RESERVE_NONE], r) ||
+        fifo_pop(&ca->free[reserve], r))
+        goto out;
+    ...
+out:
+    ...
+    b = ca->buckets + r;
+    ...
+    if (reserve <= RESERVE_PRIO) {
+        SET_GC_MARK(b, GC_MARK_METADATA);
+        SET_GC_MOVE(b, 0);
+        b->prio = BTREE_PRIO;
+    } else {
+        SET_GC_MARK(b, GC_MARK_RECLAIMABLE);
+        SET_GC_MOVE(b, 0);
+        b->prio = INITIAL_PRIO;
+    }
+    ...
+---
+The btree's bucket is allocated with RESERVE_BTREE which is the highest priority.
+</pre>
+<li> Bcache bootup
+<pre>
+run_cache_set
+---
+    if (CACHE_SYNC(&c->sb)) {
+        ...
+        if (bch_journal_read(c, &journal))
+        ...
+        for_each_cache(ca, c, i)
+            prio_read(ca, j->prio_bucket[ca->sb.nr_this_dev]);
+        ...
+<font color="red">
+        k = &j->btree_root;
+</font>
+        ...
+        c->root = bch_btree_node_get(c, NULL, k,
+                         j->btree_level,
+                         true, NULL);
+        ...
+        if (bch_btree_check(c))
+            goto err;
+        ...
+        for_each_cache(ca, c, i)
+            if (bch_cache_allocator_start(ca))
+                goto err;
+---
+The bch_btree_check is the key here.
+It will iterate the btree and invoke bch_initial_mark_key for
+every bkey in the btree.
+bch_initial_mark_key
+  -> __bch_btree_mark_key
+     ---
+        if (level)
+            SET_GC_MARK(g, GC_MARK_METADATA);
+        else if (KEY_DIRTY(k))
+            SET_GC_MARK(g, GC_MARK_DIRTY);
+        else if (!GC_MARK(g))
+            SET_GC_MARK(g, GC_MARK_RECLAIMABLE);
+     ---
+</pre>
+</ul>
+
+</font>
+</p>
+
+
+<h3><a name="buckets_generation">buckets generation</a></h3>
+<p>
+<font size="2">
+Every bucket has a generation. When it is allocated, the PTR_GEN(bkey) will
+record this. Through dance of the buckets' generation, we could omit the btree
+deleting operation.
+See
+<pre>
+static inline uint8_t gen_after(uint8_t a, uint8_t b)
+{
+    uint8_t r = a - b;
+<font color="blue">
+    // The 'r > 128' here is to defense the case b > a
+</font>
+    return r > 128U ? 0 : r;
+}
+
+static inline uint8_t ptr_stale(struct cache_set *c, const struct bkey *k,
+                unsigned int i)
+{
+    return gen_after(PTR_BUCKET(c, k, i)->gen, PTR_GEN(k, i));
+}
+</pre>
+</font>
+<br/>
+But there is one scenario need to be noted.
+<pre>
+
+
+             +-------------+
+               |A-5| ... |B-5|                
+  |            +-------------+                
+                |          |                  
+  |           v          v                  
+         +------------+  +------------+       
+  |      |     old    |  |     new    |       
+         +------------+  +------------+
+  |                                                   /\
+  V      increment the bucket's gen of key A to 6    /  \    .---- POWER OFF !!!
+                                             <------'    \  /
+         write the prio_set out to disk                   \/
+
+So when we power off and setup the bcache again, we will get,
+         +-------------+
+         |A-5| ... |B-5|          Bucket's gen of A is still 5.
+         +-------------+                
+          |          |                  
+          v          v                  
+   +------------+  +------------+       
+   |     old    |  |     new    |       
+   +------------+  +------------+
+
+
+And we get both old and new for the same KEY_OFFSET & KEY_INODE.
+
+How to fix this ? It's make_btree_freeing_key.
+
+Insert a key with ZERO_KEY, PTR_OFFSET(a) and <font color="red">PTR_GEN(A) + 1</font>.
+
+The bkey B and the freed bkey will be inserted together and the COW btree
+mechanism will ensure if B bkey is there, must be freed bkey.
+
+Then when run_cache_set, bch_btree_check_recurse will identify the freed bkey.
+bch_initial_mark_key
+---
+    for (i = 0; i < KEY_PTRS(k); i++)
+        if (ptr_available(c, k, i) &&
+            !ptr_stale(c, k, i)) {
+            struct bucket *b = PTR_BUCKET(c, k, i);
+
+            b->gen = PTR_GEN(k, i);
+<font color="blue">
+            // get the incremented generation of the freed bfree
+            // this could ensure bkey A to be stale.
+</font>
+            ...
+        }
+
+    __bch_btree_mark_key(c, level, k);
+    ---
+<font color="blue">
+    /*
+     * ptr_invalid() can't return true for the keys that mark btree nodes as
+     * freed, but since ptr_bad() returns true we'll never actually use them
+     * for anything and thus we don't want mark their pointers here
+     */
+    Question:
+        Yes, we never actually use the freed btree nodes for anything, but they
+        also will not be reclaimed, right ?
+</font>
+    if (!bkey_cmp(k, &ZERO_KEY))
+        return stale;
+    ---
+---
+
+</pre>
+</p>
+
+<h2><a name="cache_data">cache_data</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<h3><a name="COWed_cache_data">COWed cache data</a></h3>
+<p>
+<font size="2">
+<B>Yes, the bcache cache data is COWed.</B>
+<pre>
+cached_dev_write
+---
+    if (s->iop.bypass) {
+        ...
+    } else if (s->iop.writeback) {
+        bch_writeback_add(dc);
+        s->iop.bio = bio;
+        ...
+    } else {
+        ...
+    }
+
+insert_data:
+    closure_call(&s->iop.cl, bch_data_insert, NULL, cl);
+    continue_at(cl, cached_dev_write_complete, NULL);
+---
+bch_data_insert
+  -> bch_data_insert_start
+  ---
+    do {
+        ...
+        k = op->insert_keys.top;
+        bkey_init(k);
+        SET_KEY_INODE(k, op->inode);
+        SET_KEY_OFFSET(k, bio->bi_iter.bi_sector);
+<font color="">
+        // Allocate buckets directly
+</font>
+        if (!bch_alloc_sectors(op->c, k, bio_sectors(bio),
+                       op->write_point, op->write_prio,
+                       op->writeback))
+            goto err;
+
+        n = bio_next_split(bio, KEY_SIZE(k), GFP_NOIO, split);
+
+        n->bi_end_io    = bch_data_insert_endio;
+        n->bi_private    = cl;
+
+        if (op->writeback) {
+            SET_KEY_DIRTY(k, true);
+
+            for (i = 0; i < KEY_PTRS(k); i++)
+                SET_GC_MARK(PTR_BUCKET(op->c, k, i),
+                        GC_MARK_DIRTY);
+        }
+
+        SET_KEY_CSUM(k, op->csum);
+        if (KEY_CSUM(k))
+            bio_csum(n, k);
+
+        bch_keylist_push(&op->insert_keys);
+
+        bio_set_op_attrs(n, REQ_OP_WRITE, 0);
+        bch_submit_bbio(n, op->c, k, 0);
+    } while (n != bio);
+
+    op->insert_data_done = true;
+    continue_at(cl, bch_data_insert_keys, op->wq);
+    return;
+
+  ---
+</pre>
+The benefits of COWed cache data is,
+<pre>
+    allocate new bucket     /\
+    write on it            /  \    .----- POWER OFF !!!
+                     <----'    \  /
+    write complete              \/
+
+    insert new bkey into the btree
+    insert freed bkey into the btree
+    (make_btree_freeing_key will increment
+     the gen of original bucket)
+</pre>
+
+If poweroff as above, the original data buckets will not be corrupted and it<br/>
+will be still in the btree because make_btree_freeing_key has not been invoked.<br/>
+
+(If we write the data to original block directly and poweroff before complete,<br/>
+ the data in the bucket will be corrupted. Even if the bucket size is same with<br/>
+ device block size, it may still be written partially.)
+</font>
+</p>
+
+
+</body>
+</html>
