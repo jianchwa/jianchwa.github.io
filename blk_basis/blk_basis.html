@@ -43,6 +43,10 @@
 <li><a href="#Setup_and_complete_a_bio">Setup and complete a bio</a>
 <li><a href="#Bio_operations">Bio operations</a>
 <li><a href="#Bio_split">Bio split</a>
+<li><a href="#stacked_bio_layer">stacked bio layer</a>
+<ul>
+<li><a href="#bios_from_stacked_devices">bios from stacked devices</a>
+</ul>
 </ul>
 <a href="#Merge">Merge</a><br/>
 <a href="#FLUSH_and_FUA">FLUSH and FUA</a><br/>
@@ -79,6 +83,8 @@
 <li><a href="#blk_and_hardware">blk and hardware</a>
 <ul>
 <li><a href="#dma_alignment">dma alignment</a>
+<li><a href="#block_size">block size</a>
+<li><a href="#gap">gap</a>
 </ul>
 <a href="#DISCARD">DISCARD</a>
 <ul>
@@ -1925,6 +1931,140 @@ blk_queue_split
 </pre>
 </font>
 </p>
+
+<h3><a name="stacked_bio_layer">stacked bio layer</a></h3>
+<h4><a name="bios_from_stacked_devices">bios from stacked devices</a></h4>
+<p>
+<font size= "2">
+
+How does the generic_make_request handle bios from stacked devices ?
+<pre>
+Two important code fragment,
+
+#1
+---
+    if (current->bio_list) {
+        bio_list_add(&current->bio_list[0], bio);
+        goto out;
+    }
+
+---
+
+#2
+---
+    do {
+        bool enter_succeeded = true;
+
+        if (unlikely(q != bio->bi_disk->queue)) {
+            if (q)
+                blk_queue_exit(q);
+            q = bio->bi_disk->queue;
+            flags = 0;
+            if (bio->bi_opf & REQ_NOWAIT)
+                flags = BLK_MQ_REQ_NOWAIT;
+            if (blk_queue_enter(q, flags) < 0) {
+                enter_succeeded = false;
+                q = NULL;
+            }
+        }
+
+        if (enter_succeeded) {
+            struct bio_list lower, same;
+
+            /* Create a fresh bio_list for all subordinate requests */
+            bio_list_on_stack[1] = bio_list_on_stack[0];
+            bio_list_init(&bio_list_on_stack[0]);
+            ret = q->make_request_fn(q, bio);
+
+            /* sort new bios into those for a lower level
+             * and those for the same level
+             */
+            bio_list_init(&lower);
+            bio_list_init(&same);
+            while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+                if (q == bio->bi_disk->queue)
+                    bio_list_add(&same, bio);
+                else
+                    bio_list_add(&lower, bio);
+            /* now assemble so we handle the lowest level first */
+            bio_list_merge(&bio_list_on_stack[0], &lower);
+            bio_list_merge(&bio_list_on_stack[0], &same);
+            bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+        } else {
+            if (unlikely(!blk_queue_dying(q) &&
+                    (bio->bi_opf & REQ_NOWAIT)))
+                bio_wouldblock_error(bio);
+            else
+                bio_io_error(bio);
+        }
+        bio = bio_list_pop(&bio_list_on_stack[0]);
+    } while (bio);
+---
+
+Let's take the stripe as an example,
+
+
+       stripe_dev
+
+       bio 0 ~ 31
+  |--------------------|
+  +--+  +--+  +--+  +--+
+  |  |  |  |  |  |  |  | } 4K (8 sectors)
+  +--+  +--+  +--+  +--+
+  |  |  |  |  |  |  |  |
+  +--+  +--+  +--+  +--+
+  |  |  |  |  |  |  |  |
+  +--+  +--+  +--+  +--+
+
+  dev0  dev1  dev2  dev3
+
+Round #1
+
+bio[0, 31].stripe_dev
+q->make_request_fn
+then,
+bio_list_on_stack[0] -> bio[0, 7].dev0 -> bio[8, 31].stripe_dev
+then,
+lower -> bio[0, 7].dev0
+same -> bio[8, 31].stripe_dev
+then
+bio_list_on_stack[0] ->  bio[0, 7].dev0 ->  bio[8, 31].stripe_dev
+
+Round #2
+
+bio[0, 7].dev0 is picked up to handle
+bio_list_on_stack[1] -> bio[8, 31].stripe_dev
+q->make_request_fn
+bio_list_on_stack[0] is NULL
+then
+bio_list_on_stack[1] is merged into bio_list_on_stack[0]
+bio_list_on_stack[0] -> bio[8, 31].stripe_dev
+
+Round #3
+
+bio[8, 31].stripe_dev is picked up to handle
+q->make_request_fn
+then
+bio_list_on_stack[0] -> bio[8, 15].dev1 -> bio[16, 31].stripe_dev
+then
+lower ->  bio[8, 15].dev1
+same -> bio[16, 31].stripe_dev
+then
+bio_list_on_stack
+bio_list_on_stack[0] -> bio[8, 15].dev1 -> bio[16, 31].stripe_dev
+
+Round #4
+
+bio[8, 15].dev1 is picked up to handle
+bio_list_on_stack[1] ->bio[16, 31].stripe_dev
+....
+
+
+
+</pre>
+</font>
+</p>
+
 
 
 <h2><a name="Merge">Merge</a></h2>
@@ -4820,15 +4960,126 @@ Another similar interface is blk_rq_map_user_iov.
 
 </font>
 </p>
+<h3><a name="block_size">block size</a></h3>
+<p>
+<font size="2">
+The blocksize of filesystem and block device.<br/>
+<font color="red">
+Block: The smallest unit writable by a disk or ﬁle system. Everything a ﬁle system does is <br/>
+composed of operations done on blocks. A ﬁle system block is always the same size as or larger <br/>
+(in integer multiples) than the disk block size.</br>
+</font>
+
+<pre>
+
+</pre>
+The bdev_logical_block_size is the q->limits.logical_block_size.
+Look at how does the nvme set it.
+<pre>
+__nvme_revalidate_disk
+---
+    ns->lba_shift = id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ds;
+    ...
+    nvme_update_disk_info
+    ---
+        unsigned short bs = 1 << ns->lba_shift;
+
+        blk_mq_freeze_queue(disk->queue);
+        blk_integrity_unregister(disk);
+
+        blk_queue_logical_block_size(disk->queue, bs);
+        blk_queue_physical_block_size(disk->queue, bs);
+        blk_queue_io_min(disk->queue, bs);
+    ---
+---
+</pre>
+
+The most important point here is that the blocksize is set during mkfs.
+
+</font>
+</p>
+
+<h3><a name="dma_alignment">dma alignment</a></h3>
+<p>
+<font size="2">
+
+What is the gap ?<br/>
+
+It is indicated by queue_virt_boundary.
+
+<pre>
+The NVME PRP descriptor which is PAGE_SIZE aligned
+                                         
+  page A+-----+                page A+-----+            
+        |     | \ PAGE_SIZE          |     | \ PAGE_SIZE
+        |     | /                    |     | /              
+  page B+-----+                page B+-----+                
+        |     | \ PAGE_SIZE          |_ _ _| > PAGE_SIZE/2
+        |     | /                    | GAP |
+  page C+-----+                page C+-----+                
+        |     | \ PAGE_SIZE          |     | \ PAGE_SIZE
+        |     | /                    |     | /              
+        +-----+                      +-----+ 
+
+So if we want to handle the unaligned PAGE_SIZE IO, need to
+split the IO into 3 parts as following,
+
+page A+-----+              page B+-----+                page C+-----+                
+      |     | \ PAGE_SIZE        |_ _ _| > PAGE_SIZE/2        |     | \ PAGE_SIZE
+      |     | /                                               |     | /              
+      +-----+                                                 +-----+ 
+
+This is done by blk_queue_split.
+
+blk_queue_split
+  -> blk_bio_segment_split
+  ---
+    bio_for_each_segment(bv, bio, iter) {
+        /*
+         * If the queue doesn't support SG gaps and adding this
+         * offset would create a gap, disallow it.
+         */
+        if (bvprvp && bvec_gap_to_prev(q, bvprvp, bv.bv_offset))
+            goto split;
+        ....
+    }
+split:
+    *segs = nsegs;
+
+    if (do_split) {
+        new = bio_split(bio, sectors, GFP_NOIO, bs);
+        if (new)
+            bio = new;
+    }
+  ---
+</pre>
+
+And let's check other places that need to check this.
+<pre>
+// the buffer may come from userspace and not aligned
+blk_rq_map_user_iov
+// don't merge bios or requests if will gap
+bio_will_gap <- req_gap_back_merge <- ll_back_merge_fn
+                                   <- ll_merge_requests_fn
+
+bvec_gap_to_prev <- bio_integrity_add_page
+　　　　　　　　 <- bio_add_pc_page
+                 <- integrity_req_gap_back_merge
+</pre>
+
+Before queue_virt_boundary is introduced, we use QUEUE_FLAG_SG_GAPS
+<pre>
+QUEUE_FLAG_SG_GAPS
+And we check this flag in following positions.
+
+__bio_add_page
+ll_merge_requests_fn
+blk_rq_merge_ok
+</pre>
 
 
-<a href="#DISCARD">DISCARD</a>
-<ul>
-<li><a href="#What_is_discard">What is discard</a>
-<li><a href="#discard_in_blk">discard in blk</a>
-<li><a href="#discard_in_fs">discard in fs</a>
-</ul>
-
+</font>
+</p>
 
 <h3><a name="DISCARD">DISCARD</a></h3>
 <h4><a name="What_is_discard">What is discard</a></h4>
@@ -4888,6 +5139,69 @@ no longer needed as a result of file deletions or volume formatting. When an LBA
 replaced by the OS, as with an overwrite of a file, the SSD knows that the original
 LBA can be marked as stale or invalid and it will not save those blocks during Garbage
 collection.
+
+
+A simple example of SSD write,
+(Assume application only write in erase blocks)
+
+|----| erase block
+  -    free
+  o    used
+  i    invalid 
+
+   |ooooo|-----|-----|-----|-----|
+   \__ __/                 \__ __/
+      v                       v
+	File1                  Reserved
+
+
+When we write to File1,
+
+	    RMW
+      .-----.
+     /      v
+   |iiiii|ooooo|-----|-----|-----|
+         \__ __/           \__ __/
+            v                 v
+          File1            Reserved
+
+The original position of File1 will be reclaimed then.
+
+If we delete File1 in filesystem layer,
+
+   |-----|ooooo|-----|-----|-----|
+                           \__ __/
+                              v
+                          Reserved
+   
+SSD controller doesn't know this the File1 has been deleted,
+so it still think there is valid data in the block. And if
+such things happen multiple times, we would get,
+
+   |ooooo|ooooo|ooooo|ooooo|-----|
+   \__ __/     \__ __/     \__ __/
+      v           v           v
+    File2       File3      Reserved
+
+And only two of them has a valid file on it. (filesytem knows
+which block is free).
+
+When we write data in File2 and File3 in parallel,
+SSD controller has to use the Reserved block. However, there
+is only one in our case, when one write is ongoing, another one
+has to wait.
+
+This is why the SSDs would become slower when it fills up.
+
+If we DISCARD support in filesystem, when a file is deleted, filesystem
+will tell the SSD controller that the associated blocks are invalid
+and could be reclaimed. Then we would have,
+
+   |ooooo|-----|ooooo|-----|-----|
+   \__ __/     \__ __/     \__ __/
+      v           v           v
+    File2       File3      Reserved
+
 </pre>
 <br/>
 Another useful link about this <a href="https://lwn.net/Articles/293658/">Block layer discard requests</a>
@@ -5084,7 +5398,52 @@ ext4_process_freed_data
 </p>
 
 
+<h4><a name="trouble_with_discard">The trouble with discard</a></h4>
+<p>
+<font size="2">
+<pre>
+https://lwn.net/Articles/347511/
 
+At the ATA protocol level, a discard request is implemented by a "TRIM" command sent to the device.
+For reasons unknown to your editor, the protocol committee designed TRIM as a non-queued command.
+That means that, before sending a TRIM command to the device, the block layer must first wait for
+all outstanding I/O operations on that device to complete; no further operations can be started
+until the TRIM command completes. So every TRIM operation stalls the request queue. Even if TRIM 
+were completely free, its non-queued nature would impose a significant I/O performance cost. (It's
+worth noting that the SCSI equivalent to TRIM is a tagged command which doesn't suffer from this
+problem).
+
+With current SSDs, TRIM appears to be anything but free. Mark Lord has measured regular delays of
+hundreds of milliseconds. Delays on that scale would be most unwelcome on a rotating storage device.
+On an SSD, hundred-millisecond latencies are simply intolerable.
+</pre>
+
+In one word, discard is not free. <br/>
+<br/>
+Someone complained that
+<pre>
+XFS has had async discard support, but it has been problematic for our
+fleet. We were seeing bursts of large discard requests caused by async
+discard in XFS. This resulted in degraded drive performance increasing
+latency for dependent services.
+</pre>
+And proposed alternative that filesystem layer could reuse the blocks which has just been freed.
+<pre>
+   |ooooo|-----|-----|-----|-----|
+   \__ __/                 \__ __/
+      v                       v
+	File1                  Reserved
+
+Deleted File1 and then create File2,
+
+   |ooooo|-----|-----|-----|-----|
+   \__ __/                 \__ __/
+      v                       v
+	File2                  Reserved
+</pre>
+
+</font>
+</p>
 
 </body>
 </html>

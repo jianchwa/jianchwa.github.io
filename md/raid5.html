@@ -1,0 +1,2318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RAID5</title>
+</head>
+<body>
+<div>
+    <h1>RAID5</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#CONCEPTS">CONCEPTS</a>
+<ul>
+<li><a href="#STRIPE">STRIPE</a>
+</ul>
+
+<a href="#IMPLEMENTATION">IMPLEMENTATION</a>
+<ul>
+<li><a href="#R5_STATE">R5_STATE</a>
+<li><a href="#raid_run_ops">raid_run_ops</a>
+<li><a href="#SH_STATE">SH_STATE</a>
+<li><a href="#magic_of_sh_count">magic of sh->count </a>
+<li><a href="#Stripe_Cache">Stripe Cache</a>
+</ul>
+<a href="#Failure_Management">Failure Management</a>
+<ul>
+<li><a href="#Read_Failure">Read Failure</a>
+<li><a href="#Write_Failure">Write Failure</a>
+</ul>
+<a href="#DISCUSSION">DISCUSSION</a>
+<ul>
+<li><a href="#A_standard_write_process">A standard write process</a>
+<li><a href="#read_error">read error</a>
+<li><a href="#add_new_io_to_active_sh">add new IO to active sh</a>
+<li><a href="#Overlapped_IO_ON_A_SAME_STRIPE">Overlapped IO on a same stripe</a>
+</ul>
+<a href="#TRACE_LOG">TRACE　LOG</a>
+<ul>
+<li><a href="#WRTIE_ON_4K_STRIPE">WRITE ON 4K STRIPE</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="CONCEPTS">CONCEPTS</a></h2>
+<h3><a name="STRIPE">STRIPE</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<pre>
+
+STRIPE_SECTORS  == PAGE_SIZE
+                            STRIPE
+         _____________________^_____________________
+        /                                           \
+        +---+     +---+     +---+     +---+     +---+ > STRIPE_SECTORS (4K)
+        |C00|     |C01|     |C02|     |C03|     | P |
+        +---+     +---+     +---+     +---+     +---+
+        |C04|     |C05|     |C06|     | P |     |C07|
+        +---+     +---+     +---+     +---+     +---+
+        |C08|     |C09|     | P |     |C10|     |C11|
+        +---+     +---+     +---+     +---+     +---+
+        |C12|     | P |     |C13|     |C14|     |C15|
+        +---+     +---+     +---+     +---+     +---+
+        | P |     |C16|     |C17|     |C18|     |C19|
+        +---+     +---+     +---+     +---+     +---+
+
++---+
+|C00|    Chunk, the unit to decide how to distribute among the disks.
++---+
+
+STRIPE   A stripe contains the 4K slices of every row.
+
+
+In software, the bio will be attached on a stripe_head.
+
+
+        +---+   o +---+   o +---+     +---+     +---+ \
+        |SH0|   | |SH0|   | |SH0|     |SH0|     |SH0|  |  
+      o +---+   | +---+   | +---+     +---+     +---+  |
+      | |SH1|   | |SH1|   | |SH1|     |SH1|     |SH1|  | 
+      | +---+   | +---+   o +---+     +---+     +---+   > CHUNK
+      | |SH2|   | |SH2|     |SH2|     |SH2|     |SH2|  | 
+      | +---+   | +---+     +---+     +---+     +---+  |
+      | |SH3|   | |SH3|     |SH3|     |SH3|     |SH3|  |   
+      o +---+   o +---+     +---+     +---+     +---+ /
+
+o
+|  A bio could span SHs like this.
+o
+
+The bios in one sh will be lined in sh->dev[dd_idx].to_write or to_read.
+There could be multiple bios linked into sh->dev[dd_idx].to_write if they are
+not big enough to span the whole STRIPE_SECTORS. bio->bi_next is used to link
+them.
+
+The question is:
+since the one bio could span multiple sh's, is the single bio->bi_next enough ?
+
+The answer is YES.
+If a bio spans multiple sh's, the intermediate ones' size must be STRIPE_SECTORS
+and there will be no other bios there.
+
+</pre>
+
+<font color="red">
+Next, we need to figure out why does the read benefit from the bigger chunk size.
+</font>
+
+</font>
+</p>
+
+
+<h2><a name="IMPLEMENTATION">IMPLEMENTATION</a></h2>
+<h3><a name="R5_STATE">R5_STATE</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> R5_UPTODATE
+<pre>
+ops_complete_compute
+---
+	/* mark the computed target(s) as uptodate */
+	mark_target_uptodate(sh, sh->ops.target);
+	mark_target_uptodate(sh, sh->ops.target2);
+	---
+		tgt = &sh->dev[target];
+		set_bit(R5_UPTODATE, &tgt->flags);
+		BUG_ON(!test_bit(R5_Wantcompute, &tgt->flags));
+		clear_bit(R5_Wantcompute, &tgt->flags);
+	---
+
+	clear_bit(STRIPE_COMPUTE_RUN, &sh->state);
+	if (sh->check_state == check_state_compute_run)
+		sh->check_state = check_state_compute_result;
+	set_bit(STRIPE_HANDLE, &sh->state);
+	raid5_release_stripe(sh);
+---
+
+ops_complete_reconstruct
+raid5_end_read_request
+</pre>
+<li> R5_Wantfill
+<pre>
+ops_run_biofill
+
+hand the bios on sh->toread to sh->read under sh->stripe_lock
+trigger asynchronously memcpy from sh->dev[].page to bio
+complete cb is ops_complete_biofill
+
+ops_complete_biofill
+clear R5_Wantfill
+bio_endio
+hand to next
+</pre>
+<li>R5_Wantread
+<pre>
+handle_stripe // for example, s.to_read
+  -> handle_stripe_fill
+    -> fetch_block
+	---
+	} else if (test_bit(R5_Insync, &dev->flags)) {
+			set_bit(R5_LOCKED, &dev->flags);
+			set_bit(R5_Wantread, &dev->flags);
+			s->locked++;
+		}
+	---
+
+handle_stripe_dirtying
+
+check which is cheaper between reconstruct and rmw
+and decide which need to be read
+
+	 for (i = disks; i--; ) {
+		struct r5dev *dev = &sh->dev[i];
+<font color="blue">
+		/* would I have to read this buffer for read_modify_write */
+		// Need to read the dev to be written and parity dev
+</font>
+		if (((dev->towrite && !delay_towrite(conf, dev, s)) ||
+		     i == sh->pd_idx || i == sh->qd_idx ||
+		     test_bit(R5_InJournal, &dev->flags)) &&
+		    !test_bit(R5_LOCKED, &dev->flags) &&
+		    !(uptodate_for_rmw(dev) ||
+		      test_bit(R5_Wantcompute, &dev->flags))) {
+			if (test_bit(R5_Insync, &dev->flags))
+				rmw++;
+			else
+				rmw += 2*disks;  /* cannot read it */
+		}
+<font color="blue">
+		/* Would I have to read this buffer for reconstruct_write */
+		// Need to read all of the devs that not be overwritten (io spans whole PAGE)
+</font>
+		if (!test_bit(R5_OVERWRITE, &dev->flags) &&
+		    i != sh->pd_idx && i != sh->qd_idx &&
+		    !test_bit(R5_LOCKED, &dev->flags) &&
+		    !(test_bit(R5_UPTODATE, &dev->flags) ||
+		      test_bit(R5_Wantcompute, &dev->flags))) {
+			if (test_bit(R5_Insync, &dev->flags))
+				rcw++;
+			else
+				rcw += 2*disks;
+		}
+	}
+</pre>
+
+<li> R5_Wantwrite
+<pre>
+
+For both R5_Wantwrite and R5_Wantread, they will be handled by
+
+ops_run_io
+----------------------
+
+sh->dev[].req is the bio that submitted to underlayer.
+
+	for (i = disks; i--; ) {
+		sh = head_sh;
+
+<font color="blue">
+		// Decide io op and flags based on sh->dev[].flags
+</font>
+		if (test_and_clear_bit(R5_Wantwrite, &sh->dev[i].flags)) {
+			op = REQ_OP_WRITE;
+			if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags))
+				op_flags = REQ_FUA;
+			if (test_bit(R5_Discard, &sh->dev[i].flags))
+				op = REQ_OP_DISCARD;
+		} else if (test_and_clear_bit(R5_Wantread, &sh->dev[i].flags))
+			op = REQ_OP_READ;
+		} else
+			continue;
+		if (test_and_clear_bit(R5_SyncIO, &sh->dev[i].flags))
+			op_flags |= REQ_SYNC;
+
+again:
+		bi = &sh->dev[i].req;
+		...
+		if (rdev) {
+			if (s->syncing || s->expanding || s->expanded
+			    || s->replacing)
+				md_sync_acct(rdev->bdev, STRIPE_SECTORS);
+
+			set_bit(STRIPE_IO_STARTED, &sh->state);
+
+			bio_set_dev(bi, rdev->bdev);
+			bio_set_op_attrs(bi, op, op_flags);
+			bi->bi_end_io = op_is_write(op)
+				? raid5_end_write_request
+				: raid5_end_read_request;
+			bi->bi_private = sh;
+
+			atomic_inc(&sh->count);
+			if (sh != head_sh)
+				atomic_inc(&head_sh->count);
+			if (use_new_offset(conf, sh))
+				bi->bi_iter.bi_sector = (sh->sector
+						 + rdev->new_data_offset);
+			else
+				bi->bi_iter.bi_sector = (sh->sector
+						 + rdev->data_offset);
+			if (test_bit(R5_ReadNoMerge, &head_sh->dev[i].flags))
+				bi->bi_opf |= REQ_NOMERGE;
+
+			sh->dev[i].vec.bv_page = sh->dev[i].page;
+			bi->bi_vcnt = 1;
+			bi->bi_io_vec[0].bv_len = STRIPE_SIZE;
+			bi->bi_io_vec[0].bv_offset = 0;
+			bi->bi_iter.bi_size = STRIPE_SIZE;
+			bi->bi_write_hint = sh->dev[i].write_hint;
+			if (!rrdev)
+				sh->dev[i].write_hint = RWF_WRITE_LIFE_NOT_SET;
+
+			if (should_defer && op_is_write(op))
+				bio_list_add(&pending_bios, bi);
+			else
+				generic_make_request(bi);
+		}
+		
+		if (!head_sh->batch_head)
+			continue;
+		sh = list_first_entry(&sh->batch_list, struct stripe_head,
+				      batch_list);
+		if (sh != head_sh)
+			goto again;
+<font color="blue">
+	// Handle the ios in the same chunk as they are contiguous in same device
+</font>
+	}
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="raid_run_ops">raid_run_ops</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+
+<ul>
+<li> STRIPE_OP_COMPUTE_BLK
+<pre>
+
+<B>SET</B>
+
+fetch_block
+---
+<font color="blue">
+	// All of the other disks has been uptodate,
+	// compute the left one.
+</font>
+		if ((s->uptodate == disks - 1) &&
+		    ((sh->qd_idx >= 0 && sh->pd_idx == disk_idx) ||
+		    (s->failed && (disk_idx == s->failed_num[0] ||
+				   disk_idx == s->failed_num[1])))) {
+			set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+			set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+			set_bit(R5_Wantcompute, &dev->flags);
+<font color="red">
+			sh->ops.target = disk_idx;
+</font>
+			sh->ops.target2 = -1; /* no 2nd target */
+			s->req_compute = 1;
+---
+
+handle_parity_checks5
+---
+<font color="blue">
+		/* handle a successful check operation, if parity is correct
+		 * we are done.  Otherwise update the mismatch count and repair
+		 * parity if !MD_RECOVERY_CHECK
+		 */
+</font>
+		if ((sh->ops.zero_sum_result & SUM_CHECK_P_RESULT) == 0)
+			/* parity is correct (on disc,
+			 * not in buffer any more)
+			 */
+			set_bit(STRIPE_INSYNC, &sh->state);
+		else {
+			atomic64_add(STRIPE_SECTORS, &conf->mddev->resync_mismatches);
+			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery)) {
+			...
+			} else {
+				sh->check_state = check_state_compute_run;
+				set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+				set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+				set_bit(R5_Wantcompute,
+					&sh->dev[sh->pd_idx].flags);
+<font color="red">
+				sh->ops.target = sh->pd_idx;
+</font>
+				sh->ops.target2 = -1;
+				s->uptodate++;
+			}
+		}
+
+---
+
+<B>HANDLE</B>
+ops_run_compute5
+---
+DEST:
+  	target = sh->ops.target;
+	tgt = &sh->dev[target];
+	xor_dest = tgt->page;
+SRCS:
+	for (i = disks; i--; )
+		if (i != target)
+			xor_srcs[count++] = sh->dev[i].page;
+COMPLETE:
+	ops_complete_compute
+---
+</pre>
+<li> STRIPE_OP_PREXOR
+<pre>
+<B>SET</B>
+schedule_reconstruction
+---
+RMW
+		for (i = disks; i--; ) {
+			struct r5dev *dev = &sh->dev[i];
+			if (i == pd_idx || i == qd_idx)
+				continue;
+
+			if (dev->towrite &&
+			    (test_bit(R5_UPTODATE, &dev->flags) ||
+			     test_bit(R5_Wantcompute, &dev->flags))) {
+<font color="red">
+				set_bit(R5_Wantdrain, &dev->flags);
+</font>
+				set_bit(R5_LOCKED, &dev->flags);
+				clear_bit(R5_UPTODATE, &dev->flags);
+				s->locked++;
+			}
+		}
+		if (!s->locked)
+			/* False alarm - nothing to do */
+			return;
+		sh->reconstruct_state = reconstruct_state_prexor_drain_run;
+<font color="red">
+		set_bit(STRIPE_OP_PREXOR, &s->ops_request);
+</font>
+		set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);
+		set_bit(STRIPE_OP_RECONSTRUCT, &s->ops_request);
+
+---
+
+
+<B>HANDLE</B>
+op
+DEST:
+	xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+SRCS:
+	for (i = disks; i--; ) {
+		struct r5dev *dev = &sh->dev[i];
+<font color="red">
+		if (test_bit(R5_Wantdrain, &dev->flags))
+</font>
+			xor_srcs[count++] = dev->page;
+	}
+COMPLETE:
+	ops_complete_prexor (DO nothing)
+
+</pre>
+
+<li> STRIPE_OP_PARTIAL_PARITY
+<li> STRIPE_OP_BIODRAIN
+<pre>
+<B>SET</B>
+schedule_reconstruction
+
+<B>HANDLE</B>
+Move the data from bio to sh->dev[].page
+ops_run_biodrain
+---
+	for (i = disks; i--; ) {
+		struct r5dev *dev;
+		struct bio *chosen;
+
+		sh = head_sh;
+		if (test_and_clear_bit(R5_Wantdrain, &head_sh->dev[i].flags)) {
+			struct bio *wbi;
+
+again:
+			dev = &sh->dev[i];
+			spin_lock_irq(&sh->stripe_lock);
+			chosen = dev->towrite;
+<font color="red">
+			dev->towrite = NULL;
+			sh->overwrite_disks = 0;
+			BUG_ON(dev->written);
+			wbi = dev->written = chosen;
+</font>
+			spin_unlock_irq(&sh->stripe_lock);
+
+			while (wbi && wbi->bi_iter.bi_sector <
+				dev->sector + STRIPE_SECTORS) {
+				if (wbi->bi_opf & REQ_FUA)
+					set_bit(R5_WantFUA, &dev->flags);
+				if (wbi->bi_opf & REQ_SYNC)
+					set_bit(R5_SyncIO, &dev->flags);
+				if (bio_op(wbi) == REQ_OP_DISCARD)
+					set_bit(R5_Discard, &dev->flags);
+				else {
+<font color="red">
+					// frombio is '1' here
+</font>
+					tx = async_copy_data(1, wbi, &dev->page,
+							     dev->sector, tx, sh,
+							     r5c_is_writeback(conf->log));
+					...
+				}
+				wbi = r5_next_bio(wbi, dev->sector);
+			}
+
+			if (head_sh->batch_head) {
+				sh = list_first_entry(&sh->batch_list,
+						      struct stripe_head,
+						      batch_list);
+				if (sh == head_sh)
+					continue;
+				goto again;
+			}
+		}
+	}
+---
+</pre>
+
+<li> STRIPE_OP_RECONSTRUCT
+<pre>
+<B>SET</B>
+schedule_reconstruction
+
+<B>HANDLE</B>
+ops_run_reconstruct5
+---
+	if (head_sh->reconstruct_state == reconstruct_state_prexor_drain_run) {
+		prexor = 1;
+		xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+		for (i = disks; i--; ) {
+			struct r5dev *dev = &sh->dev[i];
+			if (head_sh->dev[i].written ||
+			    test_bit(R5_InJournal, &head_sh->dev[i].flags))
+				xor_srcs[count++] = dev->page;
+		}
+<font color="blue">
+	//Same with STRIPE_OP_PREXOR, the difference is
+	// it use the sh->dev[].written
+	// STRIPE_OP_BIODRAIN will set .written.
+</font>
+	} else {
+		xor_dest = sh->dev[pd_idx].page;
+		for (i = disks; i--; ) {
+			struct r5dev *dev = &sh->dev[i];
+			if (i != pd_idx)
+				xor_srcs[count++] = dev->page;
+		}
+	}
+---
+</pre>
+<li> STRIPE_OP_CHECK
+<pre>
+<B>SET</B>
+handle_stripe
+---
+	if (sh->check_state ||
+	    (s.syncing && s.locked == 0 &&
+	     !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
+	     !test_bit(STRIPE_INSYNC, &sh->state))) {
+		if (conf->level == 6)
+			handle_parity_checks6(conf, sh, &s, disks);
+		else
+			handle_parity_checks5(conf, sh, &s, disks);
+	}
+---
+
+s.syncing is set to 1 in analyse_stripe when
+---
+	if (test_bit(STRIPE_SYNCING, &sh->state)) {
+		/* If there is a failed device being replaced,
+		 *     we must be recovering.
+		 * else if we are after recovery_cp, we must be syncing
+		 * else if MD_RECOVERY_REQUESTED is set, we also are syncing.
+		 * else we can only be replacing
+		 * sync and recovery both need to read all devices, and so
+		 * use the same flag.
+		 */
+		if (do_recovery ||
+		    sh->sector >= conf->mddev->recovery_cp ||
+		    test_bit(MD_RECOVERY_REQUESTED, &(conf->mddev->recovery)))
+			s->syncing = 1;
+		else
+			s->replacing = 1;
+	}
+---
+Looks like this will not be common case
+<B>HANDLE</B>
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="SH_STATE">SH_STATE</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> STRIPE_PREREAD_ACTIVE
+<pre>
+--------------------------
+raid5_make_request
+---
+			set_bit(STRIPE_HANDLE, &sh->state);
+			clear_bit(STRIPE_DELAYED, &sh->state);
+			if ((!sh->batch_head || sh == sh->batch_head) &&
+			    (bi->bi_opf & REQ_SYNC) &&
+			    !test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+				atomic_inc(&conf->preread_active_stripes);
+---
+The synchronous request would have STRIPE_PREREAD_ACTIVE and they will be
+handled prior to the ones that doesn't have this flag.
+
+raid5_activate_delayed
+---
+if (atomic_read(&conf->preread_active_stripes) < IO_THRESHOLD) {
+		while (!list_empty(&conf->delayed_list)) {
+			struct list_head *l = conf->delayed_list.next;
+			struct stripe_head *sh;
+			sh = list_entry(l, struct stripe_head, lru);
+			list_del_init(l);
+			clear_bit(STRIPE_DELAYED, &sh->state);
+			if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+				atomic_inc(&conf->preread_active_stripes);
+			list_add_tail(&sh->lru, &conf->hold_list);
+			raid5_wakeup_stripe_thread(sh);
+		}
+	}
+---
+
+It seems that the shs on conf->delayed_list would only be handled
+when conf->preread_active_stripes is less than IO_THRESHOLD.
+
+The shs with STRIPE_HANDLE and STRIPE_DELAYED will be added on conf->delayed_list.
+Basically, they are the shs that need preread.
+Refer to handle_stripe_dirtying.
+</pre>
+</ul>
+</font>
+<p>
+
+<h3><a name="magic_of_sh_count">magic of sh->count </a></h3>
+<p>
+<font size="2">
+The infrastructure is handle_active_stripes.
+<pre>
+handle_active_stripes
+---
+    while (batch_size < MAX_STRIPE_BATCH &&
+            (sh = __get_priority_stripe(conf, group)) != NULL)
+<font color="red">
+            ---<B>[1]</B>
+            BUG_ON(atomic_inc_return(&sh->count) != 1);
+            ---
+</font>
+        batch[batch_size++] = sh;
+    ...
+    for (i = 0; i < batch_size; i++)
+        handle_stripe(batch[i]);
+    ...
+    for (i = 0; i < batch_size; i++) {
+        hash = batch[i]->hash_lock_index;
+        __release_stripe(conf, batch[i], &temp_inactive_list[hash]);
+<font color="red">
+        ---<B>[3]</B>
+            if (atomic_dec_and_test(&sh->count))
+                do_release_stripe(conf, sh, temp_inactive_list);
+        ---
+</font>
+    }
+---
+</pre>
+When a sh is pending to wait to be handled, its count is zero.</Br>
+Conversely, only the sh->zero drop to zero, it could be handed to next stage.</Br>
+When we need to reference a sh, we should,
+<pre>
+1. increase the sh->count
+2. do what you want
+3. raid5_release_stripe
+</pre>
+raid5_release_stripe will hand the sh to conf->released_stripes if it is the
+last reference.
+<pre>
+---
+    /* Avoid release_list until the last reference.
+     */
+    if (atomic_add_unless(&sh->count, -1, 1))
+        return;
+
+    if (unlikely(!conf->mddev->thread) ||
+        test_and_set_bit(STRIPE_ON_RELEASE_LIST, &sh->state))
+        goto slow_path;
+    wakeup = llist_add(&sh->release_list, &conf->released_stripes);
+    if (wakeup)
+        md_wakeup_thread(conf->mddev->thread);
+    return;
+---
+</pre>
+The last reference will be dropped by
+<pre>
+raid5d
+  -> release_stripe_list
+    -> __release_stripe
+    ---
+    if (atomic_dec_and_test(&sh->count))
+        do_release_stripe(conf, sh, temp_inactive_list);
+    ---
+</pre>
+
+<B>Note:</B>
+<pre>
+do_release_stripe only hand the sh to pending list only when <font color="red"><B>STRIPE_HANDLE</B></font> is set.
+Otherwise, the sh will be released to conf->temp_inactive_list.
+</pre>
+</font>
+</p>
+
+<h3><a name="Stripe_Cache">Stripe Cache</a></h3>
+<p>
+<font size="2">
+The stripe cache means the stripe_head which is not one-off.
+<pre>
+If the R5_UPTODATE is set, it means the corresponding sh->dev[]->page
+contains the current data. (The 'current' here not means consistent with
+the data on disk, but could be newer. The data in sh->dev[]->page could
+be newly calculated parity or drained from the writting bio)
+</pre>
+
+<B>Maintain</B><br/>
+----------------------------<br/>
+The stripe_head's (cache) are maintained on two places.
+<ul>
+<li> stripe_hash
+<pre>
+All of the <font color="red"><B>initialized</B></font> sh's are on this hash list.
+init_stripe
+---
+    sh->disks = previous ? conf->previous_raid_disks : conf->raid_disks;
+    sh->sector = sector;
+    stripe_set_idx(sector, conf, previous, sh);
+    sh->state = 0;
+
+    for (i = sh->disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+        ...
+        dev->flags = 0;
+        dev->sector = raid5_compute_blocknr(sh, i, previous);
+    }
+    ...
+    sh->overwrite_disks = 0;
+<font color="red">
+    insert_hash(conf, sh);
+</font>
+    sh->cpu = smp_processor_id();
+    set_bit(STRIPE_BATCH_READY, &sh->state);
+---
+</pre>
+<li> inactive_list
+<pre>
+All of the inactive sh's are here.
+What does the inactive/idle mean ?
+handle_active_stripes
+---
+    for (i = 0; i < batch_size; i++)
+        handle_stripe(batch[i]);
+    cond_resched();
+
+    spin_lock_irq(&conf->device_lock);
+    for (i = 0; i < batch_size; i++) {
+        hash = batch[i]->hash_lock_index;
+        __release_stripe(conf, batch[i], &temp_inactive_list[hash]);
+    }
+---
+
+__release_stripe
+---
+<font color="red">
+    if (atomic_dec_and_test(&sh->count))
+</font>
+        do_release_stripe(conf, sh, temp_inactive_list);
+---
+do_release_stripe
+---
+    if (test_bit(STRIPE_HANDLE, &sh->state)) {
+        ...
+    } else {
+        atomic_dec(&conf->active_stripes);
+        if (!test_bit(STRIPE_EXPANDING, &sh->state)) {
+            if (!r5c_is_writeback(conf->log))
+                list_add_tail(&sh->lru, temp_inactive_list);
+            ...
+        }
+    }
+---
+
+So the inactive/idle means,
+<ul>
+<li> Nothing need to be done on it (No STRIPE_HANDLE)
+<li> sh->count is zero
+</ul>
+</pre>
+</ul>
+A initialized sh could be on both stripe_hash and inactive_list,<br/>
+so if we get a idle sh on the stripe_hash, we need to remove it from inactive_list.
+<pre>
+raid5_get_active_stripe
+---
+        sh = __find_stripe(conf, sector, conf->generation - previous);
+        if (!sh) {
+            ...
+<font color="red">
+        } else if (!atomic_inc_not_zero(&sh->count)) {
+</font>
+            spin_lock(&conf->device_lock);
+            if (!atomic_read(&sh->count)) {
+                if (!test_bit(STRIPE_HANDLE, &sh->state))
+                    atomic_inc(&conf->active_stripes);
+                inc_empty_inactive_list_flag = 0;
+                if (!list_empty(conf->inactive_list + hash))
+                    inc_empty_inactive_list_flag = 1;
+<font color="red">
+                list_del_init(&sh->lru);
+</font>
+                if (list_empty(conf->inactive_list + hash) && inc_empty_inactive_list_flag)
+                    atomic_inc(&conf->empty_inactive_list_nr);
+                ...
+            }
+            atomic_inc(&sh->count);
+            spin_unlock(&conf->device_lock);
+        }
+---
+</pre>
+
+
+<B>Policy</B><br/>
+----------------------------<br/>
+<ul>
+<li> If we could get a sh in the stripe_hash, say cache hit.
+<li> Otherwise, we need to get an idle one from the inactive_list.
+<pre>
+The sh will be reinitialized here.
+
+Maybe we need a smarter select policy here ?
+</pre>
+</ul>
+</font>
+</p>
+
+
+
+
+
+<h2><a name="Failure_Management">Failure Management</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font color="red">
+<B>
+The purpose of the RAID is to provide as much data availability as possible.
+</B>
+</font>
+</p>
+
+
+<h3><a name="Read_Failure">Read Failure</a></h3>
+<p>
+<font size="2">
+How to handle read failure ?<br/>
+What we have known is,
+<pre>
+#1. retry_aligned_read (R5_ReadNoMerge)
+#2. raid5_end_read_request (R5_ReadError)
+#3. analyse_stripe, s->failed > 0
+    fetch_block set R5_Wantread on all of the other sh->dev
+    then read in them
+#4. analyse_stripe, s->failed == 1
+    fetch_block, STRIPE_OP_COMPUTE_BLK
+    ops_run_compute5, set R5_UPTODATE on the completed sh-dev
+#5. analyse_stripe, R5_Wantfill
+    ops_run_biofill
+    complete the bio in ops_complete_biofill.
+</pre>
+What's next ? Is it over ?<br/>
+Following code fragment implies the answer.
+<pre>
+handle_stripe
+---
+    if (s.failed <= conf->max_degraded && !conf->mddev->ro)
+        for (i = 0; i < s.failed; i++) {
+            struct r5dev *dev = &sh->dev[s.failed_num[i]];
+            if (test_bit(R5_ReadError, &dev->flags)
+                && !test_bit(R5_LOCKED, &dev->flags)
+                && test_bit(R5_UPTODATE, &dev->flags)
+                ) {
+                if (!test_bit(R5_ReWrite, &dev->flags)) {
+                    set_bit(R5_Wantwrite, &dev->flags);
+                    set_bit(R5_ReWrite, &dev->flags);
+                    set_bit(R5_LOCKED, &dev->flags);
+                    s.locked++;
+                } else {
+                    /* let's read it back */
+                    set_bit(R5_Wantread, &dev->flags);
+                    set_bit(R5_LOCKED, &dev->flags);
+                    s.locked++;
+                }
+            }
+        }
+
+---
+</pre>
+There are actually two steps implied here.
+<ul>
+<li>STEP #1
+<pre>
+If just a ReadError, try to wrtite back the calculated data.
+</pre>
+<li>STEP #2
+<pre>
+try to read it back.
+</pre>
+</ul>
+The fundamental here is,
+<pre>
+Today, drives are intelligent - quite often they are actually running minix, or
+linux, or some other OS in their firmware, dedicated solely to managing the disk.
+So they manage the bad block list, they manage the CHS or LBA references, and as
+far as the computer using the drive is concerned, they just see a contiguous list
+of drive sectors that don't have any errors.
+
+Behind the scenes, however, if there is a physical problem with the disk, the disk
+firmware reshuffles where the data is stored on the disk, and hides it from the drive
+user. <font color="red">The user may see a read error, and have to deal with the loss of the data on
+that sector, but when they come to write to that sector again the drive will have
+moved the real physical location so the sector appears perfect again.</font>
+
+QUESTION:
+The first read may return a read error, what if a second read ?
+Garbage data or read error again ?
+</pre>
+
+If the read in STEP#2 still fails, the blocks will be set bad.
+<pre>
+raid5_end_read_request
+---
+    if (!bi->bi_status) {
+        ...
+    } else {
+        const char *bdn = bdevname(rdev->bdev, b);
+        int retry = 0;
+        int set_bad = 0;
+
+        clear_bit(R5_UPTODATE, &sh->dev[i].flags);
+        atomic_inc(&rdev->read_errors);
+        if (test_bit(R5_ReadRepl, &sh->dev[i].flags))
+            ...
+        else if (conf->mddev->degraded >= conf->max_degraded) {
+            ...
+        } else if (test_bit(R5_ReWrite, &sh->dev[i].flags)) {
+            /* Oh, no!!! */
+            set_bad = 1;
+        } else if (atomic_read(&rdev->read_errors)
+             > conf->max_nr_stripes)
+            pr_warn("md/raid:%s: Too many read errors, failing device %s.\n",
+                   mdname(conf->mddev), bdn);
+        else
+            retry = 1;
+    
+        if (set_bad && test_bit(In_sync, &rdev->flags)
+            && !test_bit(R5_ReadNoMerge, &sh->dev[i].flags))
+            retry = 1;
+    
+        if (retry)
+            if (test_bit(R5_ReadNoMerge, &sh->dev[i].flags)) {
+                set_bit(R5_ReadError, &sh->dev[i].flags);
+                clear_bit(R5_ReadNoMerge, &sh->dev[i].flags);
+            } else
+                set_bit(R5_ReadNoMerge, &sh->dev[i].flags);
+        else {
+<font color="red">
+            clear_bit(R5_ReadError, &sh->dev[i].flags);
+            clear_bit(R5_ReWrite, &sh->dev[i].flags);
+            if (!(set_bad
+                  && test_bit(In_sync, &rdev->flags)
+                  && rdev_set_badblocks(
+                      rdev, sh->sector, STRIPE_SECTORS, 0)))
+</font>
+                md_error(conf->mddev, rdev);
+        }
+    }
+---
+</pre>
+
+After set badblock, the read on it will need to be calculated.
+<pre>
+raid5_make_request
+  -> chunk_aligned_read
+    -> raid5_read_one_chunk
+---
+    if (rdev) {
+        sector_t first_bad;
+        int bad_sectors;
+
+        atomic_inc(&rdev->nr_pending);
+        rcu_read_unlock();
+        raid_bio->bi_next = (void*)rdev;
+        bio_set_dev(align_bi, rdev->bdev);
+        bio_clear_flag(align_bi, BIO_SEG_VALID);
+<font color="red">
+        if (is_badblock(rdev, align_bi->bi_iter.bi_sector,
+                bio_sectors(align_bi),
+                &first_bad, &bad_sectors)) {
+</font>
+            bio_put(align_bi);
+            rdev_dec_pending(rdev, mddev);
+            return 0;
+        }
+        ...
+    }
+---
+
+raid5_make_request
+---
+    if (rw == READ && mddev->degraded == 0 &&
+        mddev->reshape_position == MaxSector) {
+        bi = chunk_aligned_read(mddev, bi);
+        if (!bi)
+            return true;
+    }
+---
+When the IO touch the range of the bad blocks, the 'bi' above is not NULL.
+So the read IO will be handled by stripe fashion.
+There could be following scene,
+
+     _+---+
+    | |___| > <font color="red">badbloks</font>
+IO <  |   |
+    |_|   |
+      |   |
+      +---+
+
+When handle the IO in stripe fashion, the IO will be split up into parts which
+are STRIPE_SECTORS aligned. The parts of IO on badblocks need to be calculated,
+the others will be read directly.
+
+analyse_stripe
+---
+        is_bad = is_badblock(rdev, sh->sector, STRIPE_SECTORS,
+                         &first_bad, &bad_sectors);
+
+        clear_bit(R5_Insync, &dev->flags);
+        if (!rdev)
+            /* Not in-sync */;
+        else if (is_bad) {
+            /* also not in-sync */
+            if (!test_bit(WriteErrorSeen, &rdev->flags) &&
+                test_bit(R5_UPTODATE, &dev->flags)) {
+                /* treat as in-sync, but with a read error
+                 * which we can now try to correct
+                 */
+                set_bit(R5_Insync, &dev->flags);
+                set_bit(R5_ReadError, &dev->flags);
+            }
+        }
+---
+In this path, R5_Insync is not set, so it will trigger the following logic:
+
+                if (!test_bit(R5_Insync, &dev->flags)) {
+                        if (s->failed < 2)
+                                s->failed_num[s->failed] = i;
+                        s->failed++;
+                        if (rdev && !test_bit(Faulty, &rdev->flags))
+                                do_recovery = 1;
+                        else if (!rdev) {
+                                rdev = rcu_dereference(
+                                    conf->disks[i].replacement);
+                                if (rdev && !test_bit(Faulty, &rdev->flags))
+                                        do_recovery = 1;
+                        }
+                }
+
+Then s->failed > 0 and/or do_recovery = 1 will trick next steps of the repair.
+</pre>
+</font>
+</p>
+
+
+<h3><a name="Write_Failure">Write Failure</a></h3>
+<p>
+<font size="2">
+A write error is much more serious than a read error, see
+<pre>
+Hard drives handle media write errors by relocating the data so that the write
+error is not visible to the OS. Once a write error does get through, it either
+means there is a fairly serious problem with the device or some connector, or
+it means that drive's relocation area is full, which is again a fairly serious
+error.
+
+However several of the possible serious errors can still leave a device in a
+state where most of the blocks can be read. To provide as much data availability as
+possible, we could keep the it until a recovery process could save data in another
+device.
+</pre>
+
+What will raid5 do when encounter a write error.
+<pre>
+raid5_end_read_request
+---
+        if (bi->bi_status) {
+            set_bit(STRIPE_DEGRADED, &sh->state);
+            set_bit(WriteErrorSeen, &rdev->flags);
+            set_bit(R5_WriteError, &sh->dev[i].flags);
+            if (!test_and_set_bit(WantReplacement, &rdev->flags))
+                set_bit(MD_RECOVERY_NEEDED,
+                    &rdev->mddev->recovery);
+        } 
+---
+
+analyse_stripe
+---
+        if (test_bit(R5_WriteError, &dev->flags)) {
+            /* This flag does not apply to '.replacement'
+             * only to .rdev, so make sure to check that*/
+            struct md_rdev *rdev2 = rcu_dereference(
+                conf->disks[i].rdev);
+<font color="red">
+            if (rdev2 == rdev)
+                clear_bit(R5_Insync, &dev->flags);
+</font>
+            if (rdev2 && !test_bit(Faulty, &rdev2->flags)) {
+                s->handle_bad_blocks = 1;
+                atomic_inc(&rdev2->nr_pending);
+            } else
+                clear_bit(R5_WriteError, &dev->flags);
+        }
+---
+
+handle_stripe
+---
+    if (s.handle_bad_blocks)
+        for (i = disks; i--; ) {
+            struct md_rdev *rdev;
+            struct r5dev *dev = &sh->dev[i];
+            if (test_and_clear_bit(R5_WriteError, &dev->flags)) {
+                /* We own a safe reference to the rdev */
+                rdev = conf->disks[i].rdev;
+                if (!rdev_set_badblocks(rdev, sh->sector,
+                            STRIPE_SECTORS, 0))
+                    md_error(conf->mddev, rdev);
+                rdev_dec_pending(rdev, conf->mddev);
+            }
+            ...
+        }
+---
+</pre>
+The badblock and WriteErrorSeen flag will influence the raid5 process as
+<ul>
+<li>Read
+<pre>
+Need to calculate the data in the range of the badblocks, but will not rewrite
+them.
+analyse_stripe
+---
+    else if (is_bad) {
+            /* also not in-sync */
+            if (!test_bit(WriteErrorSeen, &rdev->flags) &&
+                test_bit(R5_UPTODATE, &dev->flags)) {
+                /* treat as in-sync, but with a read error
+                 * which we can now try to correct
+                 */
+                set_bit(R5_Insync, &dev->flags);
+                set_bit(R5_ReadError, &dev->flags);
+            }
+    }
+---
+</pre>
+<li>Write
+<pre>
+Skip the write on the badblocks of a device with WriteErrorSeen.
+ops_run_io
+---
+        while (op_is_write(op) && rdev &&
+               test_bit(WriteErrorSeen, &rdev->flags)) {
+            sector_t first_bad;
+            int bad_sectors;
+            int bad = is_badblock(rdev, sh->sector, STRIPE_SECTORS,
+                          &first_bad, &bad_sectors);
+            if (!bad)
+                break;
+
+            if (bad < 0) {
+                ...
+            } else {
+                /* Acknowledged bad block - skip the write */
+                rdev_dec_pending(rdev, conf->mddev);
+                rdev = NULL;
+            }
+        }
+---
+</pre>
+</ul>
+
+The most important thing need to be talked that does raid5 need to return error
+to upperlayer ?<br/>
+<pre>
+The core of the RAID (Redundant Array of Inexpensive Disks) is Redundancy.
+For RAID5, if lost one disk, the whole array still could work well.
+</pre>
+handle_stripe
+<pre>
+---
+    if (s.failed > conf->max_degraded ||
+        (s.log_failed && s.injournal == 0)) {
+        sh->check_state = 0;
+        sh->reconstruct_state = 0;
+        break_stripe_batch_list(sh, 0);
+        if (s.to_read+s.to_write+s.written)
+            handle_failed_stripe(conf, sh, &s, disks);
+        if (s.syncing + s.replacing)
+            handle_failed_sync(conf, sh, &s);
+    }
+    ...
+    if (s.written &&
+        (s.p_failed || ((test_bit(R5_Insync, &pdev->flags)
+                 && !test_bit(R5_LOCKED, &pdev->flags)
+                 && (test_bit(R5_UPTODATE, &pdev->flags) ||
+                 test_bit(R5_Discard, &pdev->flags))))) &&
+        (s.q_failed || ((test_bit(R5_Insync, &qdev->flags)
+                 && !test_bit(R5_LOCKED, &qdev->flags)
+                 && (test_bit(R5_UPTODATE, &qdev->flags) ||
+                 test_bit(R5_Discard, &qdev->flags))))))
+        handle_stripe_clean_event(conf, sh, disks);
+---
+
+handle_stripe_clean_event
+---
+    for (i = disks; i--; )
+        if (sh->dev[i].written) {
+            dev = &sh->dev[i];
+            if (!test_bit(R5_LOCKED, &dev->flags) &&
+                (test_bit(R5_UPTODATE, &dev->flags) ||
+<font color="blue">
+                // ops_complete_reconstruct will set R5_UPTODATE
+                // on parity disk and disk with written.
+</font>
+                 test_bit(R5_Discard, &dev->flags) ||
+                 test_bit(R5_SkipCopy, &dev->flags))) {
+                /* We can return any write requests */
+                ...
+                wbi = dev->written;
+                dev->written = NULL;
+                while (wbi && wbi->bi_iter.bi_sector <
+                    dev->sector + STRIPE_SECTORS) {
+                    wbi2 = r5_next_bio(wbi, dev->sector);
+                    md_write_end(conf->mddev);
+                    bio_endio(wbi);
+                    wbi = wbi2;
+                }
+                ...
+                if (head_sh->batch_head) {
+                    sh = list_first_entry(&sh->batch_list,
+                                  struct stripe_head,
+                                  batch_list);
+                    if (sh != head_sh) {
+                        dev = &sh->dev[i];
+                        goto returnbi;
+                    }
+                }
+                sh = head_sh;
+                dev = &sh->dev[i];
+            }
+        }
+
+---
+</pre>
+When there is 1 failure in the stripe, RAID5 could tolerate it and return
+success for it.
+</font>
+</p>
+
+
+<h2><a name="DISCUSSION">DISCUSSION</a></h2>
+<h3><a name="A_standard_write_process">A standard write process</a></h3>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<pre>
+       md0_raid5-1616  [006] ....   505.512174: handle_stripe: START TO HANDLE
+       md0_raid5-1616  [006] ....   505.512180: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.512185: dump_flags: sh state: ACTIVE PREREAD_ACTIVE 
+       md0_raid5-1616  [006] ....   505.512187: dump_flags: dd 0 : OVERWRITE 
+       md0_raid5-1616  [006] ....   505.512189: dump_flags: dd 1 : 
+       md0_raid5-1616  [006] ....   505.512189: dump_flags: dd 2 : 
+       md0_raid5-1616  [006] ....   505.512191: dump_flags: dd 3 : 
+       md0_raid5-1616  [006] ....   505.512192: dump_flags: pd 4 : 
+       md0_raid5-1616  [006] ....   505.512199: handle_stripe: l 0 ud 0 tr 0 tw 1 f 0 fn -1 -1
+<font color="blue">
+       handle_stripe_dirtying
+       rmw
+       STRIPE_PREREAD_ACTIVE is set
+       towrite and pd are set R5_LOCKED and R5_Wantread
+       schedule_reconstrcution does nothing
+</font>
+       md0_raid5-1616  [006] ....   505.512203: handle_stripe: RUN OPS AND IO
+       md0_raid5-1616  [006] ....   505.512204: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.512206: dump_flags: sh state: ACTIVE HANDLE PREREAD_ACTIVE 
+       md0_raid5-1616  [006] ....   505.512208: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantread 
+       md0_raid5-1616  [006] ....   505.512210: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.512211: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.512212: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.512214: dump_flags: pd 4 : LOCKED Insync Wantread 
+ <font color="blue">
+       ops_run_io clear R5_Wantread and submit
+
+       md0_raid5-1616  [006] ....   505.512249: handle_stripe: END
+
+       raid5_end_read_request
+       towrite and pd are set with R5_Uptodate and clean R5_LOCKED
+ </font>  
+       md0_raid5-1616  [006] ....   505.533277: handle_stripe: START TO HANDLE
+       md0_raid5-1616  [006] ....   505.533283: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.533288: dump_flags: sh state: ACTIVE PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533291: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1616  [006] ....   505.533292: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533294: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533295: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533297: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1616  [006] ....   505.533305: handle_stripe: l 0 ud 2 tr 0 tw 1 f 0 fn -1 -1
+<font color="blue">
+
+       schedule_construction
+       set R5_Wantdrain and R5_LOCKED and clear R5_Uptodate on towrite
+       set sh->reconstruct_state to prexor_drain_run
+
+</font>
+       md0_raid5-1616  [006] ....   505.533309: handle_stripe: RUN OPS AND IO
+       md0_raid5-1616  [006] ....   505.533310: dump_sh: sh 0 c 1 p 4 ck idle rc prexor_drain_run
+       md0_raid5-1616  [006] ....   505.533312: dump_flags: sh state: ACTIVE HANDLE PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533315: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1616  [006] ....   505.533316: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533317: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533318: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533320: dump_flags: pd 4 : LOCKED Insync 
+
+
+       md0_raid5-1616  [006] ...1   505.533321: raid_run_ops: sh 0 op prexor
+
+<font color="blue">     
+       towrite and pd contains old data read from disk
+       towrite XOR pd -> pd
+</font>
+       md0_raid5-1616  [006] ...1   505.533328: raid_run_ops: sh 0 op bio drain
+<font color="blue">
+
+       copy new data in the bios to the buffer in the sh->dev[].page
+       (the one with R5_Wantdrain)
+       clear towrite, set written
+
+       md0_raid5-1616  [006] ...1   505.533333: raid_run_ops: sh 0 op reconstruct
+       written, the new data from bio has been copied to buffer
+       pd is the old data XOR old parity
+       written XOR pd -> pd
+
+       Now the pd contains the newly and correct parity
+
+       This is the process of rmw
+       md0_raid5-1616  [006] ....   505.533338: handle_stripe: END
+       
+       opc_complete_reconstruct
+       set written and pd with R5_Uptodate
+       set sh->reconstruct_state to prexor_drain_result
+</font> 
+
+       md0_raid5-1616  [006] ....   505.533343: handle_stripe: START TO HANDLE
+       md0_raid5-1616  [006] ....   505.533344: dump_sh: sh 0 c 1 p 4 ck idle rc prexor_drain_result
+       md0_raid5-1616  [006] ....   505.533346: dump_flags: sh state: ACTIVE PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533348: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1616  [006] ....   505.533349: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533350: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533351: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533353: dump_flags: pd 4 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1616  [006] ....   505.533358: handle_stripe: l 2 ud 2 tr 0 tw 0 f 0 fn -1 -1
+
+<font color="blue">
+       handle_stripe when sh->reconstruct_state == prexor_drain_result
+       set the written and pd with R5_Wantwrite
+</font>
+
+       md0_raid5-1616  [006] ....   505.533360: handle_stripe: RUN OPS AND IO
+       md0_raid5-1616  [006] ....   505.533361: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.533362: dump_flags: sh state: ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533364: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1616  [006] ....   505.533366: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533367: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533368: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533370: dump_flags: pd 4 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+
+<font color="blue">
+       ops_run_io
+       write them out
+ 
+       md0_raid5-1616  [006] ....   505.533414: handle_stripe: END
+
+       raid5_end_write_request
+       clean the R5_LOCKED
+</font> 
+     
+       md0_raid5-1616  [006] ....   505.533671: handle_stripe: START TO HANDLE
+       md0_raid5-1616  [006] ....   505.533675: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.533678: dump_flags: sh state: ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533681: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1616  [006] ....   505.533683: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533684: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533685: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533687: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1616  [006] ....   505.533693: handle_stripe: l 0 ud 2 tr 0 tw 0 f 0 fn -1 -1
+<font color="blue">
+
+       handle_stripe if written and pd ! R5_LOCKED and R5_Uptodate
+       handle_stripe_clean_event
+</font>
+
+       md0_raid5-1616  [006] ....   505.533737: handle_stripe: RUN OPS AND IO
+       md0_raid5-1616  [006] ....   505.533739: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1616  [006] ....   505.533740: dump_flags: sh state: ACTIVE IO_STARTED 
+       md0_raid5-1616  [006] ....   505.533742: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1616  [006] ....   505.533743: dump_flags: dd 1 : Insync 
+       md0_raid5-1616  [006] ....   505.533745: dump_flags: dd 2 : Insync 
+       md0_raid5-1616  [006] ....   505.533746: dump_flags: dd 3 : Insync 
+       md0_raid5-1616  [006] ....   505.533747: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1616  [006] ....   505.533749: handle_stripe: END
+
+</pre>
+</font>
+</p>
+
+
+<h3><a name="read_error">read error</a></h3>
+<p>
+<font size="2">
+
+For a single read IO,
+<pre>
+raid5_make_request
+  -> chunk_aligned_read
+    -> raid5_read_one_chunk
+</pre>
+
+Its bi_end_io is raid5_align_endio<br/>
+
+The failed IO will be added to conf->retry_read_aligned_list<br/>
+
+<B>ROUND #1</B><br/>
+And handled by raid5d -> retry_aligned_read
+<pre>
+---
+    for (; logical_sector < last_sector;
+         logical_sector += STRIPE_SECTORS,
+             sector += STRIPE_SECTORS,
+             scnt++) {
+
+        if (scnt < offset)
+            /* already done this stripe */
+            continue;
+
+        sh = raid5_get_active_stripe(conf, sector, 0, 1, 1);
+
+        if (!sh) {
+            /* failed to get a stripe - must wait */
+            conf->retry_read_aligned = raid_bio;
+            conf->retry_read_offset = scnt;
+            return handled;
+        }
+
+        if (!add_stripe_bio(sh, raid_bio, dd_idx, 0, 0)) {
+            raid5_release_stripe(sh);
+            conf->retry_read_aligned = raid_bio;
+            conf->retry_read_offset = scnt;
+            return handled;
+        }
+
+        set_bit(R5_ReadNoMerge, &sh->dev[dd_idx].flags);
+        handle_stripe(sh);
+        raid5_release_stripe(sh);
+        handled++;
+    }
+---
+</pre>
+
+<B>ROUND #2</B><br/>
+Then fetch_block set R5_LOCKED and R5_Wantread.<br/>
+
+ops_run_io sends the sh out.<br/>
+
+If still fails,<br/>
+
+raid5_end_read_request
+<pre>
+---
+    if (!bi->bi_status) {
+        ...
+    } else {
+        clear_bit(R5_UPTODATE, &sh->dev[i].flags);
+        atomic_inc(&rdev->read_errors);
+        if (test_bit(R5_ReadRepl, &sh->dev[i].flags))
+            ...
+        else if (conf->mddev->degraded >= conf->max_degraded) {
+            ...
+        } else if (atomic_read(&rdev->read_errors)
+             > conf->max_nr_stripes)
+            ...
+        else
+            retry = 1;
+            ....
+        if (retry)
+            if (test_bit(R5_ReadNoMerge, &sh->dev[i].flags)) {
+<font color="red">
+                set_bit(R5_ReadError, &sh->dev[i].flags);
+</font>
+                clear_bit(R5_ReadNoMerge, &sh->dev[i].flags);
+            } else
+                set_bit(R5_ReadNoMerge, &sh->dev[i].flags);
+        else {
+            clear_bit(R5_ReadError, &sh->dev[i].flags);
+            clear_bit(R5_ReWrite, &sh->dev[i].flags);
+            if (!(set_bad
+                  && test_bit(In_sync, &rdev->flags)
+                  && rdev_set_badblocks(
+                      rdev, sh->sector, STRIPE_SECTORS, 0)))
+                md_error(conf->mddev, rdev);
+        }
+    }
+    rdev_dec_pending(rdev, conf->mddev);
+    bio_reset(bi);
+    clear_bit(R5_LOCKED, &sh->dev[i].flags);
+    set_bit(STRIPE_HANDLE, &sh->state);
+    raid5_release_stripe(sh);
+---
+</pre>
+
+<B>ROUND #3</B><br/>
+So how does handle_stripe handle R5_ReadError<br/>
+analyse_stripe
+<pre>
+---
+    for (i=disks; i--; ) {
+        ...
+        if (test_bit(R5_ReadError, &dev->flags))
+            clear_bit(R5_Insync, &dev->flags);
+        if (!test_bit(R5_Insync, &dev->flags)) {
+            if (s->failed < 2)
+                s->failed_num[s->failed] = i;
+            s->failed++;
+            ...
+        }
+        ...
+    }
+---
+</pre>
+Then <br/>
+handle_stripe_fill
+<pre>
+---
+        for (i = disks; i--; )
+            if (fetch_block(sh, s, i, disks))
+                break;
+---
+
+fetch_block
+  -> need_this_block
+  ---
+    struct r5dev *dev = &sh->dev[disk_idx];
+    struct r5dev *fdev[2] = { &sh->dev[s->failed_num[0]],
+                  &sh->dev[s->failed_num[1]] };
+    ...
+    if ((s->failed >= 1 && fdev[0]->toread) ||
+        (s->failed >= 2 && fdev[1]->toread))
+<font color="blue">
+        /* If we want to read from a failed device, then
+         * we need to actually read every other device.
+         */
+</font>
+        return 1;
+  ---
+
+fetch_block
+---
+<font color="red">
+        if ((s->uptodate == disks - 1) &&
+</font>
+<font color="blue">
+        // This condition would not stand when we get here 1st time. [1]
+</font>
+            ((sh->qd_idx >= 0 && sh->pd_idx == disk_idx) ||
+<font color="red">
+            (s->failed && (disk_idx == s->failed_num[0] ||
+</font>
+                   disk_idx == s->failed_num[1])))) {
+            /* have disk failed, and we're requested to fetch it;
+             * do compute it
+             */
+            set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+            set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+            set_bit(R5_Wantcompute, &dev->flags);
+            sh->ops.target = disk_idx;
+            sh->ops.target2 = -1; /* no 2nd target */
+            s->req_compute = 1;
+            s->uptodate++;
+            return 1;
+        } else if (test_bit(R5_Insync, &dev->flags)) {
+<font color="blue">
+        // R5_ReadError dev doesn't have this R5_Insync [2]
+        // So we would read in all of the other devs to compute the failed dev.
+</font>
+            set_bit(R5_LOCKED, &dev->flags);
+            set_bit(R5_Wantread, &dev->flags);
+            s->locked++;
+        }
+---
+</pre>
+After ops_run_io and raid5_end_read_request, all of the non-failed devs are read
+in.<br/>
+
+<B>ROUND #4</B><br/>
+
+And fetch_block [1] condition will stand.<br/>
+
+raid_run_ops will take over the sh.<br/>
+<pre>
+raid_run_ops
+  -> ops_run_compute5
+<B>DEST</B>
+    target = sh->ops.target;
+    r5dev *tgt = &sh->dev[target];
+    page *xor_dest = tgt->page;
+<B>SRCS</B>
+    for (i = disks; i--; )
+        if (i != target)
+            xor_srcs[count++] = sh->dev[i].page;
+<B>COMPL</B>
+ops_complete_compute
+---
+    mark_target_uptodate(sh, sh->ops.target);
+      -> set R5_UPTODATE clear R5_Wantcompute
+
+    clear_bit(STRIPE_COMPUTE_RUN, &sh->state);
+    set_bit(STRIPE_HANDLE, &sh->state);
+    raid5_release_stripe(sh);
+---
+</pre>
+
+<B>ROUND #5</B><br/>
+analyse_stripe
+<pre>
+---
+        if (test_bit(R5_UPTODATE, &dev->flags) && dev->toread &&
+            !test_bit(STRIPE_BIOFILL_RUN, &sh->state))
+            set_bit(R5_Wantfill, &dev->flags);
+---
+</pre>
+handle_stripe
+<pre>
+---
+
+    if (s.to_fill && !test_bit(STRIPE_BIOFILL_RUN, &sh->state)) {
+        set_bit(STRIPE_OP_BIOFILL, &s.ops_request);
+        set_bit(STRIPE_BIOFILL_RUN, &sh->state);
+    }
+---
+</pre>
+raid_run_ops  -> ops_run_biofill
+<pre>
+  ---
+    for (i = sh->disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+        if (test_bit(R5_Wantfill, &dev->flags)) {
+            struct bio *rbi;
+            spin_lock_irq(&sh->stripe_lock);
+            dev->read = rbi = dev->toread;
+            dev->toread = NULL;
+<font color="blue">
+            // 'toread' -> 'read'
+</font>
+            spin_unlock_irq(&sh->stripe_lock);
+            while (rbi && rbi->bi_iter.bi_sector <
+                dev->sector + STRIPE_SECTORS) {
+                tx = async_copy_data(0, rbi, &dev->page,
+                             dev->sector, tx, sh, 0);
+                rbi = r5_next_bio(rbi, dev->sector);
+            }
+        }
+    }
+  ---
+</pre>
+ops_complete_biofill
+<pre>
+---
+    for (i = sh->disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+        if (test_and_clear_bit(R5_Wantfill, &dev->flags)) {
+            struct bio *rbi, *rbi2;
+            rbi = dev->read;
+            dev->read = NULL;
+            while (rbi && rbi->bi_iter.bi_sector <
+                dev->sector + STRIPE_SECTORS) {
+                rbi2 = r5_next_bio(rbi, dev->sector);
+                bio_endio(rbi);
+                rbi = rbi2;
+            }
+        }
+    }
+    clear_bit(STRIPE_BIOFILL_RUN, &sh->state);
+
+    set_bit(STRIPE_HANDLE, &sh->state);
+    raid5_release_stripe(sh);
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="add_new_io_to_active_sh">add new IO to active sh</a></h3>
+<p>
+<font size="2">
+add_stripe_bio will only check overlap, so we may add a new bio into a sh that
+is being handled by handle_stripe.<br/>
+What will happen next ?<br/>
+Look at the log below,
+<pre>
+  md0_raid5-1609  [002] ....  1324.200268: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200272: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200275: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200278: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200279: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200280: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200281: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200282: dump_flags: pd 4 : UPTODATE Insync 
+
+       md0_raid5-1609  [002] ....  1324.200288: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+<font color="blue">                                                                             ^^^^
+                                                                           towrite is 1 here
+</font>
+       md0_raid5-1609  [002] ....  1324.200291: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200292: dump_sh: sh 0 c 1 p 4 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.200294: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200295: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.200296: dump_flags: dd 1 : LOCKED OVERWRITE Insync Wantdrain
+<font color="blue">
+                                                                          There have been two towrite here.
+
+</font>
+       md0_raid5-1609  [002] ....  1324.200297: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200298: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200299: dump_flags: pd 4 : LOCKED Insync 
+       md0_raid5-1609  [002] ...1  1324.200300: raid_run_ops: sh 0 op bio drain
+       md0_raid5-1609  [002] ...1  1324.200306: raid_run_ops: sh 0 op reconstruct
+       md0_raid5-1609  [002] ....  1324.200312: handle_stripe: END
+
+
+
+       md0_raid5-1609  [002] ....  1324.201048: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201049: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201050: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201051: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201052: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201053: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201054: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201055: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201058: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.201060: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201060: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201062: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201062: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201063: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201064: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201065: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201067: dump_flags: dd 4 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ...1  1324.201067: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201070: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201074: handle_stripe: END
+<font color="blue">
+                                                                      After this, the sh->dev[]->towrite should be moved
+                                                                      to written. The tw should be zero in next around.
+</font>
+       md0_raid5-1609  [002] ....  1324.201077: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201077: dump_sh: sh 8 c 1 p 3 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.201078: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201079: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201080: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201081: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201082: dump_flags: pd 3 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201084: dump_flags: dd 4 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201087: handle_stripe: l 2 ud 5 tr 0 tw 1 f 0 fn -1 -1
+<font color="blue">                                                                             ^^^^
+                                                                      It says another bio is inserted into sh->dev[]->towrite
+</font>
+       md0_raid5-1609  [002] ....  1324.201088: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201089: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201090: dump_flags: sh state: ACTIVE HANDLE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201091: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201091: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201092: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201094: dump_flags: pd 3 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201095: dump_flags: dd 4 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201113: handle_stripe: END
+<font color="blue">
+                                                                       Nothing happen [1]
+
+</font>
+       md0_raid5-1609  [002] ....  1324.201234: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201235: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201237: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201238: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201239: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201240: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201241: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201242: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201246: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+
+
+       md0_raid5-1609  [002] ....  1324.201260: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201260: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201262: dump_flags: sh state: ACTIVE HANDLE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201263: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.201264: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201265: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201266: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201267: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ...1  1324.201268: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201270: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201273: handle_stripe: END
+<font color="blue">
+                                                                       Nothing happen [2]
+
+
+</font>
+</pre>
+The difference between the Position [1] and [2] is the R5_LOCKED. <br/>
+<pre>
+handle_stripe_dirtying
+---
+    if ((s->req_compute || !test_bit(STRIPE_COMPUTE_RUN, &sh->state)) &&
+<font color="red">
+        (s->locked == 0 && (rcw == 0 || rmw == 0) &&
+</font>
+         !test_bit(STRIPE_BIT_DELAY, &sh->state)))
+        schedule_reconstruction(sh, s, rcw == 0, 0);
+---
+</pre>
+<br/>
+<br/>
+What does this R5_LOCKED mean ?
+<pre>
+IO has been submitted on "req"
+</pre>
+There are mainly two places where the R5_LOCKED is cleaned.
+<ul>
+<li>raid5_end_read_request
+<pre>
+Conversely, the R5_LOCKED is set with R5_Wantread for,
+1. there is something to read, we read it directly or to repair.
+   handle_stripe_fill
+     -> fetch_block
+2. there is something to write, we read it to calculate the new parity.
+  handle_stripe_dirtying
+    -> schedule_reconstruction
+</pre>
+<li>raid5_end_write_request
+<pre>
+It is a bit complicated here.
+A simpler case is the rewrite after a readerror.
+handle_stripe
+---
+    if (s.failed <= conf->max_degraded && !conf->mddev->ro)
+        for (i = 0; i < s.failed; i++) {
+            struct r5dev *dev = &sh->dev[s.failed_num[i]];
+            if (test_bit(R5_ReadError, &dev->flags)
+                && !test_bit(R5_LOCKED, &dev->flags)
+                && test_bit(R5_UPTODATE, &dev->flags)
+                ) {
+                if (!test_bit(R5_ReWrite, &dev->flags)) {
+                    set_bit(R5_Wantwrite, &dev->flags);
+                    set_bit(R5_ReWrite, &dev->flags);
+                    set_bit(R5_LOCKED, &dev->flags);
+                    s.locked++;
+                } else {
+                    /* let's read it back */
+                    set_bit(R5_Wantread, &dev->flags);
+                    set_bit(R5_LOCKED, &dev->flags);
+                    s.locked++;
+                }
+            }
+        }
+---
+
+The more common case is the new parity calculating sequence.
+When required data is uptodate (already in stripe cache, or be read in),
+schedule_reconstruction set <font color="red">R5_Wantdrain and R5_LOCKED</font>,
+then during the whole reconstruction, the R5_LOCKED is held until the new parity
+and data are written out.
+</pre>
+</ul>
+</font>
+</p>
+
+
+
+<h3><a name="Overlapped_IO_ON_A_SAME_STRIPE">Overlapped IO on a same stripe</a></h3>
+<p>
+<font size="2">
+Does the RAID5 tolerate overlapped IO on a same stripe ?
+<pre>
+raid5_make_request
+---
+    prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
+    for (;logical_sector < last_sector; logical_sector += STRIPE_SECTORS) {
+        ...
+        if (test_bit(STRIPE_EXPANDING, &sh->state) ||
+            !add_stripe_bio(sh, bi, dd_idx, rw, previous)) {
+            /* Stripe is busy expanding or
+             * add failed due to overlap.  Flush everything
+             * and wait a while
+             */
+            md_wakeup_thread(mddev->thread);
+            raid5_release_stripe(sh);
+            schedule();
+            do_prepare = true;
+            goto retry;
+        }
+    ...
+---
+</pre>
+It seems true.<br/>
+If overlap with bio in the active stripe_head, the task would sleep on
+conf->wait_for_overlap.<br/>
+<br/>
+When to wakeup it ? The normal case is,
+<pre>
+raid_run_ops
+---
+    if (test_bit(STRIPE_OP_BIOFILL, &ops_request)) {
+        ops_run_biofill(sh);
+        overlap_clear++;
+    }
+    ...
+    if (test_bit(STRIPE_OP_BIODRAIN, &ops_request)) {
+        tx = ops_run_biodrain(sh, tx);
+        overlap_clear++;
+    }
+    ...
+    if (overlap_clear && !sh->batch_head)
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (test_and_clear_bit(R5_Overlap, &dev->flags))
+                wake_up(&sh->raid_conf->wait_for_overlap);
+        }
+---
+</pre>
+
+<ul>
+<li> biofill
+<pre>
+biofill means the data has been ready in the sh->dev[]->page,
+ops_run_biofill will copy this data into the bio,
+It is set by analyse_stripe (only one place)
+---
+        if (test_bit(R5_UPTODATE, &dev->flags) && dev->toread &&
+            !test_bit(STRIPE_BIOFILL_RUN, &sh->state))
+            set_bit(R5_Wantfill, &dev->flags);
+---
+
+ops_run_biofill
+---
+    for (i = sh->disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+        if (test_bit(R5_Wantfill, &dev->flags)) {
+            struct bio *rbi;
+<font color="red">
+            spin_lock_irq(&sh->stripe_lock);
+            dev->read = rbi = dev->toread;
+            dev->toread = NULL;
+            spin_unlock_irq(&sh->stripe_lock);
+</font>
+            while (rbi && rbi->bi_iter.bi_sector <
+                dev->sector + STRIPE_SECTORS) {
+                tx = async_copy_data(0, rbi, &dev->page,
+                             dev->sector, tx, sh, 0);
+                rbi = r5_next_bio(rbi, dev->sector);
+            }
+        }
+    }
+---
+
+after compelte, ops_complete_biofill will be invoked,
+---
+    for (i = sh->disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+
+        if (test_and_clear_bit(R5_Wantfill, &dev->flags)) {
+            struct bio *rbi, *rbi2;
+            BUG_ON(!dev->read);
+            rbi = dev->read;
+            dev->read = NULL;
+            while (rbi && rbi->bi_iter.bi_sector <
+                dev->sector + STRIPE_SECTORS) {
+                rbi2 = r5_next_bio(rbi, dev->sector);
+<font color="red">
+                bio_endio(rbi);
+</font>
+                rbi = rbi2;
+            }
+        }
+    }
+---
+
+After ops_run_biofill, the new IO is permitted to use this sh,
+at the moment, the data in sh->dev[]->page is uptodate, so it is OK
+to use it to fill the bio. But we have to wait until the previous
+ops_complete_biofill is inactive.
+analyse_stripe
+---
+        /* maybe we can reply to a read
+         *
+         * new wantfill requests are only permitted while
+         * ops_complete_biofill is guaranteed to be inactive
+         */
+        if (test_bit(R5_UPTODATE, &dev->flags) && dev->toread &&
+            !test_bit(STRIPE_BIOFILL_RUN, &sh->state))
+            set_bit(R5_Wantfill, &dev->flags);
+---
+</pre>
+<li>biodrain
+<pre>
+biodrain means move the data in bios of sh->dev[]->towrite to sh->dev[]->page.
+Drain the new data in the bio to sh->dev[]->page to calculate the parity and write it out.
+
+Allowing overlapped IO to enter the stripe here sounds reasonable...
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="TRACE_LOG">TRACE LOG</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+
+<h3><a name="WRTIE_ON_4K_STRIPE">WRITE ON 4K STRIPE</a></h3>
+<p>
+<font size="2">
+<pre>
+       md0_raid5-1609  [002] ....  1324.200268: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200272: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200275: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200278: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200279: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200280: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200281: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200282: dump_flags: pd 4 : UPTODATE Insync 
+
+       md0_raid5-1609  [002] ....  1324.200288: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.200291: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200292: dump_sh: sh 0 c 1 p 4 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.200294: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200295: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.200296: dump_flags: dd 1 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.200297: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200298: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200299: dump_flags: pd 4 : LOCKED Insync 
+       md0_raid5-1609  [002] ...1  1324.200300: raid_run_ops: sh 0 op bio drain
+       md0_raid5-1609  [002] ...1  1324.200306: raid_run_ops: sh 0 op reconstruct
+       md0_raid5-1609  [002] ....  1324.200312: handle_stripe: END
+
+       md0_raid5-1609  [002] ....  1324.200316: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200317: dump_sh: sh 0 c 1 p 4 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.200318: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200319: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200320: dump_flags: dd 1 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200321: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200322: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200324: dump_flags: pd 4 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200327: handle_stripe: l 3 ud 5 tr 0 tw 0 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.200328: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200328: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200329: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200331: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200332: dump_flags: dd 1 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200333: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200334: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200335: dump_flags: pd 4 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200368: handle_stripe: END
+
+       md0_raid5-1609  [002] ....  1324.200554: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200557: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200559: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200561: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200562: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200563: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200564: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200565: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.200569: handle_stripe: l 0 ud 5 tr 0 tw 0 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.200591: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200592: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200593: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200594: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200595: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200596: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200597: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200598: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.200600: handle_stripe: END
+
+       md0_raid5-1609  [002] ....  1324.200723: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200726: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200728: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200730: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200731: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200732: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200733: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200734: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.200739: handle_stripe: l 0 ud 5 tr 0 tw 2 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.200741: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200742: dump_sh: sh 0 c 1 p 4 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.200744: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200745: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200746: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200748: dump_flags: dd 2 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.200749: dump_flags: dd 3 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.200750: dump_flags: pd 4 : LOCKED Insync 
+       md0_raid5-1609  [002] ...1  1324.200751: raid_run_ops: sh 0 op bio drain
+       md0_raid5-1609  [002] ...1  1324.200755: raid_run_ops: sh 0 op reconstruct
+       md0_raid5-1609  [002] ....  1324.200759: handle_stripe: END
+
+       md0_raid5-1609  [002] ....  1324.200762: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200763: dump_sh: sh 0 c 1 p 4 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.200764: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200766: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200767: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200768: dump_flags: dd 2 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200769: dump_flags: dd 3 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200770: dump_flags: pd 4 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.200773: handle_stripe: l 3 ud 5 tr 0 tw 0 f 0 fn -1 -1
+
+       md0_raid5-1609  [002] ....  1324.200774: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200775: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200776: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200777: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200778: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200779: dump_flags: dd 2 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200781: dump_flags: dd 3 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200782: dump_flags: pd 4 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.200812: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.200958: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.200959: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200961: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200962: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200963: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200964: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200965: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200966: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.200970: handle_stripe: l 0 ud 5 tr 0 tw 0 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.200988: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.200988: dump_sh: sh 0 c 1 p 4 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.200989: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.200990: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200991: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200992: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200993: dump_flags: dd 3 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.200994: dump_flags: pd 4 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.200995: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201048: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201049: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201050: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201051: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201052: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201053: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201054: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201055: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201058: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201060: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201060: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201062: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201062: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201063: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201064: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201065: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201067: dump_flags: dd 4 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ...1  1324.201067: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201070: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201074: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201077: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201077: dump_sh: sh 8 c 1 p 3 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.201078: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201079: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201080: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201081: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201082: dump_flags: pd 3 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201084: dump_flags: dd 4 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201087: handle_stripe: l 2 ud 5 tr 0 tw 1 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201088: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201089: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201090: dump_flags: sh state: ACTIVE HANDLE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201091: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201091: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201092: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201094: dump_flags: pd 3 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201095: dump_flags: dd 4 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201113: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201234: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201235: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201237: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201238: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201239: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201240: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201241: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201242: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201246: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201260: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201260: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201262: dump_flags: sh state: ACTIVE HANDLE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201263: dump_flags: dd 0 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.201264: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201265: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201266: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201267: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ...1  1324.201268: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201270: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201273: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201276: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201277: dump_sh: sh 8 c 1 p 3 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.201278: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201279: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201280: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201281: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201282: dump_flags: pd 3 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201283: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201286: handle_stripe: l 2 ud 5 tr 0 tw 0 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201287: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201288: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201289: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201290: dump_flags: dd 0 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201291: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201292: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201294: dump_flags: pd 3 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201295: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201312: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201432: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201433: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201434: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201436: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201437: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201438: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201439: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201440: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201443: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201455: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201456: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201458: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201459: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201460: dump_flags: dd 1 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.201461: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201462: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201463: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ...1  1324.201464: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201466: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201469: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201472: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201472: dump_sh: sh 8 c 1 p 3 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.201474: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201475: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201476: dump_flags: dd 1 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201477: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201479: dump_flags: pd 3 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201480: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201483: handle_stripe: l 2 ud 5 tr 0 tw 0 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201483: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201484: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201485: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201486: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201488: dump_flags: dd 1 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201489: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201490: dump_flags: pd 3 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201491: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201508: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201627: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201628: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201630: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201631: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201632: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201633: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201634: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201635: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201638: handle_stripe: l 0 ud 5 tr 0 tw 1 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201650: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201651: dump_sh: sh 8 c 1 p 3 ck idle rc drain_run
+       md0_raid5-1609  [002] ....  1324.201652: dump_flags: sh state: ACTIVE HANDLE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201653: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201654: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201655: dump_flags: dd 2 : LOCKED OVERWRITE Insync Wantdrain 
+       md0_raid5-1609  [002] ....  1324.201656: dump_flags: pd 3 : LOCKED Insync 
+       md0_raid5-1609  [002] ....  1324.201657: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ...1  1324.201658: raid_run_ops: sh 8 op bio drain
+       md0_raid5-1609  [002] ...1  1324.201660: raid_run_ops: sh 8 op reconstruct
+       md0_raid5-1609  [002] ....  1324.201663: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201666: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201667: dump_sh: sh 8 c 1 p 3 ck idle rc drain_result
+       md0_raid5-1609  [002] ....  1324.201668: dump_flags: sh state: ACTIVE INSYNC PREREAD_ACTIVE IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201669: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201670: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201672: dump_flags: dd 2 : UPTODATE LOCKED OVERWRITE Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201673: dump_flags: pd 3 : UPTODATE LOCKED Insync SyncIO 
+       md0_raid5-1609  [002] ....  1324.201674: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201677: handle_stripe: l 2 ud 5 tr 0 tw 0 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201677: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201678: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201679: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201680: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201681: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201682: dump_flags: dd 2 : UPTODATE LOCKED OVERWRITE Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201684: dump_flags: pd 3 : UPTODATE LOCKED Insync Wantwrite SyncIO 
+       md0_raid5-1609  [002] ....  1324.201685: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201703: handle_stripe: END
+       md0_raid5-1609  [002] ....  1324.201794: handle_stripe: START TO HANDLE
+       md0_raid5-1609  [002] ....  1324.201795: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201797: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201798: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201799: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201800: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201801: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201802: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201806: handle_stripe: l 0 ud 5 tr 0 tw 0 f 0 fn -1 -1
+       md0_raid5-1609  [002] ....  1324.201816: handle_stripe: RUN OPS AND IO
+       md0_raid5-1609  [002] ....  1324.201817: dump_sh: sh 8 c 1 p 3 ck idle rc idle
+       md0_raid5-1609  [002] ....  1324.201818: dump_flags: sh state: ACTIVE INSYNC IO_STARTED 
+       md0_raid5-1609  [002] ....  1324.201819: dump_flags: dd 0 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201820: dump_flags: dd 1 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201821: dump_flags: dd 2 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201822: dump_flags: pd 3 : UPTODATE Insync 
+       md0_raid5-1609  [002] ....  1324.201824: dump_flags: dd 4 : UPTODATE OVERWRITE Insync 
+       md0_raid5-1609  [002] ....  1324.201824: handle_stripe: END
+
+</pre>
+</font>
+</p>
+</body>
+</html>

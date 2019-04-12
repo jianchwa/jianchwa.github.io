@@ -81,7 +81,10 @@
 <li><a href="#speculative_preallocation_2">speculative preallocation on COW</a>
 <li><a href="#COW_Unwritten">COW Unwritten</a>
 </ul>
-
+<a href="#Talking">Talking</a>
+<ul>
+<li> <a href="#concurrent_read_write">concurrent read write</a>
+</ul>
 </font>
 </p>
 
@@ -356,6 +359,42 @@ xfs_bmap_btalloc
 </pre>
 <li> EOF preallocation
 <pre>
+http://xfs.org/index.php/XFS_FAQ#Q:_What_is_speculative_preallocation.3F
+
+The XFS speculative preallocation algorithm allocates extra blocks beyond end of file (EOF)
+to minimize file fragmentation during buffered write workloads.
+<font color="red">
+Workloads that benefit from this behaviour include slowly growing files, concurrent writers
+and mixed reader/writer workloads. It also provides fragmentation resistance in situations where
+memory pressure prevents adequate buffering of dirty data to allow formation of large contiguous
+regions of data in memory.
+</font>
+
+           T_a T_b T_c T_d T_e T_f T_a
+            |   |   |   |   |   |   |
+            v   v   v   v   v   v   v
+          |---|---|---|---|---|---|---|...
+            |                       |
+            '----------- -----------'
+                        V
+               fragmentation for T_a
+
+With EOF preallocation
+
+             T_a preallocates
+                  ^
+          .------- -------.
+          |               |
+          |---|---|---|---|---|---|---|...
+            ^
+            |
+         T_a writes
+
+speculative preallocation has two styles,
+  1. fixed size with 'allocsize=' mount option
+  2. dynamic based on the current inode size
+
+
 xfs_file_iomap_begin_delay
 ---
     if (eof) {
@@ -411,7 +450,8 @@ retry:
 </font>
 </pre>
 </ul>
-Reclaim of EOF blocks,
+Preallocated blocks are normally reclaimed on file close, inode reclaim, unmount or<br/>
+in the background once file write activity subsides. <br/>
 <pre>
 xfs_icache_free_eofblocks
   -> __xfs_icache_free_eofblocks
@@ -480,6 +520,117 @@ xfs_eofblocks_worker
 <li> ioctl XFS_IOC_FREE_EOFBLOCKS
 </ul>
 
+</pre>
+
+We also would truncate the blocks beyond EOF when close the file. <br/>
+To avoid the applications that write and close the file repeatedly to cause<br/>
+too much fragmentation, there is some heuristic there to detect that pattern.
+<pre>
+xfs_release
+---
+    if (xfs_can_free_eofblocks(ip, false)) {
+<font color="blue">
+        /*
+         * Check if the inode is being opened, written and closed
+         * frequently and we have delayed allocation blocks outstanding
+         * (e.g. streaming writes from the NFS server), truncating the
+         * blocks past EOF will cause fragmentation to occur.
+         *
+         * In this case don't do the truncation, but we have to be
+         * careful how we detect this case. Blocks beyond EOF show up as
+         * i_delayed_blks even when the inode is clean, so we need to
+         * truncate them away first before checking for a dirty release.
+         * Hence on the first dirty close we will still remove the
+         * speculative allocation, but after that we will leave it in
+         * place.
+         */
+</font>
+        if (xfs_iflags_test(ip, XFS_IDIRTY_RELEASE))
+            return 0;
+        /*
+         * If we can't get the iolock just skip truncating the blocks
+         * past EOF because we could deadlock with the mmap_sem
+         * otherwise. We'll get another chance to drop them once the
+         * last reference to the inode is dropped, so we'll never leak
+         * blocks permanently.
+         */
+        if (xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
+            error = xfs_free_eofblocks(ip);
+            xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+            if (error)
+                return error;
+        }
+
+        /* delalloc blocks after truncation means it really is dirty */
+        if (ip->i_delayed_blks)
+            xfs_iflags_set(ip, XFS_IDIRTY_RELEASE);
+    }
+
+---
+</pre>
+
+Reference of dynamic speculatively preallocation
+<pre>
+link https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=055388a3188f56676c21e92962fc366ac8b5cb72
+
+xfs: dynamic speculative EOF preallocation
+Currently the size of the speculative preallocation during delayed
+allocation is fixed by either the allocsize mount option of a
+default size. We are seeing a lot of cases where we need to
+recommend using the allocsize mount option to prevent fragmentation
+when buffered writes land in the same AG.
+
+Rather than using a fixed preallocation size by default (up to 64k),
+make it dynamic by basing it on the current inode size. That way the
+EOF preallocation will increase as the file size increases.  Hence
+for streaming writes we are much more likely to get large
+preallocations exactly when we need it to reduce fragementation.
+
+For default settings, the size of the initial extents is determined
+by the number of parallel writers and the amount of memory in the
+machine. For 4GB RAM and 4 concurrent 32GB file writes:
+
+EXT: FILE-OFFSET           BLOCK-RANGE          AG AG-OFFSET                 TOTAL
+   0: [0..1048575]:         1048672..2097247      0 (1048672..2097247)      1048576
+   1: [1048576..2097151]:   5242976..6291551      0 (5242976..6291551)      1048576
+   2: [2097152..4194303]:   12583008..14680159    0 (12583008..14680159)    2097152
+   3: [4194304..8388607]:   25165920..29360223    0 (25165920..29360223)    4194304
+   4: [8388608..16777215]:  58720352..67108959    0 (58720352..67108959)    8388608
+   5: [16777216..33554423]: 117440584..134217791  0 (117440584..134217791) 16777208
+   6: [33554424..50331511]: 184549056..201326143  0 (184549056..201326143) 16777088
+   7: [50331512..67108599]: 251657408..268434495  0 (251657408..268434495) 16777088
+
+and for 16 concurrent 16GB file writes:
+
+ EXT: FILE-OFFSET           BLOCK-RANGE          AG AG-OFFSET                 TOTAL
+   0: [0..262143]:          2490472..2752615      0 (2490472..2752615)       262144
+   1: [262144..524287]:     6291560..6553703      0 (6291560..6553703)       262144
+   2: [524288..1048575]:    13631592..14155879    0 (13631592..14155879)     524288
+   3: [1048576..2097151]:   30408808..31457383    0 (30408808..31457383)    1048576
+   4: [2097152..4194303]:   52428904..54526055    0 (52428904..54526055)    2097152
+   5: [4194304..8388607]:   104857704..109052007  0 (104857704..109052007)  4194304
+   6: [8388608..16777215]:  209715304..218103911  0 (209715304..218103911)  8388608
+   7: [16777216..33554423]: 452984848..469762055  0 (452984848..469762055) 16777208
+
+Because it is hard to take back specualtive preallocation, cases
+where there are large slow growing log files on a nearly full
+filesystem may cause premature ENOSPC. Hence as the filesystem nears
+full, the maximum dynamic prealloc size іs reduced according to this
+table (based on 4k block size):
+
+freespace       max prealloc size
+  >5%             full extent (8GB)
+  4-5%             2GB (8GB >> 2)
+  3-4%             1GB (8GB >> 3)
+  2-3%           512MB (8GB >> 4)
+  1-2%           256MB (8GB >> 5)
+  <1%            128MB (8GB >> 6)
+
+This should reduce the amount of space held in speculative
+preallocation for such cases.
+
+The allocsize mount option turns off the dynamic behaviour and fixes
+the prealloc size to whatever the mount option specifies. i.e. the
 </pre>
 </font>
 </p>
@@ -4916,6 +5067,100 @@ b - block
 l - length
 f - found
 sh- shared
+</pre>
+</font>
+</p>
+
+<h2><a name="Talking">Talking</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<h3><a name="concurrent_read_write">concurrent read write</a></h3>
+<p>
+<font size="2">
+<pre>
+https://www.spinics.net/lists/linux-xfs/msg26459.html
+
+xfs_file_buffered_aio_read() is the only call sites I know of
+to call generic_file_read_iter() with i_rwsem read side held.
+
+xfs_file_buffered_aio_read
+---
+    if (iocb->ki_flags & IOCB_NOWAIT) {
+        if (!xfs_ilock_nowait(ip, XFS_IOLOCK_SHARED))
+            return -EAGAIN;
+    } else {
+        xfs_ilock(ip, XFS_IOLOCK_SHARED);
+    }
+    ret = generic_file_read_iter(iocb, to);
+    xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+
+    return ret;
+---
+
+xfs_file_buffered_aio_write
+---
+write_retry:
+    iolock = XFS_IOLOCK_EXCL;
+    xfs_ilock(ip, iolock);
+
+    ret = xfs_file_aio_write_checks(iocb, from, &iolock);
+    if (ret)
+        goto out;
+
+    /* We can write back this queue in page reclaim */
+    current->backing_dev_info = inode_to_bdi(inode);
+
+    ret = iomap_file_buffered_write(iocb, from, &xfs_iomap_ops);
+    if (likely(ret >= 0))
+        iocb->ki_pos += ret;
+
+    ...
+    current->backing_dev_info = NULL;
+out:
+    if (iolock)
+        xfs_iunlock(ip, iolock);
+
+    if (ret > 0) {
+        XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
+        /* Handle various SYNC-type writes */
+        ret = generic_write_sync(iocb, ret);
+    }
+    return ret;
+---
+
+This lock is killing performance of multi-threaded buffered
+read/write mixed workload on the same file [1].
+
+My question is, is the purpose of this lock syncing
+dio/buffered io?
+
+Answer:
+That's one part of it. The other is POSIX atomic write semantics.
+https://pubs.opengroup.org/onlinepubs/009695399/functions/read.html
+
+"I/O is intended to be atomic to ordinary files and pipes and FIFOs.
+Atomic means that all the bytes from a single operation that started
+out together end up together, without interleaving from other I/O
+operations."
+
+i.e. that independent read()s should see a write() as a single
+atomic change. hence if you do a read() concurrently with a write(),
+the read should either run to completion before the write, or the
+write run to completion before the read().
+
+XFS is the only linux filesystem that provides this behaviour.
+(Databases like this behaviour very much....)
+
+ext4 and other filesytsems tha thave no buffered read side locking
+provide serialisation at page level, which means an 8kB read racing
+with a 8kB write can return 4k from the new write and 4k from the
+yet-to-be-written part of the file. IOWs, the buffered read gets
+torn.
+
+
+using AIO+DIO on XFS will allow
+both reads and writes to be issued concurrently and not block the
+main thread of execution.
+
 </pre>
 </font>
 </p>

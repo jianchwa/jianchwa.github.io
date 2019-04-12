@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>mit 6.824</title>
+</head>
+<body>
+<div>
+    <h1>mit 6.824</h1> 
+</div>
+<p>
+<font size="2">
+Click <a href="https://pdos.csail.mit.edu/6.824/">here</a> to access mit 6.824 websit.
+</p>
+
+
+<h2><a name="#Lecture_1">Lecture 1</a></h2>
+<hr style="height:5px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+<pre>
+What is distributed system ?
+ - multipe cooperating computers
+ - storage for big websites, MapReduce, peer-to-peer sharing,
+ - lots of critical infrastructure is distributed.
+
+Why distributed ?
+ - to organize physically separate entities
+ - to achieve security via isolation
+                           ^^^^^^^^^
+                               ?
+ - to tolerate faul via replication
+ - to scale up throughput via parallel cpu/mem/disk/net
+
+but
+ - complexity, too many concurrent parts
+ - must cope with partial failures
+ - tricky to realize performance potential
+
+
+Around the whole distributed system, there are 3 kinds of abstraction,
+ - storage -> disk
+ - computation -> cpu
+ - communication -> net
+
+There are a couple of topcis come up here,
+ - implementation
+    - RPC, remote procedure call
+    - threads (???)
+    - concurrency control
+
+ - performance
+    - idea scene is that the performance is scaled out when number of nodes grow
+      so handling more load only need to buy more computers
+    - however, the fact is so perfect
+       - the performance would not grow linearly with more nodes,
+          - load imbalance
+          - non-parallelizable code
+          - bottlenecks from shared resources, e.g. network
+    - we could also improve the performance through optimize the code
+
+
+ - fault tolerance
+   1000s of nodes, complex net -> node fault should be deemed a common thing.
+   The failures should be hidden from the applications. (Not exact here,
+   large amount of nodes failure would degrade the performance at least)
+
+
+ - consistency
+   consistency and performance are enemies
+   strong consistency often needs more communication and more control
+   high performance often impose weak consistency
+
+MapReduce
+
+   Scatter and Gather
+
+   Input1 -> Map -> a,1 b,1 c,1
+   Input2 -> Map ->     b,1
+   Input3 -> Map -> a,1     c,1
+                    |   |   |
+                    |   |   -> Reduce -> c,2
+                    |   -----> Reduce -> b,2
+                    ---------> Reduce -> a,2
+
+   Example: word count
+    input is thousands of text files
+    Map(k, v)
+      split v into words
+      for each word w
+        emit(w, "1")
+    Reduce(k, v)
+      emit(len(v))
+
+   When M and R are both >= N, Map()s and Reduce()s could run in parallel and
+   balance well.
+
+   Map() tasks needn't to talk with each other, as well as Reduce() tasks.
+   But the Reduce() task need to talk with Map() task.
+
+   The Map() task save its output files in local disk instead of the GFS
+   which has a global namespace around the whole cluster, so the Reduce()
+   task needs to get it through some special way, but essentially, through
+   network. All of the network's throughput is limited, so it would be a
+   bottleneck.
+
+      .--------------------------------------.
+     /                                        \
+    +      input              output          +
+    |   _ _ _ _ _ _ _ _    _ _ _ _ _ _ _      |
+    |  |_|_|_|_|_|_|_|_|  |_|_|_|_|_|_|_|     | GFS namespace
+    +         |                        ^      +
+     \        |                        |      /
+      '-------^------------------------^-----'
+              |                        |
+              | local replica          |
+              v                        |
+           Map worker                  |
+              | local                  |
+              v              net       |
+        intermediate files   --->  Reduce worker
+
+     - input files will be handed over to the node where one of
+       the input files's replicas locates, thus no need to occupy
+       network bandwidth for it
+     - many more tasks than workers is good for load balance
+
+
+   Fault tolerance
+
+   There is a 'heartbeat' between the master and workers.
+   If a worker no longer respond to pings, master deem it lost,
+   and would recover the map or reduce works assigned to the worker.
+
+
+
+</pre>	
+</font>
+</p>
+
+</body>
+</html>

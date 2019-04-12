@@ -15,7 +15,7 @@
 <li><a href="#Barriers">Barriers</a>
 <li><a href="#component_size">compoment size</a>
 <li><a href="#sync_min_max">sync_min/max</a>
-
+<li><a href="#recovery_from_poweroff_crash">recovery from poweroff or crash</a>
 </ul>
 <a href="#Software-RAID1">Software RAID1</a><br/>
 <ul>
@@ -338,6 +338,224 @@ when update curr_resync_completed, it will wake up the poll waiter on it.
 </pre>
 </font>
 </p>
+
+<h3><a name="recovery_from_poweroff_crash">recovery from poweroff or crash</a></h3>
+<p>
+<font size="2">
+If the system crash or power off during a write, we may get following scene,
+<pre>
+RAID1:
+
+
+       write BBBB
+           |
+           V                /\  /\
+                         <-'  \/  '-- POWER OFF/CRASH
+    Dev0        Dev1
+   +----+      +----+
+   |AAAA|      |AAAA|
+   +----+      +----+
+                           
+Then, only IO on Dev1 successed.
+
+    Dev0        Dev1
+   +----+      +----+
+   |AAAA|      |BBBB|
+   +----+      +----+
+
+
+RAID5:
+                               dd_3n  dd_pn
+                               
+                                 |       |     
+                                 V       V
+
+    Dev0     Dev1     Dev2     Dev3     Devp
+   +----+   +----+   +----+   +----+   +----+
+   |dd_0|   |dd_1|   |dd_2|   |dd_3|   |dd_p|
+   +----+   +----+   +----+   +----+   +----+
+
+   dd_0 ^ dd_1 ^ dd_2 ^ dd_3 == dd_p
+                                                  /\  /\
+                                               <-'  \/  '-- POWER OFF/CRASH
+
+    Dev0     Dev1     Dev2     Dev3     Devp
+   +----+   +----+   +----+   +----+   +-----+
+   |dd_0|   |dd_1|   |dd_2|   |dd_3|   |dd_pn|
+   +----+   +----+   +----+   +----+   +-----+
+
+   dd_0 ^ dd_1 ^ dd_2 ^ dd_3 != dd_pn
+</pre>
+
+Then we need to do recovery.
+
+<pre>
+RAID1:
+
+
+    Dev0        Dev1
+   +----+      +----+
+   |AAAA|      |BBBB|
+   +----+      +----+
+
+No matter resync to 'AAAA' or 'BBBB', it is both acceptable, because the IO on
+this stripe didn't return, the upperlayer would handle this case through journal.
+
+As well as the RAID5 case,
+
+     +--------+---------+-------+--------+
+     |        |         |       |        |
+     |        |         |       |        V
+    Dev0     Dev1     Dev2     Dev3     Devp
+   +----+   +----+   +----+   +----+   +-----+
+   |dd_0|   |dd_1|   |dd_2|   |dd_3|   |dd_pn|
+   +----+   +----+   +----+   +----+   +-----+
+
+   dd_0 ^ dd_1 ^ dd_2 ^ dd_3 -> dd_pn
+
+Just re-calculate the parity no matter whether the dd_3 is stable or not.
+Because the IO didn't return, the upperlayer could handle all of this.
+</pre>
+
+How to detect the unfinished IO ?<br/>
+Before every write, md_write_start will be invoked,
+<pre>
+STEP #1
+
+md_write_start
+---
+    if (mddev->in_sync || mddev->sync_checkers) {
+        spin_lock(&mddev->lock);
+        if (mddev->in_sync) {
+<font color="red">
+            mddev->in_sync = 0;
+            set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
+            set_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags);
+            md_wakeup_thread(mddev->thread);
+</font>
+            did_change = 1;
+        }
+        spin_unlock(&mddev->lock);
+    }
+    rcu_read_unlock();
+    if (did_change)
+        sysfs_notify_dirent_safe(mddev->sysfs_state);
+<font color="red">
+    wait_event(mddev->sb_wait,
+           !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) ||
+           mddev->suspended);
+</font>
+---
+
+STEP #2
+
+md_check_recovery
+  -> md_update_sb // check mddev->sb_flags
+    -> sync_sbs //iterate all of the replica dev
+      -> sync_super
+        -> super_1_sync
+---
+    if (mddev->in_sync)
+        sb->resync_offset = cpu_to_le64(mddev->recovery_cp);
+    else if (test_bit(MD_JOURNAL_CLEAN, &mddev->flags))
+        sb->resync_offset = cpu_to_le64(MaxSector);
+    else
+        sb->resync_offset = cpu_to_le64(0);
+---
+
+md_update_sb
+---
+<font color="red">
+    sync_sbs(mddev, nospares);
+</font>
+    spin_unlock(&mddev->lock);
+
+rewrite:
+    md_bitmap_update_sb(mddev->bitmap);
+    rdev_for_each(rdev, mddev) {
+        char b[BDEVNAME_SIZE];
+
+        if (rdev->sb_loaded != 1)
+            continue; /* no noise on spare devices */
+
+        if (!test_bit(Faulty, &rdev->flags)) {
+            md_super_write(mddev,rdev,
+                       rdev->sb_start, rdev->sb_size,
+                       rdev->sb_page);
+            ...
+        }
+        ...
+    }
+    if (md_super_wait(mddev) < 0)
+        goto rewrite;
+        ...
+    if (mddev->in_sync != sync_req ||
+        !bit_clear_unless(&mddev->sb_flags, BIT(MD_SB_CHANGE_PENDING),
+                   BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_CLEAN)))
+        goto repeat;
+<font color="red">
+    wake_up(&mddev->sb_wait);
+</font>
+---
+
+STEP #3
+
+md_run
+  -> analyze_sbs
+    -> load_super
+    -> super_types[mddev->major_version].validate_super(mddev, freshest)
+       super_1_validate
+       -> mddev->recovery_cp = le64_to_cpu(sb->resync_offset);
+  -> pers->run
+     raid1_run
+     ---
+       if (mddev->recovery_cp != MaxSector)
+        pr_info("md/raid1:%s: not clean -- starting background reconstruction\n",
+            mdname(mddev));
+     ---
+<fron color="red">
+  -> set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+</font>
+
+
+STEP #4
+
+raid1d
+  -> md_check_recovery
+   ---
+        if (mddev->reshape_position != MaxSector) {
+            ...
+        } else if ((spares = remove_and_add_spares(mddev, NULL))) {
+            clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+            clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
+            clear_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+            set_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
+        } else if (mddev->recovery_cp < MaxSector) {
+            set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+            clear_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
+        } 
+   ---
+</pre>
+
+Here we need to clarify the difference between resync and recovery.<br/>
+https://raid.wiki.kernel.org/index.php/Reconstruction#recovery_and_resync
+<ul>
+<li>recovery
+<pre>
+Namely rebuild.
+The purpose of recovery/rebuild process is to fill the new disk with the
+relevant information from a running array.
+</pre>
+<li>resync
+<pre>
+The purpose of resync is to ensure all the data in array are synchronized.
+</pre>
+</ul>
+
+</font>
+</p>
+
+
 
 
 <h2><a name="Software-RAID1">Software RAID1</a></h2 >
