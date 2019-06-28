@@ -11,6 +11,13 @@
 <p>
 <font size="2">
 <a href="#writeback">writeback</a><br/>
+<ul>
+<li><a href="#dirty_balance">dirty balance</a>
+<li><a href="#dirty_timeout">dirty timeout</a>
+<li><a href="#hand_page_to_writeback">hand page to writeback</a>
+<li><a href="#per-queue_wb">per-queue wb</a>
+<li><a href="#writeback_legacy">writeback(legacy)</a>
+</ul>
 <a href="#BH">BH</a>
 <ul>
 <li><a href="#bh2bio">bh to bio</a>
@@ -22,10 +29,10 @@
 <li><a href="#locks_of_dentry">locks_of_dentry</a>
 <li><a href="#lookup_in_parellel">lookup in parellel</a>
 </ul>
-<a href="#inode">inode</a><br/>
+<a href="pagecache">pagecache</a>
 <ul>
-<li><a href="#aops">address_space ops</a>
-<li><a href="#iops">inode ops</a>
+<li><a href="#lifecycle_of_pagecache">lifecycle of pagecache</a>
+<li><a href="#pagecache_in_meminfo">pagecache in meminfo</a>
 </ul>
 <a href="#fs_misc">fs misc</a>
 <ul>
@@ -35,6 +42,384 @@
 </p>
 
 <h2><a name="writeback">writeback</a></h2>
+<h3><a name="dirty_balance">dirty balance</a></h3>
+<p>
+<font size="2">
+Look at the comment of balance_dirty_pages
+<pre>
+balance_dirty_pages() must be called by processes which are generating dirty
+data.  It looks at the number of dirty pages in the machine and will force
+                                                                ^^^^^^^^^^
+the caller to wait once crossing the (background_thresh + dirty_thresh) / 2.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+If we're over `background_thresh' then the writeback threads are woken to
+perform some writeout.
+</pre>
+In normal case, the writeback mode could avoid the application to be blocked,<br/>
+but what if the case when there is continuous writting IO ?
+                                   ^^^^^^^^^^^^^^^^^^^^^^
+<pre>
+                        pagecache
+               write    +-------+
+  application ------->  | Dirty |
+                        +-------+
+                        | Dirty |
+                        +-------+
+                        | Dirty |                  __________
+                        +-------+  writeback      /         /|
+                        | Dirty | ----------->   /_________/ |
+                        +-------+                |         | /
+                                                 |_________|/ 
+
+When there is dirty balance mechanism here, the bw of application writting is
+actually equal to the disk bw. So regarding to latency, the writeback here is
+not so helpful.
+
+But combined with delayed allocation, writeback could avoid fragment.
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</pre>
+Anyway, let's look at how does it work ?
+<pre>
+generic_perform_write
+---
+    do {
+        ...
+        offset = (pos & (PAGE_SIZE - 1));
+        bytes = min_t(unsigned long, PAGE_SIZE - offset,
+                        iov_iter_count(i));
+
+again:
+        ...
+        status = a_ops->write_begin(file, mapping, pos, bytes, flags,
+                        &page, &fsdata);
+        if (unlikely(status < 0))
+            break;
+
+        if (mapping_writably_mapped(mapping))
+            flush_dcache_page(page);
+
+        copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
+        flush_dcache_page(page);
+
+        status = a_ops->write_end(file, mapping, pos, bytes, copied,
+                        page, fsdata);
+        if (unlikely(status < 0))
+            break;
+        copied = status;
+
+        cond_resched();
+
+        iov_iter_advance(i, copied);
+        ...
+        pos += copied;
+        written += copied;
+
+        balance_dirty_pages_ratelimited(mapping);
+    } while (iov_iter_count(i));
+---
+
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="dirty_timeout">dirty timeout</a></h3>
+<p>
+<font size="2">
+queue_io is used to move the timeout dirty inode from the wb->b_dirty or
+wb->b_dirty_time to wb->b_io.
+<pre>
+move_expired_inodes
+---
+    if ((flags & EXPIRE_DIRTY_ATIME) == 0)
+        older_than_this = work->older_than_this;
+    else if (!work->for_sync) {
+        expire_time = jiffies - (dirtytime_expire_interval * HZ);
+        older_than_this = &expire_time;
+    }
+    while (!list_empty(delaying_queue)) {
+        inode = wb_inode(delaying_queue->prev);
+<font color="red">
+        // If the dirty time is before older_than_this, it will be moved.
+                                ^^^^^^^^^^^^^^^^^^^^^^
+</font>
+        if (older_than_this &&
+            inode_dirtied_after(inode, *older_than_this))
+            break;
+        list_move(&inode->i_io_list, &tmp);
+        ...
+    }
+---
+</pre>
+So how to set the older_than_this ?
+<ul>
+<li> EXPIRE_DIRTY_ATIME
+<pre>
+It is only used for b_dirty_time
+queue_io
+---
+    moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
+                     EXPIRE_DIRTY_ATIME, work);
+---
+In this case,
+move_expired_inodes
+---
+    if ((flags & EXPIRE_DIRTY_ATIME) == 0)
+        older_than_this = work->older_than_this;
+    else if (!work->for_sync) {
+        expire_time = jiffies - (dirtytime_expire_interval * HZ);
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        older_than_this = &expire_time;
+    }
+---
+
+Only move the inodes that have been dirtied for dirty_expire_interval HZ (12 hours)
+Get more from the comment of dirty_expire_interval
+</pre>
+<li> periodic writeback (the so-called kupdate)
+<pre>
+wb_writeback
+---
+        if (work->for_kupdate) {
+            oldest_jif = jiffies -
+                msecs_to_jiffies(dirty_expire_interval * 10);
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                     30 seconds
+        } 
+---
+
+The periodic writeback will writeback the dirty inode after 30s
+</pre>
+<li> background writeback
+<pre>
+wb_writeback
+---
+        if (work->for_kupdate) {
+            oldest_jif = jiffies -
+                msecs_to_jiffies(dirty_expire_interval * 10);
+        } else if (work->for_background)
+            oldest_jif = jiffies;
+            ^^^^^^^^^^^^^^^^^^^^^
+                 Now !
+---
+
+The interesting thing is when to start up a background writeback ?
+balance_dirty_pages
+  -> wb_start_background_writeback
+
+wb_workfn
+  -> wb_do_writeback
+    -> wb_check_background_flush
+    ---
+    if (wb_over_bg_thresh(wb)) {
+        ^^^^^^^^^^^^^^^^^^^^^^
+
+        struct wb_writeback_work work = {
+            .nr_pages    = LONG_MAX,
+            .sync_mode    = WB_SYNC_NONE,
+            .for_background    = 1,
+            .range_cyclic    = 1,
+            .reason        = WB_REASON_BACKGROUND,
+        };
+
+        return wb_writeback(wb, &work);
+    }
+    ---
+
+</pre>
+<li> others
+<pre>
+For all the other types of writeback (vmscan, sync ...), it will not check the
+dirty time but just write them out directly.
+</pre>
+</ul>
+
+</font>
+</p>
+
+<h3><a name="hand_page_to_writeback">hand page to writeback</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> filesystems that use BH
+<pre>
+mark_buffer_dirty
+---
+    if (!test_set_buffer_dirty(bh)) {
+        struct page *page = bh->b_page;
+        struct address_space *mapping = NULL;
+
+        lock_page_memcg(page);
+        if (!TestSetPageDirty(page)) {
+            mapping = page_mapping(page);
+            if (mapping)
+                __set_page_dirty(page, mapping, 0);
+                ^^^^^^^^^^^^^^^^
+<font color="blue">
+            // set PAGECACHE_TAG_DIRTY on the page in the pagecache tree
+</font>
+        }
+        unlock_page_memcg(page);
+        if (mapping)
+            __mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+            ^^^^^^^^^^^^^^^^^^
+<font color="blue">
+        // hand the inode to writeback core
+</font>
+    }
+
+---
+
+<B>regular data</B>
+ext4_write_end
+  -> block_write_end
+    -> __block_commit_write
+      -> mark_buffer_dirty
+
+<B>metadata</B>
+__jbd2_journal_refile_buffer
+  -> __jbd2_journal_unfile_buffer
+    -> __jbd2_journal_temp_unlink_buffer
+      -> mark_buffer_dirty
+      
+</pre>
+<li> iomap (xfs)
+<pre> 
+__iomap_write_end
+  -> iomap_set_page_dirty
+  ---
+    lock_page_memcg(page);
+    newly_dirty = !TestSetPageDirty(page);
+    if (newly_dirty)
+        __set_page_dirty(page, mapping, 0);
+    unlock_page_memcg(page);
+
+    if (newly_dirty)
+        __mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+    return newly_dirty;
+
+  ---
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h3><a name="per-queue_wb">per-queue wb</a></h3>
+<p>
+<font size="2">
+The bdi is per-queue instead of per-fs.
+<pre>
+#STEP 0
+blk_alloc_queue_node
+---
+    q->backing_dev_info = bdi_alloc_node(gfp_mask, node_id);
+    if (!q->backing_dev_info)
+        goto fail_split;
+
+    q->stats = blk_alloc_queue_stats();
+    if (!q->stats)
+        goto fail_stats;
+
+    q->backing_dev_info->ra_pages = VM_READAHEAD_PAGES;
+    q->backing_dev_info->capabilities = BDI_CAP_CGROUP_WRITEBACK;
+    q->backing_dev_info->name = "block";
+    q->node = node_id;
+
+    timer_setup(&q->backing_dev_info->laptop_mode_wb_timer,
+            laptop_mode_timer_fn, 0);
+---
+
+#STEP 1
+__blkdev_get
+---
+    if (!bdev->bd_openers) {
+        first_open = true;
+        bdev->bd_disk = disk;
+        bdev->bd_queue = disk->queue;
+        bdev->bd_contains = bdev;
+        bdev->bd_partno = partno;
+
+        if (!partno) {
+            ret = -ENXIO;
+            bdev->bd_part = disk_get_part(disk, partno);
+            if (!bdev->bd_part)
+                goto out_clear;
+
+            ret = 0;
+            if (disk->fops->open) {
+                ret = disk->fops->open(bdev, mode);
+                ...
+            }
+
+            if (!ret) {
+                bd_set_size(bdev,(loff_t)get_capacity(disk)<<9);
+                set_init_blocksize(bdev);
+            }
+
+            ...
+        } else {
+            struct block_device *whole;
+            whole = bdget_disk(disk, 0);
+            ret = -ENOMEM;
+            if (!whole)
+                goto out_clear;
+            BUG_ON(for_part);
+            ret = __blkdev_get(whole, mode, 1);
+            if (ret)
+                goto out_clear;
+            bdev->bd_contains = whole;
+            bdev->bd_part = disk_get_part(disk, partno);
+            if (!(disk->flags & GENHD_FL_UP) ||
+                !bdev->bd_part || !bdev->bd_part->nr_sects) {
+                ret = -ENXIO;
+                goto out_clear;
+            }
+            bd_set_size(bdev, (loff_t)bdev->bd_part->nr_sects << 9);
+            set_init_blocksize(bdev);
+        }
+
+        if (bdev->bd_bdi == &noop_backing_dev_info)
+            bdev->bd_bdi = bdi_get(disk->queue->backing_dev_info);
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+---
+
+#STEP 2
+mount_dev
+---
+    s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
+         bdev);
+---
+
+static int set_bdev_super(struct super_block *s, void *data)
+{
+    s->s_bdev = data;
+    s->s_dev = s->s_bdev->bd_dev;
+    s->s_bdi = bdi_get(s->s_bdev->bd_bdi);
+
+    return 0;
+}
+
+#STEP 3
+balance_dirty_pages_ratelimited
+  -> inode_to_bdi
+  ---
+    sb = inode->i_sb;
+#ifdef CONFIG_BLOCK
+    if (sb_is_blkdev_sb(sb))
+        return I_BDEV(inode)->bd_bdi;
+#endif
+    return sb->s_bdi;
+  ---
+
+
+</pre>
+</font>
+</p>
+
+
+<h3><a name="writeback_legacy">writeback(legacy)</a></h3>
 <p>
 <font size="2">
 <pre>
@@ -442,6 +827,7 @@ it.
         nd->last_type = type;
 <font color="blue">
         nd->last is the name component we walking currently.
+        link_path_walk will leave the last component of the path for do_last
 </font>
         name += hashlen_len(hash_len);
         if (!*name)
@@ -542,6 +928,22 @@ Currently, there are two path walking modes:
 ref-walk is the traditional way of performing dcache lookup using d_lock to
 serialize the concurrent modifications to the dentry and take a reference count
 on it.
+
+The reference is release here,
+
+step_into
+  -> path_to_nameidata
+---
+    if (!(nd->flags & LOOKUP_RCU)) {
+        dput(nd->path.dentry);
+        if (nd->path.mnt != path->mnt)
+            mntput(nd->path.mnt);
+    }
+    nd->path.mnt = path->mnt;
+    nd->path.dentry = path->dentry;
+
+---
+
 </pre>
 <li> rcu-walk
 <pre>
@@ -572,7 +974,7 @@ The 'storing to shared data' means, in ref-walk, it need to:
 
 To kill them, rcu-walk does as following:
 <ul>
-<li> Take the RCU lock for the entire path walk.
+<li> Take the RCU lock for the entire path walk to protect the dentry against being freed.
 <pre>
 path_openat/path_lookupat...
   -> path_init
@@ -641,7 +1043,7 @@ lookup_fast
        </pre>
         ---
         ...
-<font color="blude">
+<font color="blue">
         //This sequence count validates that the inode matches
         //the dentry name information from lookup.
 </font>
@@ -656,16 +1058,104 @@ lookup_fast
 </font>
         if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
             return -ECHILD;
-
         *seqp = seq;
         ...
     }
 ---
 
-The write_seqcount on dentry->d_seq occurs when modify the dentry, such as
-__d_move.
+
+<U>This d_seq could ensure if we get a dentry, it must be expected.
+Even if the dentry is renamed after this, it is still valid because the rename
+would not allocate a new dentry but just modify and rehash it.</U>
+
+
 </pre>
 </ul>
+
+Who would write_seqcount the dentry->d_seq ?
+<ul>
+<li> dentry_unlink_inode
+<pre>
+---
+    raw_write_seqcount_begin(&dentry->d_seq);
+    __d_clear_type_and_inode(dentry);
+    hlist_del_init(&dentry->d_u.d_alias);
+    raw_write_seqcount_end(&dentry->d_seq);
+---
+dentry_unlink_inode <- __dentry_kill
+                       d_delete
+</pre>
+<li> __d_instantiate
+<pre>
+---
+    spin_lock(&dentry->d_lock);
+    /*
+     * Decrement negative dentry count if it was in the LRU list.
+     */
+    if (dentry->d_flags & DCACHE_LRU_LIST)
+        this_cpu_dec(nr_dentry_negative);
+    hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+    raw_write_seqcount_begin(&dentry->d_seq);
+    __d_set_inode_and_type(dentry, inode, add_flags);
+    raw_write_seqcount_end(&dentry->d_seq);
+    fsnotify_update_flags(dentry);
+    spin_unlock(&dentry->d_lock);
+---
+</pre>
+<li> __d_add
+<pre>
+---
+    if (inode) {
+        unsigned add_flags = d_flags_for_inode(inode);
+        hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+        raw_write_seqcount_begin(&dentry->d_seq);
+        __d_set_inode_and_type(dentry, inode, add_flags);
+        raw_write_seqcount_end(&dentry->d_seq);
+        fsnotify_update_flags(dentry);
+    }
+---
+</pre>
+<li> __d_move
+<pre>
+---
+    write_seqcount_begin(&dentry->d_seq);
+    write_seqcount_begin_nested(&target->d_seq, DENTRY_D_LOCK_NESTED);
+
+    /* unhash both */
+    if (!d_unhashed(dentry))
+        ___d_drop(dentry);
+    if (!d_unhashed(target))
+        ___d_drop(target);
+
+    /* ... and switch them in the tree */
+    dentry->d_parent = target->d_parent;
+    if (!exchange) {
+        copy_name(dentry, target);
+        target->d_hash.pprev = NULL;
+        dentry->d_parent->d_lockref.count++;
+        if (dentry != old_parent) /* wasn't IS_ROOT */
+            WARN_ON(!--old_parent->d_lockref.count);
+    } else {
+        target->d_parent = old_parent;
+        swap_names(dentry, target);
+        list_move(&target->d_child, &target->d_parent->d_subdirs);
+        __d_rehash(target);
+        fsnotify_update_flags(target);
+    }
+    list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+    __d_rehash(dentry);
+    fsnotify_update_flags(dentry);
+    fscrypt_handle_d_move(dentry);
+
+    write_seqcount_end(&target->d_seq);
+    write_seqcount_end(&dentry->d_seq);
+
+
+---
+</pre>
+</ul>
+ 
+
 
 There are two points that why seqlock is better than spinlock in almost-read
 scenario.
@@ -829,109 +1319,134 @@ retry:
 </font>
 </p>
 
+<h2><a name="pagecache">pagecache</a></h2>
+<h3><a name="lifecycle_of_pagecache">lifecycle of pagecache</a></h3>
+<p>
+<font size="2">
+<pre>
 
+<a href="#grow_pagecache">grow pagecache</a>
+</pre>
+<a name="grow_pagecache">grow pagecache</a>
+<pre>
+pagecache_get_page
+  -> find_get_entry
+  -> __page_cache_alloc
+  -> add_to_page_cache_lru
+    -> __add_to_page_cache_locked
+    -> lru_cache_add
+      -> __lru_cache_add
+      ---
+        struct pagevec *pvec = &get_cpu_var(lru_add_pvec);
 
-<h2><a name="inode">inode</a></h2>
-<h3><a name="aops">address_space ops</a></h3>
+        get_page(page);
+        if (!pagevec_add(pvec, page) || PageCompound(page))
+<font color="red">
+             ^^^^^^^^^^^ [1]
+</font>
+            __pagevec_lru_add(pvec);
+<font color="red">
+           ^^^^^^^^^^^^^^^^^^^^^^^^ [2]
+</font>
+        put_cpu_var(lru_add_pvec);
+      ---
+
+The interesting thing here is that the page would be added into per-cpu pagevec
+first. If per-cpu pagevec is full, __pagevec_lru_add would drain the pages into
+lru list one time.
+
+__pagevec_lru_add
+  -> __pagevec_lru_add_fn
+  ---
+    SetPageLRU(page);
+    smp_mb();
+
+    if (page_evictable(page)) {
+        lru = page_lru(page);
+    } else {
+        ...
+    }
+
+    add_page_to_lru_list(page, lruvec, lru);
+  ---
+
+When drain pages into lru, we need to select lru list for it. This is done by page_lru
+
+static __always_inline enum lru_list page_lru(struct page *page)
+{
+    enum lru_list lru;
+
+    if (PageUnevictable(page))
+        lru = LRU_UNEVICTABLE;
+    else {
+        lru = page_lru_base_type(page);
+        if (PageActive(page))
+            lru += LRU_ACTIVE;
+    }
+    return lru;
+}
+
+enum lru_list {
+    LRU_INACTIVE_ANON = LRU_BASE,
+    LRU_ACTIVE_ANON = LRU_BASE + LRU_ACTIVE,
+    LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
+    LRU_ACTIVE_FILE = LRU_BASE + LRU_FILE + LRU_ACTIVE,
+    LRU_UNEVICTABLE,
+    NR_LRU_LISTS
+};
+
+</pre>
+
+</font>
+</p>
+
+<h3><a name="pagecache_in_meminfo">pagecache in meminfo</a></h3>
+<p>
 <font size="2">
 <ul>
-<li> readpage/readpages
+<li> Buffers and Cached
 <pre>
-// f_ops.read_iter
-generic_file_read_iter
-  -> generic_file_buffered_read
+meminfo_proc_show
+---
+    si_meminfo(&i);
+    si_swapinfo(&i);
+    committed = percpu_counter_read_positive(&vm_committed_as);
 
-//vm_ops.fault
-filemap_fault
-  -> page_cache_read // if no_cached_page
-    -> __page_cache_alloc
-    -> a_ops->readpage
-or-> a_ops->readpage // if page_not_uptodate
+    cached = global_node_page_state(NR_FILE_PAGES) -
+            total_swapcache_pages() - i.bufferram;
+    if (cached < 0)
+        cached = 0;
 
-__do_page_cache_readahead
-  -> read_pages
-    -> a_ops->readpages // if there is readpages
-	// otherwise one by one
-    -> a_ops->readpage
-</pre>
+    for (lru = LRU_BASE; lru < NR_LRU_LISTS; lru++)
+        pages[lru] = global_node_page_state(NR_LRU_BASE + lru);
 
-<li> writepage/writepages
-<pre>
-// start writeback on mapping dirty pages in range
-__filemap_fdatawrite_range
-  -> do_writepages
-    -> a_ops->writepages or
-	   generic_writepages
-	     -> pagevec_lookup_range_tag
-		 -> __writepage
-		   -> a_ops->writepage
+    available = si_mem_available();
+    sreclaimable = global_node_page_state(NR_SLAB_RECLAIMABLE);
+    sunreclaim = global_node_page_state(NR_SLAB_UNRECLAIMABLE);
 
-// memory management, on-demand
-shrink_page_list
-  -> pageout
-    -> a_ops->writepage
+    show_val_kb(m, "MemTotal:       ", i.totalram);
+    show_val_kb(m, "MemFree:        ", i.freeram);
+    show_val_kb(m, "MemAvailable:   ", available);
+    show_val_kb(m, "Buffers:        ", i.bufferram);
+---
 
-//wb, periodic and on-demand
-wb_writeback
-  -> writeback_sb_inodes
-    -> __writeback_single_inode
-	  -> do_writepages
-</pre>
-<li> direct_IO
-<pre>
-bypass the pagecache
+What need to be noticed here is the Buffers
+bufferram come from nr_blockdev_pages
+---
+    struct block_device *bdev;
+    long ret = 0;
+    spin_lock(&bdev_lock);
+    list_for_each_entry(bdev, &all_bdevs, bd_list) {
+        ret += bdev->bd_inode->i_mapping->nrpages;
+    }
+    spin_unlock(&bdev_lock);
+    return ret;
+---
 
-generic_file_read_iter
-if iocb->ki_flags & IOCB_DIRECT
-  -> filemap_write_and_wait_range // we will bypass the pagecache, so have to
-                                  // write and wait the data in pagecache to disk.
-  -> a_ops->direct_IO
-
-__generic_file_write_iter
-  -> generic_file_direct_write
-    -> file_write_and_wait_range
-	-> invalidate_inode_pages2_range //invalidate page cache to ensure buffered
-	                                 //reads to go to disk to get new data.
 </pre>
 </ul>
-<li> write_begin/write_end
-<pre>
-__generic_file_write_iter
-  -> generic_perform_write
----
-		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
-						&page, &fsdata);
-		if (unlikely(status < 0))
-			break;
-
-		if (mapping_writably_mapped(mapping))
-			flush_dcache_page(page);
-
-		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
-		flush_dcache_page(page);
-
-		status = a_ops->write_end(file, mapping, pos, bytes, copied,
-						page, fsdata);
----
-</pre>
 </font>
-</pre>
-
-<h3><a name="iops">inode ops</a></h3>
-<pre>
-<font size="2">
-<li> lookup (just for inode of dir)
-<pre>
-walk_component
-  -> lookup_fast
-    -> __d_lookup // lookup the dentry in dentry_hashtable
-  -> lookup_slow  // if lookup_fast fails
-    -> __lookup_slow
-	  -> inode->i_op->lookup(parent_inode, dentry, flags); // dentry include the name of the child
-</pre>
-<li> 
-</font>
-</pre>
+</p>
 
 
 

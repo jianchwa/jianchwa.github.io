@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ZFS</title>
+</head>
+<body>
+<div>
+    <h1>ZFS</h1> 
+</div>
+
+<p>
+<font size="2">
+
+<a href="#Talking">Talking</a>
+<ul>
+<li> <a href="#self_healing">self healing</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="Talking">Talking</a></h2>
+<p>
+<font size="2">
+    We call this section as 'Talking' because we have not got a global view    of<br/>
+    of the ZFS. So we have to just setup some small, separate and independent<br/>
+    sections here.
+</font>
+</p>
+
+<h3><a name="self_healing">self healing</a></h3>
+
+<h4><a name="self_healing_mirror">Mirror</a></h4>
+<p>
+<font size="2">
+There are two layers of vdev
+<pre>
+              vdev of mirror
+                  /  \
+                 /    \
+              vdev   vdev
+              sda     sdb
+</pre>
+<pre>
+vdev_mirror_io_start
+---
+    if (zio->io_type == ZIO_TYPE_READ) {
+        ...
+        /*
+         * For normal reads just pick one child.
+         */
+<font color="red">
+        c = vdev_mirror_child_select(zio);
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        children = (c >= 0);
+</font>
+    } else {
+        ASSERT(zio->io_type == ZIO_TYPE_WRITE);
+
+        /*
+         * Writes go to all children.
+         */
+        c = 0;
+        children = mm->mm_children;
+    }
+<font color="blue">
+    // send out the child IOs
+</font>
+    while (children--) {
+        mc = &mm->mm_child[c];
+        zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+            mc->mc_vd, mc->mc_offset, zio->io_abd, zio->io_size,
+            zio->io_type, zio->io_priority, 0,
+            vdev_mirror_child_done, mc));
+        c++;
+    }
+
+    zio_execute(zio);
+---
+
+vdev_mirror_child_select
+---
+    for (c = 0; c < mm->mm_children; c++) {
+        mirror_child_t *mc;
+
+        mc = &mm->mm_child[c];
+<font color="red">
+        if (mc->mc_tried || mc->mc_skipped)
+</font>
+            continue;
+        ...
+    
+        mc->mc_load = vdev_mirror_load(mm, mc->mc_vd, mc->mc_offset);
+        if (mc->mc_load > lowest_load)
+            continue;
+
+        if (mc->mc_load < lowest_load) {
+            lowest_load = mc->mc_load;
+            mm->mm_preferred_cnt = 0;
+        }
+        mm->mm_preferred[mm->mm_preferred_cnt] = c;
+        mm->mm_preferred_cnt++;
+    }
+---
+</pre>
+
+Every child IO (multiple for write, one for read) would go through the zio_pipeline.<br/>
+<pre>
+VDEV_IO_START -> VDEV_IO_DONE -> VDEV_IO_ASSESS -> CHECKSUM_VERIFY -> DONE
+
+There are some special things about the child zio.
+
+zio_vdev_child_io
+---
+    enum zio_stage pipeline = ZIO_VDEV_CHILD_PIPELINE;
+<font color="blue">
+    #define    ZIO_VDEV_IO_STAGES            \
+        (ZIO_STAGE_VDEV_IO_START |        \
+        ZIO_STAGE_VDEV_IO_DONE |        \
+        ZIO_STAGE_VDEV_IO_ASSESS)
+
+    #define    ZIO_VDEV_CHILD_PIPELINE            \
+        (ZIO_VDEV_IO_STAGES |            \
+        ZIO_STAGE_DONE)
+
+</font>
+    ...
+    if (type == ZIO_TYPE_READ && bp != NULL) {
+        /*
+<font color="red">
+         * If we have the bp, then the child should perform the
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * checksum and the parent need not.  This pushes error
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+         * detection as close to the leaves as possible and
+         * eliminates redundant checksums in the interior nodes.
+         */
+        pipeline |= ZIO_STAGE_CHECKSUM_VERIFY;
+        pio->io_pipeline &= ~ZIO_STAGE_CHECKSUM_VERIFY;
+    }
+    ...
+    flags |= ZIO_VDEV_CHILD_FLAGS(pio);
+<font color="blue">
+    #define    ZIO_VDEV_CHILD_FLAGS(zio)                \
+        (((zio)->io_flags & ZIO_FLAG_VDEV_INHERIT) |        \
+        ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_CANFAIL)
+</font>
+---
+</pre>
+
+When the zio_done is invoked for the child io of mirror,
+<pre>
+zio_done
+  -> zio->io_done
+     vdev_mirror_child_done
+     ---
+        mc->mc_error = zio->io_error;
+        mc->mc_tried = 1;
+        mc->mc_skipped = 0;
+     ---
+  -> zio_notify_parent
+  ---
+    uint64_t *countp = &pio->io_children[zio->io_child_type][wait];
+    ...
+    mutex_enter(&pio->io_lock);
+    ...
+    (*countp)--;
+
+    if (*countp == 0 && pio->io_stall == countp) {
+        zio_taskq_type_t type =
+            pio->io_stage < ZIO_STAGE_VDEV_IO_START ? ZIO_TASKQ_ISSUE :
+            ZIO_TASKQ_INTERRUPT;
+        pio->io_stall = NULL;
+        mutex_exit(&pio->io_lock);
+
+        if (next_to_executep != NULL && *next_to_executep == NULL) {
+<font color="red">
+            *next_to_executep = pio;
+            ^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+        } else {
+            zio_taskq_dispatch(pio, type, B_FALSE);
+        }
+    } 
+  ---
+</pre>
+zio_done of child zio would return its parent zio which will be executed next.
+<pre>
+The zio_vdev_io_done will be invoked for mirror zio.
+zio_vdev_io_done
+  -> ops->vdev_op_io_done
+     vdev_mirror_io_done
+     ---
+    for (c = 0; c < mm->mm_children; c++) {
+        mc = &mm->mm_child[c];
+
+        if (mc->mc_error) {
+            if (!mc->mc_skipped)
+                unexpected_errors++;
+        } else if (mc->mc_tried) {
+            good_copies++;
+        }
+    }
+
+    ...
+<font color="red">
+    /*
+     * If we don't have a good copy yet, keep trying other children.
+     */
+</font>
+    /* XXPOLICY */
+    if (good_copies == 0 && (c = vdev_mirror_child_select(zio)) != -1) {
+        ASSERT(c >= 0 && c < mm->mm_children);
+        mc = &mm->mm_child[c];
+        zio_vdev_io_redone(zio);
+        zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+            mc->mc_vd, mc->mc_offset, zio->io_abd, zio->io_size,
+            ZIO_TYPE_READ, zio->io_priority, 0,
+            vdev_mirror_child_done, mc));
+        return;
+    }
+    ...
+    if (good_copies && spa_writeable(zio->io_spa) &&
+        (unexpected_errors ||
+        (zio->io_flags & ZIO_FLAG_RESILVER) ||
+        ((zio->io_flags & ZIO_FLAG_SCRUB) && mm->mm_resilvering))) {
+        /*
+         * Use the good data we have in hand to repair damaged children.
+         */
+        for (c = 0; c < mm->mm_children; c++) {
+            /*
+             * Don't rewrite known good children.
+             * Not only is it unnecessary, it could
+             * actually be harmful: if the system lost
+             * power while rewriting the only good copy,
+             * there would be no good copies left!
+             */
+            mc = &mm->mm_child[c];
+
+            if (mc->mc_error == 0) {
+                if (mc->mc_tried)
+                    continue;
+                ...
+            }
+
+            zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+                mc->mc_vd, mc->mc_offset,
+                zio->io_abd, zio->io_size,
+                ZIO_TYPE_WRITE, ZIO_PRIORITY_ASYNC_WRITE,
+                ZIO_FLAG_IO_REPAIR | (unexpected_errors ?
+                ZIO_FLAG_SELF_HEAL : 0), NULL, NULL));
+        }
+</pre>
+In conclusion, the silent data corruption and self-healing is done in vdev mirror layer.<br/>
+                                                                      ^^^^^^^^^^^^^^^^^
+There is nothing to do with zio reexecute.
+</font>
+</p>
+
+<h4><a name="self_healing_raidz">RAIDZ</a></h4>
+<p>
+<font size="2">
+One of the most important thing we should know is that<br/>
+<pre>
+RAIDZ has dynamic stripe width
+
+<font color="green">                 +--+--+--+--+--+
+                 |P0|D0|D2|D4|D6|
+                 +--+--+--+--+--+
+                 |P1|D1|D3|D5|D7|</font>
+                 +--+--+--+--+--+
+<font color="blue">                 |P0|D1|D2|D3</font><font color="red">|P0|
+                 +--+--+--+--+--+
+                 |D1|D2|D3</font><font color="green">|P0|D0|</font>
+                 +--+--+--+--+--+
+<font color="blue">                 |P0|D0|D1|D2|D3|</font>
+                 +--+--+--+--+--+
+<ul>
+<li> variable block size from 512 byte to 16M
+<li> every logical block has its own stripe
+<li> every write is a full stripe write
+</ul>
+</pre> 
+<B>And the checksum is against block</B><br/>
+So in RAIDZ, the checksum isn't checked on the child zio under it.
+<pre>
+vdev_raidz_io_start
+---
+    for (c = rm->rm_cols - 1; c >= 0; c--) {
+        rc = &rm->rm_col[c];
+        cvd = vd->vdev_child[rc->rc_devidx];
+        ...
+        if (c >= rm->rm_firstdatacol || rm->rm_missingdata > 0 ||
+            (zio->io_flags & (ZIO_FLAG_SCRUB | ZIO_FLAG_RESILVER))) {
+            zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+<font color="red">
+                                               /\
+                                               ||
+                                            The block pointer here is NULL
+</font>
+                rc->rc_offset, rc->rc_abd, rc->rc_size,
+                zio->io_type, zio->io_priority, 0,
+                vdev_raidz_child_done, rc));
+        }
+    }
+---
+zio_vdev_child_io
+---
+    if (type == ZIO_TYPE_READ && bp != NULL) {
+        pipeline |= ZIO_STAGE_CHECKSUM_VERIFY;
+        pio->io_pipeline &= ~ZIO_STAGE_CHECKSUM_VERIFY;
+    }
+---
+Only the bp is provided, zfs check the checksum of the child zio. (<font color="red">Mirror is
+that case</font>)
+</pre>
+The checksum is checked in vdev_raidz_io_done with raidz_checksum_verify.<br/>
+If data errors occurred:
+<ul>
+<li> Try to reassemble the data from the parity available.
+<li> If we haven't yet read the parity drives, read them now.
+<li> If all parity drives have been read but the data still doesn't
+<li> reassemble with a correct checksum, then try combinatorial reconstruction.
+<li> If that doesn't work, return an error.
+</ul>
+
+Let's look at the code segment that read in all of the columns and perform
+combinatorial reconstruction over all possible combinations.
+<pre>
+vdev_raidz_io_done
+---
+    for (c = 0; c < rm->rm_cols; c++) {
+        if (rm->rm_col[c].rc_tried)<font color="blue">// updated by vdev_raidz_child_done</font>
+            continue;
+
+        zio_vdev_io_redone(zio);
+        do {
+            rc = &rm->rm_col[c];
+            if (rc->rc_tried)
+                continue;
+            zio_nowait(zio_vdev_child_io(zio, NULL,
+                vd->vdev_child[rc->rc_devidx],
+                rc->rc_offset, rc->rc_abd, rc->rc_size,
+                zio->io_type, zio->io_priority, 0,
+                vdev_raidz_child_done, rc));
+        } while (++c < rm->rm_cols);
+
+        return;
+    }
+
+    if (total_errors > rm->rm_firstdatacol) {
+        zio->io_error = vdev_raidz_worst_error(rm);
+
+    } else if (total_errors < rm->rm_firstdatacol &&
+<font color="red">
+        (code = vdev_raidz_combrec(zio, total_errors, data_errors)) != 0) {
+</font>
+        if (code != (1 << rm->rm_firstdatacol) - 1)
+            (void) raidz_parity_verify(zio, rm);
+    }
+---
+vdev_raidz_combrec
+---
+            code = vdev_raidz_reconstruct(rm, tgts, n);
+            if (raidz_checksum_verify(zio) == 0) {
+---
+</pre>
+If we get valid data after reconstruction attempts, vdev_raidz_io_done would try
+to repair the errors.
+<pre>
+    if (zio->io_error == 0 && spa_writeable(zio->io_spa) &&
+        (unexpected_errors || (zio->io_flags & ZIO_FLAG_RESILVER))) {
+        /*
+         * Use the good data we have in hand to repair damaged children.
+         */
+        for (c = 0; c < rm->rm_cols; c++) {
+            rc = &rm->rm_col[c];
+            cvd = vd->vdev_child[rc->rc_devidx];
+
+            if (rc->rc_error == 0)
+                continue;
+
+            zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+                rc->rc_offset, rc->rc_abd, rc->rc_size,
+                ZIO_TYPE_WRITE, ZIO_PRIORITY_ASYNC_WRITE,
+                ZIO_FLAG_IO_REPAIR | (unexpected_errors ?
+                ZIO_FLAG_SELF_HEAL : 0), NULL, NULL));
+        }
+    }
+
+</pre>
+</font>
+</p>
+
+
+
+</body>
+</html>
+

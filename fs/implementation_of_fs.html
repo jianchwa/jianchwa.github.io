@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Implementation of FS</title>
+</head>
+<body>
+<div>
+    <h1>Implementation of FS</h1> 
+</div>
+
+<p>
+<font size="2">
+
+<a href="#ext2">ext2</a>
+<ul>
+<li><a href="#root_inode">root inode</a>
+<li><a href="#equipment_of_an_inode">equipment of an inode</a>
+</ul>
+<a href="#vfs">vfs</a>
+<ul>
+<li><a href="#The_lovely_inode">The lovely inode</a>
+<li><a href="#The_lovely_BH">The lovely BH</a>
+</ul>
+</font>
+</p>
+
+
+
+<h2><a name="ext2">ext2</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+<p>
+How does a fs work in kernel<br/>
+Let's take ext2 as example.<br/>
+</p>
+
+<h3><a name="root_inode">root inode</a></h3>
+<p>
+<font size=2>
+The inode should be there when fill_super.<br/>
+Look at the ext2_fill_super
+<pre>
+---
+<font color="blue">
+	/*
+	 * set up enough so that it can read an inode
+	 */
+</font>
+	sb->s_op = &ext2_sops;
+	sb->s_export_op = &ext2_export_ops;
+	sb->s_xattr = ext2_xattr_handlers;
+	...
+	root = ext2_iget(sb, EXT2_ROOT_INO);
+	if (IS_ERR(root)) {
+		ret = PTR_ERR(root);
+		goto failed_mount3;
+	}
+	if (!S_ISDIR(root->i_mode) || !root->i_blocks || !root->i_size) {
+		iput(root);
+		ext2_msg(sb, KERN_ERR, "error: corrupt root inode, run e2fsck");
+		goto failed_mount3;
+	}
+<font color="red">
+	sb->s_root = d_make_root(root);
+</font>
+---
+</pre>
+What is the sb->s_root for ?<br/>
+It will be used as the inode of the mount point.
+<pre>
+See vfs_create_mount
+    follow_managed
+</pre>
+</font>
+</p>
+
+<h3><a name="equipment_of_an_inode">equipment of an inode</a></h3>
+<p>
+<font size="2">
+The root inode of a filesystem should be the start of all of the operations.<br/>
+Let's look at what equipment does the inode have to carry all of the operations
+of the fs.
+<pre>
+ext2_iget
+---
+	if (S_ISREG(inode->i_mode)) {
+		ext2_set_file_ops(inode);
+		---
+		inode->i_op = <font color="red">&ext2_file_inode_operations;</font>
+		inode->i_fop = <font color="red">&ext2_file_operations;</font>
+		if (IS_DAX(inode))
+			inode->i_mapping->a_ops = &ext2_dax_aops;
+		else if (test_opt(inode->i_sb, NOBH))
+			inode->i_mapping->a_ops = &ext2_nobh_aops;
+		else
+			inode->i_mapping->a_ops = <font color="red">&ext2_aops;</font>
+		---
+	} else if (S_ISDIR(inode->i_mode)) {
+		inode->i_op = <font color="red">&ext2_dir_inode_operations;</font>
+		inode->i_fop =<font color="red">&ext2_dir_operations;</font>
+		if (test_opt(inode->i_sb, NOBH))
+			inode->i_mapping->a_ops = &ext2_nobh_aops;
+		else
+			inode->i_mapping->a_ops = <font color="red">&ext2_aops;</font>
+	} else if (S_ISLNK(inode->i_mode)) {
+		if (ext2_inode_is_fast_symlink(inode)) {
+			inode->i_link = (char *)ei->i_data;
+			inode->i_op = &ext2_fast_symlink_inode_operations;
+			nd_terminate_link(ei->i_data, inode->i_size,
+				sizeof(ei->i_data) - 1);
+		} else {
+			inode->i_op = &ext2_symlink_inode_operations;
+			inode_nohighmem(inode);
+			if (test_opt(inode->i_sb, NOBH))
+				inode->i_mapping->a_ops = &ext2_nobh_aops;
+			else
+				inode->i_mapping->a_ops = &ext2_aops;
+		}
+	} else {
+		inode->i_op = &ext2_special_inode_operations;
+		if (raw_inode->i_block[0])
+			init_special_inode(inode, inode->i_mode,
+			   old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
+		else 
+			init_special_inode(inode, inode->i_mode,
+			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
+	}
+---
+</pre>
+The equipments of an inode includes<br/>
+</br>
+<B>inode operations</B>
+<br/>
+<ul>
+<B><li>For a regular file</B>
+<pre>
+const struct inode_operations ext2_file_inode_operations = {
+#ifdef CONFIG_EXT2_FS_XATTR
+	.listxattr	= ext2_listxattr,
+#endif
+	.getattr	= ext2_getattr,
+	.setattr	= ext2_setattr,
+	.get_acl	= ext2_get_acl,
+	.set_acl	= ext2_set_acl,
+	.fiemap		= ext2_fiemap,
+};
+
+<ul>
+<B><li>getattr</B>
+<pre>
+vfs_stat/lstat/fstatat/fstat
+  -> vfs_statx
+    -> vfs_getattr
+	  -> vfs_getattr_nosec
+	  ---
+		if (inode->i_op->getattr)
+			return inode->i_op->getattr(path, stat, request_mask,
+						    query_flags);
+
+<font color="red">		generic_fillattr(inode, stat); </font>
+	  ---
+</pre>
+<B><li>setattr</B>
+<pre>
+utimes_common / chmod_common /chown_common
+  -> notify_change
+	---
+		if (inode->i_op->setattr)
+		error = inode->i_op->setattr(dentry, attr);
+	else
+<font color="red">		error = simple_setattr(dentry, attr); </font>
+	---
+	simple_setattr here will inovke <font color="red">mark_inode_dirty</font>
+</pre>
+<B><li> get_acl/set_acl</B>
+<pre>
+ACCESS CONTROL LISTS
+This could be controlled by <font color="red">SB_POSIXACL</font>
+We could refer to the btrfs
+btrfs_parse_options
+---
+		case Opt_acl:
+#ifdef CONFIG_BTRFS_FS_POSIX_ACL
+			info->sb->s_flags |= SB_POSIXACL;
+			break;
+#else
+			btrfs_err(info, "support for ACL not compiled in!");
+			ret = -EINVAL;
+			goto out;
+#endif
+----
+</pre>
+<B><li> fiemap</B>
+<pre>
+Note, this is not FILE map. It is used to get the file extent mappings.
+We could refer to Documentation/filesystems/fiemap.txt 
+
+do_vfs_ioctl
+  -> ioctl_fiemap
+    -> inode->i_op->fiemap
+For ext2, it is
+ext2_fiemap
+---
+	return generic_block_fiemap(inode, fieinfo, start, len,
+				    ext2_get_block);
+---
+</pre>
+</ul>
+</pre>
+
+<B><li>For a directory</B>
+<pre>
+const struct inode_operations ext2_dir_inode_operations = {
+	.create		= ext2_create,
+	.lookup		= ext2_lookup,
+	.link		= ext2_link,
+	.unlink		= ext2_unlink,
+	.symlink	= ext2_symlink,
+	.mkdir		= ext2_mkdir,
+	.rmdir		= ext2_rmdir,
+	.mknod		= ext2_mknod,
+	.rename		= ext2_rename,
+#ifdef CONFIG_EXT2_FS_XATTR
+	.listxattr	= ext2_listxattr,
+#endif
+	.getattr	= ext2_getattr,
+	.setattr	= ext2_setattr,
+	.get_acl	= ext2_get_acl,
+	.set_acl	= ext2_set_acl,
+	.tmpfile	= ext2_tmpfile,
+};
+
+<ul>
+<B><li> create</B>
+<pre>
+do_mknodat // S_IFREG
+  -> vfs_create
+
+path_openat
+  -> do_last
+    -> lookup_open
+	---
+	/* Negative dentry, just create the file */
+	if (!dentry->d_inode && (open_flag & O_CREAT)) {
+		file->f_mode |= FMODE_CREATED;
+		audit_inode_child(dir_inode, dentry, AUDIT_TYPE_CHILD_CREATE);
+		if (!dir_inode->i_op->create) {
+			error = -EACCES;
+			goto out_dput;
+		}
+		error = dir_inode->i_op->create(dir_inode, dentry, mode,
+						open_flag & O_EXCL);
+	}
+	---
+</pre>
+<B><li> lookup</B>
+<pre>
+walk_component
+  -> lookup_slow
+    -> __lookup_slow
+	---
+		old = inode->i_op->lookup(inode, dentry, flags);
+		d_lookup_done(dentry);
+		if (unlikely(old)) {
+			dput(dentry);
+			dentry = old;
+		}
+
+	---
+</pre>
+<B><li> link/unlink/symlink</B>
+<pre>
+vfs_link
+  // if i_op->link is NULL, return -EPERM
+  -> dir->i_op->link(old_dentry, dir, new_dentry);
+
+vfs_symlink
+---
+	if (!dir->i_op->symlink)
+		return -EPERM;
+	...
+	error = dir->i_op->symlink(dir, dentry, oldname);
+---
+</pre>
+<B><li>mkdir/rmdir</B>
+<pre>
+vfs_mkdir
+---
+	if (!dir->i_op->mkdir)
+		return -EPERM;
+
+	mode &= (S_IRWXUGO|S_ISVTX);
+	...
+	error = dir->i_op->mkdir(dir, dentry, mode);
+---
+</pre>
+<B><li> mknod</B>
+<pre>
+vfs_mknod
+---
+	if (!dir->i_op->mknod)
+		return -EPERM;
+
+	error = dir->i_op->mknod(dir, dentry, mode, dev);
+---
+</pre>
+<B><li> rename</B>
+<pre>
+vfs_rename
+---
+	if (!old_dir->i_op->rename)
+		return -EPERM;
+
+Yeah Yeah Yeah, we are even able to not support rename.
+---
+</pre>
+<B><li> tmpfile</B>
+<pre>
+tmpfile will create a file and system will delete it after it is closed.
+We are also able to not support it.
+</pre>
+
+Others are same with file's
+
+<B>We don't want to support link now, so ignore it</B>
+</pre>
+</ul>
+</pre>
+
+<br/>
+
+<B> file operation</B>
+<ul>
+<B><li>For regular file</B>
+<pre>
+const struct file_operations ext2_file_operations = {
+	.llseek		= generic_file_llseek,
+	.read_iter	= ext2_file_read_iter,
+	.write_iter	= ext2_file_write_iter,
+	.unlocked_ioctl = ext2_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ext2_compat_ioctl,
+#endif
+	.mmap		= ext2_file_mmap,
+	.open		= dquot_file_open,
+	.release	= ext2_release_file,
+	.fsync		= ext2_fsync,
+	.get_unmapped_area = thp_get_unmapped_area,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= iter_file_splice_write,
+};
+No things seem to be noted here.
+
+We'd better support larger filesystem block than PAGE_SIZE. This would be better
+for raid5.
+</pre>
+<B><li>For directory</B>
+<pre>
+const struct file_operations ext2_dir_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= ext2_readdir,
+	.unlocked_ioctl = ext2_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ext2_compat_ioctl,
+#endif
+	.fsync		= ext2_fsync,
+};
+
+The most important one here is the iterate_shared
+
+iterate_dir
+---
+	if (file->f_op->iterate_shared)
+		shared = true;
+	else if (!file->f_op->iterate)
+		goto out;
+	...
+	if (shared)
+		res = down_read_killable(&inode->i_rwsem);
+	else
+		res = down_write_killable(&inode->i_rwsem);
+	if (res)
+		goto out;
+
+	res = -ENOENT;
+	if (!IS_DEADDIR(inode)) {
+		ctx->pos = file->f_pos;
+		if (shared)
+			res = file->f_op->iterate_shared(file, ctx);
+		else
+			res = file->f_op->iterate(file, ctx);
+		file->f_pos = ctx->pos;
+		fsnotify_access(file);
+		file_accessed(file);
+	}
+	if (shared)
+		inode_unlock_shared(inode);
+	else
+		inode_unlock(inode);
+
+---
+</pre>
+</ul>
+<br/>
+<B>address space operations</B>
+<pre>
+regular file and directory have the same one.
+
+const struct address_space_operations ext2_aops = {
+	.readpage		= ext2_readpage,
+	.readpages		= ext2_readpages,
+	.writepage		= ext2_writepage,
+	.write_begin		= ext2_write_begin,
+	.write_end		= ext2_write_end,
+	.bmap			= ext2_bmap,
+	.direct_IO		= ext2_direct_IO,
+	.writepages		= ext2_writepages,
+	.migratepage		= buffer_migrate_page,
+	.is_partially_uptodate	= block_is_partially_uptodate,
+	.error_remove_page	= generic_error_remove_page,
+};
+
+<ul>
+<B><li> readpage / readpages</B>
+<pre>
+readpage
+  generic_file_buffered_read
+  filemap_fault
+  read_pages (readahead)
+  swap_readpage
+  nobh_truncate_page (?)
+
+readpages
+  read_pages (readahead)
+</pre>
+<B><li> writepage / writepages</B>
+<pre>
+writepage
+  move_to_new_page // if no migratepage
+    -> fallback_migrate_page
+	  -> writeout
+
+  generic_writepages
+  ---
+  	blk_start_plug(&plug);
+	ret = write_cache_pages(mapping, wbc, __writepage, mapping);
+	blk_finish_plug(&plug);
+  ---
+
+  write_one_page
+  ---
+ 	 wait_on_page_writeback(page);
+
+	if (clear_page_dirty_for_io(page)) {
+		get_page(page);
+		ret = mapping->a_ops->writepage(page, &wbc);
+		if (ret == 0)
+			wait_on_page_writeback(page);
+		put_page(page);
+	} 
+  ---
+
+  shrink_page_list
+    -> pageout
+
+  __mpage_writepage
+ 
+writepages
+  __writeback_single_inode
+    -> do_writepages
+	---
+	while (1) {
+		if (mapping->a_ops->writepages)
+			ret = mapping->a_ops->writepages(mapping, wbc);
+		else
+			ret = generic_writepages(mapping, wbc);
+		if ((ret != -ENOMEM) || (wbc->sync_mode != WB_SYNC_ALL))
+			break;
+		cond_resched();
+		congestion_wait(BLK_RW_ASYNC, HZ/50);
+	}
+	---
+  __filemap_fdatawrite_range
+  ---
+	wbc_attach_fdatawrite_inode(&wbc, mapping->host);
+	ret = do_writepages(mapping, &wbc);
+	wbc_detach_inode(&wbc);
+
+  ---
+
+</pre>
+<B><li> write_begin / write_end</B>
+<pre>
+write_begin
+  pagecache_write_begin
+
+write_end
+  pagecache_write_end
+
+generic_perform_write
+---
+	status = a_ops->write_begin(file, mapping, pos, bytes, flags,
+						&page, &fsdata);
+		if (unlikely(status < 0))
+			break;
+
+		if (mapping_writably_mapped(mapping))
+			flush_dcache_page(page);
+
+		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
+		flush_dcache_page(page);
+
+		status = a_ops->write_end(file, mapping, pos, bytes, copied,
+						page, fsdata);
+---
+</pre>
+<B><li> bmap</B>
+<pre>
+<font color="blue">
+	Returns the block number on the device holding the inode that
+ *	is the disk block number for the block of the file requested.
+
+</font>
+sector_t bmap(struct inode *inode, sector_t block)
+{
+	sector_t res = 0;
+	if (inode->i_mapping->a_ops->bmap)
+		res = inode->i_mapping->a_ops->bmap(inode->i_mapping, block);
+	return res;
+}
+</pre>
+<B><li> direct_IO</B>
+<pre>
+No need to say much here.
+</pre>
+<B><li> migratepage</B>
+<B><li> is_partially_uptodate</B>
+<B><li> error_remove_page</B>
+</ul>
+</pre>
+
+
+
+
+</font>
+</p>
+
+
+
+<h2><a name="vfs">vfs</a></h2>
+<hr style="height:5px;border:none;border-top:3px solid black;" />
+
+
+<h3><a name="The_lovely_inode">The lovely inode</a></h3>
+<p>
+<font size="2">
+<B>iget_locked</B>
+<pre>
+iget_locked
+---
+<font color="blue">
+	//inode_hashtable is a global hash table which is for caching the inode.
+	//the key is hashed from sb & ino
+</font>
+	struct hlist_head *head = inode_hashtable + hash(sb, ino);
+	struct inode *inode;
+again:
+	spin_lock(&inode_hash_lock);
+	inode = find_inode_fast(sb, head, ino);
+	spin_unlock(&inode_hash_lock);
+	if (inode) {
+		if (IS_ERR(inode))
+			return NULL;
+<font color="blue">
+		//wait for the __I_NEW to cleaned. At the moment,
+	    //the inode filled well and the caller will invoke unlock_new_inode to
+		//wakeup the waiter here.
+</font>
+		wait_on_inode(inode);
+		...
+		return inode;
+	}
+	
+<font color="blue">
+	// sb_ops->alloc_inode
+</font>
+	inode = alloc_inode(sb);
+	if (inode) {
+		struct inode *old;
+
+		spin_lock(&inode_hash_lock);
+		/* We released the lock, so.. */
+		old = find_inode_fast(sb, head, ino);
+		if (!old) {
+			inode->i_ino = ino;
+			spin_lock(&inode->i_lock);
+			inode->i_state = I_NEW;
+			hlist_add_head(&inode->i_hash, head);
+			spin_unlock(&inode->i_lock);
+			inode_sb_list_add(inode);
+			spin_unlock(&inode_hash_lock);
+<font color="blue">
+			/* Return the locked inode with I_NEW set, the
+			 * caller is responsible for filling in the contents
+			 */
+</font>
+			return inode;
+		}
+		...
+	}
+
+---
+</pre>
+</font>
+</p>
+
+
+<h3><a name="The_lovely_BH">The lovely BH</a></h3>
+<p>
+<font size="2">
+<pre>
+<B>allocation of BH</B>
+grow_dev_page
+  -> alloc_page_buffers
+  ---
+	head = NULL;
+	offset = PAGE_SIZE;
+	while ((offset -= size) >= 0) {
+		bh = alloc_buffer_head(gfp);
+		if (!bh)
+			goto no_grow;
+
+		bh->b_this_page = head;
+		bh->b_blocknr = -1;
+		head = bh;
+
+		bh->b_size = size;
+
+		/* Link the buffer to its page */
+		set_bh_page(bh, page, offset);
+	}
+  ---
+
+<B>Hold the BH</B>
+We could use get_bh and brelse to grab or release a bh. How does it work ?
+
+One of the scene is shrink_page_list
+---
+		if (page_has_private(page)) {
+			if (!try_to_release_page(page, sc->gfp_mask))
+				goto activate_locked;
+			...
+		}
+---
+
+try_to_release_page
+  -> try_to_free_buffers
+    -> drop_buffers
+	---
+	bh = head;
+	do {
+<font color="red">
+		if (buffer_busy(bh))
+			goto failed;
+</font>
+		bh = bh->b_this_page;
+	} while (bh != head);
+
+	do {
+		struct buffer_head *next = bh->b_this_page;
+
+		if (bh->b_assoc_map)
+			__remove_assoc_queue(bh);
+		bh = next;
+	} while (bh != head);
+	*buffers_to_free = head;
+	__clear_page_buffers(page);
+
+	---
+
+</pre>
+
+
+<B>BH for the metadata</B>
+<pre>
+static inline struct buffer_head *
+sb_getblk(struct super_block *sb, sector_t block)
+{
+	return __getblk_gfp(sb->s_bdev, block, sb->s_blocksize, __GFP_MOVABLE);
+}
+
+struct buffer_head *
+__getblk_gfp(struct block_device *bdev, sector_t block,
+	     unsigned size, gfp_t gfp)
+{
+	struct buffer_head *bh = __find_get_block(bdev, block, size);
+
+	might_sleep();
+	if (bh == NULL)
+		bh = __getblk_slow(bdev, block, size, gfp);
+	return bh;
+}
+
+In __find_get_block, there are fast and slow two paths.
+<ul>
+<li> fast path, lookup_bh_lru
+<pre>
+lookup_bh_lru
+---
+	bh_lru_lock();
+	for (i = 0; i < BH_LRU_SIZE; i++) {
+		struct buffer_head *bh = __this_cpu_read(bh_lrus.bhs[i]);
+
+		if (bh && bh->b_blocknr == block && bh->b_bdev == bdev &&
+		    bh->b_size == size) {
+			if (i) {
+				while (i) {
+					__this_cpu_write(bh_lrus.bhs[i],
+						__this_cpu_read(bh_lrus.bhs[i - 1]));
+					i--;
+				}
+				__this_cpu_write(bh_lrus.bhs[0], bh);
+			}
+			get_bh(bh);
+			ret = bh;
+			break;
+		}
+	}
+	bh_lru_unlock();
+---
+</pre>
+<li> slow path, __find_get_block_slow
+<pre>
+Get the bh from the pagecache of the block device where the fs is mounted.
+__find_get_block_slow
+---
+	struct inode *bd_inode = bdev->bd_inode;
+	struct address_space *bd_mapping = bd_inode->i_mapping;
+	...
+	index = block >> (PAGE_SHIFT - bd_inode->i_blkbits);
+	page = find_get_page_flags(bd_mapping, index, FGP_ACCESSED);
+	if (!page)
+		goto out;
+
+	spin_lock(&bd_mapping->private_lock);
+	if (!page_has_buffers(page))
+		goto out_unlock;
+	head = page_buffers(page);
+	bh = head;
+	do {
+		if (!buffer_mapped(bh))
+			all_mapped = 0;
+		else if (bh->b_blocknr == block) {
+			ret = bh;
+			get_bh(bh);
+			goto out_unlock;
+		}
+		bh = bh->b_this_page;
+	} while (bh != head);
+---
+</pre>
+</ul>
+If cannot find out any bh in both per-cpu bh cache and blkdev's pagecache, we
+need to invoke grow_buffers to allocate it.
+
+grow_buffers
+  -> grow_dev_page
+---
+	page = find_or_create_page(inode->i_mapping, index, gfp_mask);
+
+	BUG_ON(!PageLocked(page));
+
+	if (page_has_buffers(page)) {
+		bh = page_buffers(page);
+		if (bh->b_size == size) {
+			end_block = init_page_buffers(page, bdev,
+						(sector_t)index << sizebits,
+						size);
+			goto done;
+		}
+		if (!try_to_free_buffers(page))
+			goto failed;
+	}
+
+	/*
+	 * Allocate some buffers for this page
+	 */
+	bh = alloc_page_buffers(page, size, true);
+
+	/*
+	 * Link the page to the buffers and initialise them.  Take the
+	 * lock to be atomic wrt __find_get_block(), which does not
+	 * run under the page lock.
+	 */
+	spin_lock(&inode->i_mapping->private_lock);
+	link_dev_buffers(page, bh);
+	end_block = init_page_buffers(page, bdev, (sector_t)index << sizebits,
+			size);
+	spin_unlock(&inode->i_mapping->private_lock);
+done:
+	ret = (block < end_block) ? 1 : -ENXIO;
+failed:
+	unlock_page(page);
+	put_page(page);
+---
+
+In conclusion, sb_getblk may get a bh which is not uptodate.
+In that case, we need to read in it by ourselves.
+For example,
+
+ext4_read_inode_bitmap
+---
+	bh = sb_getblk(sb, bitmap_blk);
+	...
+	if (bitmap_uptodate(bh))
+		goto verify;
+
+	lock_buffer(bh);
+	if (bitmap_uptodate(bh)) {
+		unlock_buffer(bh);
+		goto verify;
+	}
+	...
+	/*
+	 * submit the buffer_head for reading
+	 */
+	trace_ext4_load_inode_bitmap(sb, block_group);
+	bh->b_end_io = ext4_end_bitmap_read;
+	get_bh(bh);
+	submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+	wait_on_buffer(bh);
+---
+
+
+But the writeout depends on the writeback mechanism.
+
+The ext4 will use __ext4_handle_dirty_metadata to hand the bh to jbd2.
+__ext4_handle_dirty_metadata
+---
+
+	set_buffer_meta(bh);
+	set_buffer_prio(bh);
+	if (ext4_handle_valid(handle)) {
+		err = jbd2_journal_dirty_metadata(handle, bh);
+<font color="red">
+		  -> __jbd2_journal_file_buffer
+</font>
+		...
+		} else {
+		if (inode)
+			mark_buffer_dirty_inode(bh, inode);
+		else
+			mark_buffer_dirty(bh);
+		if (inode && inode_needs_sync(inode)) {
+			sync_dirty_buffer(bh);
+			...
+		}
+	}
+---
+
+When the bh is logged, it will be handed to writeback mechanism.
+
+
+</pre>
+
+
+
+</font>
+</p>
+
+
+</body>
+</html>

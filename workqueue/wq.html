@@ -18,11 +18,13 @@
 <li><a href="#ASSOCIATED_&_BOUND">ASSOCIATED & BOUND</a>
 <li><a href="#Non-reentrancy">Non-reentrancy</a>
 <li><a href="#Will_kworkers_be_frozen">Will kworkers be frozen ?</a>
+<li><a href="#concurrency_of_works">concurrency of works</a>
 <li><a href="#Delayed_work">Delayed work</a>
 </ul>
 <a href="#Operations">Operations</a>
 <ul>
 <li><a href="#How_to_queue_a_work">How to queue a work</a>
+<li><a href="#Delay_of_a_queued_work">Delay of a queued work</a>
 </ul>
 </font>
 </p>
@@ -803,6 +805,292 @@ Date:   Fri Jan 19 08:58:55 2018 -0800
 </pre>
 </font>
 </p>
+
+<h3><a name="concurrency_of_works">concurrency of works</a></h3>
+<p>
+<font size="2">
+The max_active of a workqueue works here,
+<pre>
+__queue_work
+---
+<font color="blue">
+    // under spinlock pool->lock
+</font>
+    if (likely(pwq->nr_active < pwq->max_active)) {
+        pwq->nr_active++;
+        worklist = &pwq->pool->worklist;
+        if (list_empty(worklist))
+            pwq->pool->watchdog_ts = jiffies;
+    } else {
+        work_flags |= WORK_STRUCT_DELAYED;
+        worklist = &pwq->delayed_works;
+    }
+
+    insert_work(pwq, work, worklist, work_flags);
+---
+</pre>
+These delayed works will be handled when a work is completed,
+<pre>
+worker_thread
+  -> process_one_work
+    -> pwq_dec_nr_in_flight //under pool->lock
+    ---
+        pwq->nr_active--;
+        if (!list_empty(&pwq->delayed_works)) {
+            /* one down, submit a delayed one */
+            if (pwq->nr_active < pwq->max_active)
+                pwq_activate_first_delayed(pwq);
+        }
+    ---
+      -> pwq_activate_delayed_work
+
+</pre>
+And actuall, if the work not sleep, these active works will be handled one by one.
+<br/>
+If there are multiple workers, these workers will not handle the pending works
+in the pool, look at the code below,
+<pre>
+worker_thread
+---
+<font color="blue">
+    // under pool->lock
+</font>
+    do {
+        struct work_struct *work =
+            list_first_entry(&pool->worklist,
+                     struct work_struct, entry);
+
+        pool->watchdog_ts = jiffies;
+
+        if (likely(!(*work_data_bits(work) & WORK_STRUCT_LINKED))) {
+            /* optimization path, not strictly necessary */
+            process_one_work(worker, work);
+            if (unlikely(!list_empty(&worker->scheduled)))
+                process_scheduled_works(worker);
+        } else {
+            move_linked_works(work, &worker->scheduled, NULL);
+            process_scheduled_works(worker);
+        }
+    } while (<font color="red"><B>keep_working(pool)</B></font>);
+---
+   
+static bool keep_working(struct worker_pool *pool)
+{
+    return !list_empty(&pool->worklist) &&
+<font color="red">
+        atomic_read(&pool->nr_running) <= 1;
+</font>
+}
+</pre>
+So, if use the WQ_UNBOUND pool, there would not be much concurrency there.
+To get it, we may need to use the PERCPU pool.
+</font>
+</p>
+
+<h3><a name="Delay_of_a_queued_work">Delay of a queued work</a></h3>
+<p>
+<font size="2">
+As we known, both of kthread and a workqueue could provide asynchronous context
+that could sleep, but what's the difference ?<br/>
+Let's look at the implementation of the workqueue.
+<pre>
+alloc_workqueue
+  -> alloc_and_link_pwqs
+---
+    if (!(wq->flags & WQ_UNBOUND)) {
+        wq->cpu_pwqs = alloc_percpu(struct pool_workqueue);
+        if (!wq->cpu_pwqs)
+            return -ENOMEM;
+
+        for_each_possible_cpu(cpu) {
+            struct pool_workqueue *pwq =
+                per_cpu_ptr(wq->cpu_pwqs, cpu);
+            struct worker_pool *cpu_pools =
+<font color="red">
+                per_cpu(cpu_worker_pools, cpu);
+</font>
+            init_pwq(pwq, wq, &cpu_pools[highpri]);
+
+            mutex_lock(&wq->mutex);
+            link_pwq(pwq);
+            mutex_unlock(&wq->mutex);
+        }
+        return 0;
+    } else if (wq->flags & __WQ_ORDERED) {
+        ...
+    } else {
+        return apply_workqueue_attrs(wq, unbound_std_wq_attrs[highpri]);
+          -> apply_workqueue_attrs_locked
+            -> apply_wqattrs_prepare
+              -> alloc_unbound_pwq // dfl_pwq and per node
+                -> get_unbound_pool
+                ---
+<font color="red">
+                /* do we already have a matching pool? */
+                hash_for_each_possible(unbound_pool_hash, pool, hash_node, hash) {
+                if (wqattrs_equal(pool->attrs, attrs)) {
+                    pool->refcnt++;
+                    return pool;
+                }
+</font>
+                }
+                ---
+    }
+---
+</pre>
+What we could know from the source code above is:<br/>
+<font color="red">
+The worker_pools are shared between all of the workqueues around the whole system.
+</font>
+<br/>
+Let's see how does the kworker handle the work ?
+<pre>
+worker_thread
+---
+<font color="blue">
+    // under spinlock worker_pool->lock
+</font>
+    do {
+<font color="red">
+        struct work_struct *work =
+            list_first_entry(&pool->worklist,
+                     struct work_struct, entry);
+</font>
+        pool->watchdog_ts = jiffies;
+
+        if (likely(!(*work_data_bits(work) & WORK_STRUCT_LINKED))) {
+            /* optimization path, not strictly necessary */
+            process_one_work(worker, work);
+            if (unlikely(!list_empty(&worker->scheduled)))
+                process_scheduled_works(worker);
+        } else {
+            move_linked_works(work, &worker->scheduled, NULL);
+            process_scheduled_works(worker);
+        }
+    } while (keep_working(pool));
+---
+</pre>
+All of the kworkers would handle the works queued on this pool which is shared
+between around the system. How many kworkers an pool could have ?<br/>
+<ul>
+<li> When to create
+<pre>
+worker_thread
+---
+    if (unlikely(!may_start_working(pool)) && manage_workers(worker))
+---
+
+static bool may_start_working(struct worker_pool *pool)
+{
+    return pool->nr_idle;
+}
+
+maybe_create_worker guarantees that there is at least one idle kworker when it
+returns.
+
+This idle kworker could be wakedup when one working one falls into sleep in
+__schedule
+---
+<font color="blue">
+            /*
+             * If a worker went to sleep, notify and ask workqueue
+             * whether it wants to wake up a task to maintain
+             * concurrency.
+             */
+</font>
+            if (prev->flags & PF_WQ_WORKER) {
+                struct task_struct *to_wakeup;
+
+                to_wakeup = wq_worker_sleeping(prev);
+                if (to_wakeup)
+                    try_to_wake_up_local(to_wakeup, &rf);
+            }
+
+---
+
+</pre>
+<li> When to destroy
+<pre>
+idle_worker_timeout
+---
+    spin_lock_irq(&pool->lock);
+
+    while (too_many_workers(pool)) {
+<font color="blue">
+            ---
+            return nr_idle > 2 && (nr_idle - 2) * MAX_IDLE_WORKERS_RATIO >= nr_busy;
+            ---
+</font>
+        struct worker *worker;
+        unsigned long expires;
+
+        /* idle_list is kept in LIFO order, check the last one */
+        worker = list_entry(pool->idle_list.prev, struct worker, entry);
+        expires = worker->last_active + IDLE_WORKER_TIMEOUT;<font color="blue">300 * HZ</font>
+
+        if (time_before(jiffies, expires)) {
+            mod_timer(&pool->idle_timer, expires);
+            break;
+        }
+
+        destroy_worker(worker);
+        ---
+<font color="blue">
+        // pool->lock could serialize everything.
+</font>
+        pool->nr_workers--;
+        pool->nr_idle--;
+
+        list_del_init(&worker->entry);
+        worker->flags |= WORKER_DIE;
+        wake_up_process(worker->task);
+        ---
+    }
+
+    spin_unlock_irq(&pool->lock);
+---
+</pre>
+<li> which to wake up
+<pre>
+When a work is queued on a pool, the first idle kworker will be waked up if
+there is no running one.
+
+insert_work
+---
+    set_work_pwq(work, pwq, extra_flags);
+    list_add_tail(&work->entry, head);
+    get_pwq(pwq);
+
+    /*
+     * Ensure either wq_worker_sleeping() sees the above
+     * list_add_tail() or we see zero nr_running to avoid workers lying
+     * around lazily while there are works to be processed.
+     */
+    smp_mb();
+
+    if (__need_more_worker(pool)) <font color="blue">//pool->nr_running</font>
+        wake_up_worker(pool);
+---
+</pre>
+</ul>
+
+In conclusion,
+<pre>
+there are 2 kworkers at least in one pool. When the 1st one gets to sleep,
+the other one will be waked up. Before the second one starts to handle the work,
+it will try to create another kworker to ensure there is one idle task for
+backup.
+
+In the other word, works queued to one worker pool will be handled one by one if
+none of them gets to sleep. If one of them is cpu-intensive, the latter ones
+maybe delayed. This indicates there could be extra delay in workqueue than a
+specific kthread.
+</pre>
+
+</font>
+</p>
+
+
 
 
 </body>

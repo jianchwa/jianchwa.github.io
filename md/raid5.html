@@ -36,7 +36,12 @@
 <li><a href="#Overlapped_IO_ON_A_SAME_STRIPE">Overlapped IO on a same stripe</a>
 <li><a href="#run_with_1_faulty_disk">run with 1 faulty disk</a>
 <li><a href="#write_hole">write hole</a>
-<li><a href="#sync">sync</a>
+<li><a href="#sync_and_recovery">sync and recovery</a>
+</ul>
+<a href="$raid6">raid6</a>
+<ul>
+<li><a href="#how_to_calculate_the_Q">how to calculate the Q</a>
+<li><a href="#Handle_disk_failure">Handle disk failure</a>
 </ul>
 <a href="#TRACE_LOG">TRACE　LOG</a>
 <ul>
@@ -124,21 +129,21 @@ Next, we need to figure out why does the read benefit from the bigger chunk size
 <pre>
 ops_complete_compute
 ---
-	/* mark the computed target(s) as uptodate */
-	mark_target_uptodate(sh, sh->ops.target);
-	mark_target_uptodate(sh, sh->ops.target2);
-	---
-		tgt = &sh->dev[target];
-		set_bit(R5_UPTODATE, &tgt->flags);
-		BUG_ON(!test_bit(R5_Wantcompute, &tgt->flags));
-		clear_bit(R5_Wantcompute, &tgt->flags);
-	---
+    /* mark the computed target(s) as uptodate */
+    mark_target_uptodate(sh, sh->ops.target);
+    mark_target_uptodate(sh, sh->ops.target2);
+    ---
+        tgt = &sh->dev[target];
+        set_bit(R5_UPTODATE, &tgt->flags);
+        BUG_ON(!test_bit(R5_Wantcompute, &tgt->flags));
+        clear_bit(R5_Wantcompute, &tgt->flags);
+    ---
 
-	clear_bit(STRIPE_COMPUTE_RUN, &sh->state);
-	if (sh->check_state == check_state_compute_run)
-		sh->check_state = check_state_compute_result;
-	set_bit(STRIPE_HANDLE, &sh->state);
-	raid5_release_stripe(sh);
+    clear_bit(STRIPE_COMPUTE_RUN, &sh->state);
+    if (sh->check_state == check_state_compute_run)
+        sh->check_state = check_state_compute_result;
+    set_bit(STRIPE_HANDLE, &sh->state);
+    raid5_release_stripe(sh);
 ---
 
 ops_complete_reconstruct
@@ -162,51 +167,51 @@ hand to next
 handle_stripe // for example, s.to_read
   -> handle_stripe_fill
     -> fetch_block
-	---
-	} else if (test_bit(R5_Insync, &dev->flags)) {
-			set_bit(R5_LOCKED, &dev->flags);
-			set_bit(R5_Wantread, &dev->flags);
-			s->locked++;
-		}
-	---
+    ---
+    } else if (test_bit(R5_Insync, &dev->flags)) {
+            set_bit(R5_LOCKED, &dev->flags);
+            set_bit(R5_Wantread, &dev->flags);
+            s->locked++;
+        }
+    ---
 
 handle_stripe_dirtying
 
 check which is cheaper between reconstruct and rmw
 and decide which need to be read
 
-	 for (i = disks; i--; ) {
-		struct r5dev *dev = &sh->dev[i];
+     for (i = disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
 <font color="blue">
-		/* would I have to read this buffer for read_modify_write */
-		// Need to read the dev to be written and parity dev
+        /* would I have to read this buffer for read_modify_write */
+        // Need to read the dev to be written and parity dev
 </font>
-		if (((dev->towrite && !delay_towrite(conf, dev, s)) ||
-		     i == sh->pd_idx || i == sh->qd_idx ||
-		     test_bit(R5_InJournal, &dev->flags)) &&
-		    !test_bit(R5_LOCKED, &dev->flags) &&
-		    !(uptodate_for_rmw(dev) ||
-		      test_bit(R5_Wantcompute, &dev->flags))) {
-			if (test_bit(R5_Insync, &dev->flags))
-				rmw++;
-			else
-				rmw += 2*disks;  /* cannot read it */
-		}
+        if (((dev->towrite && !delay_towrite(conf, dev, s)) ||
+             i == sh->pd_idx || i == sh->qd_idx ||
+             test_bit(R5_InJournal, &dev->flags)) &&
+            !test_bit(R5_LOCKED, &dev->flags) &&
+            !(uptodate_for_rmw(dev) ||
+              test_bit(R5_Wantcompute, &dev->flags))) {
+            if (test_bit(R5_Insync, &dev->flags))
+                rmw++;
+            else
+                rmw += 2*disks;  /* cannot read it */
+        }
 <font color="blue">
-		/* Would I have to read this buffer for reconstruct_write */
-		// Need to read all of the devs that not be overwritten (io spans whole PAGE)
+        /* Would I have to read this buffer for reconstruct_write */
+        // Need to read all of the devs that not be overwritten (io spans whole PAGE)
 </font>
-		if (!test_bit(R5_OVERWRITE, &dev->flags) &&
-		    i != sh->pd_idx && i != sh->qd_idx &&
-		    !test_bit(R5_LOCKED, &dev->flags) &&
-		    !(test_bit(R5_UPTODATE, &dev->flags) ||
-		      test_bit(R5_Wantcompute, &dev->flags))) {
-			if (test_bit(R5_Insync, &dev->flags))
-				rcw++;
-			else
-				rcw += 2*disks;
-		}
-	}
+        if (!test_bit(R5_OVERWRITE, &dev->flags) &&
+            i != sh->pd_idx && i != sh->qd_idx &&
+            !test_bit(R5_LOCKED, &dev->flags) &&
+            !(test_bit(R5_UPTODATE, &dev->flags) ||
+              test_bit(R5_Wantcompute, &dev->flags))) {
+            if (test_bit(R5_Insync, &dev->flags))
+                rcw++;
+            else
+                rcw += 2*disks;
+        }
+    }
 </pre>
 
 <li> R5_Wantwrite
@@ -219,79 +224,79 @@ ops_run_io
 
 sh->dev[].req is the bio that submitted to underlayer.
 
-	for (i = disks; i--; ) {
-		sh = head_sh;
+    for (i = disks; i--; ) {
+        sh = head_sh;
 
 <font color="blue">
-		// Decide io op and flags based on sh->dev[].flags
+        // Decide io op and flags based on sh->dev[].flags
 </font>
-		if (test_and_clear_bit(R5_Wantwrite, &sh->dev[i].flags)) {
-			op = REQ_OP_WRITE;
-			if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags))
-				op_flags = REQ_FUA;
-			if (test_bit(R5_Discard, &sh->dev[i].flags))
-				op = REQ_OP_DISCARD;
-		} else if (test_and_clear_bit(R5_Wantread, &sh->dev[i].flags))
-			op = REQ_OP_READ;
-		} else
-			continue;
-		if (test_and_clear_bit(R5_SyncIO, &sh->dev[i].flags))
-			op_flags |= REQ_SYNC;
+        if (test_and_clear_bit(R5_Wantwrite, &sh->dev[i].flags)) {
+            op = REQ_OP_WRITE;
+            if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags))
+                op_flags = REQ_FUA;
+            if (test_bit(R5_Discard, &sh->dev[i].flags))
+                op = REQ_OP_DISCARD;
+        } else if (test_and_clear_bit(R5_Wantread, &sh->dev[i].flags))
+            op = REQ_OP_READ;
+        } else
+            continue;
+        if (test_and_clear_bit(R5_SyncIO, &sh->dev[i].flags))
+            op_flags |= REQ_SYNC;
 
 again:
-		bi = &sh->dev[i].req;
-		...
-		if (rdev) {
-			if (s->syncing || s->expanding || s->expanded
-			    || s->replacing)
-				md_sync_acct(rdev->bdev, STRIPE_SECTORS);
+        bi = &sh->dev[i].req;
+        ...
+        if (rdev) {
+            if (s->syncing || s->expanding || s->expanded
+                || s->replacing)
+                md_sync_acct(rdev->bdev, STRIPE_SECTORS);
 
-			set_bit(STRIPE_IO_STARTED, &sh->state);
+            set_bit(STRIPE_IO_STARTED, &sh->state);
 
-			bio_set_dev(bi, rdev->bdev);
-			bio_set_op_attrs(bi, op, op_flags);
-			bi->bi_end_io = op_is_write(op)
-				? raid5_end_write_request
-				: raid5_end_read_request;
-			bi->bi_private = sh;
+            bio_set_dev(bi, rdev->bdev);
+            bio_set_op_attrs(bi, op, op_flags);
+            bi->bi_end_io = op_is_write(op)
+                ? raid5_end_write_request
+                : raid5_end_read_request;
+            bi->bi_private = sh;
 
-			atomic_inc(&sh->count);
-			if (sh != head_sh)
-				atomic_inc(&head_sh->count);
-			if (use_new_offset(conf, sh))
-				bi->bi_iter.bi_sector = (sh->sector
-						 + rdev->new_data_offset);
-			else
-				bi->bi_iter.bi_sector = (sh->sector
-						 + rdev->data_offset);
-			if (test_bit(R5_ReadNoMerge, &head_sh->dev[i].flags))
-				bi->bi_opf |= REQ_NOMERGE;
+            atomic_inc(&sh->count);
+            if (sh != head_sh)
+                atomic_inc(&head_sh->count);
+            if (use_new_offset(conf, sh))
+                bi->bi_iter.bi_sector = (sh->sector
+                         + rdev->new_data_offset);
+            else
+                bi->bi_iter.bi_sector = (sh->sector
+                         + rdev->data_offset);
+            if (test_bit(R5_ReadNoMerge, &head_sh->dev[i].flags))
+                bi->bi_opf |= REQ_NOMERGE;
 
-			sh->dev[i].vec.bv_page = sh->dev[i].page;
-			bi->bi_vcnt = 1;
-			bi->bi_io_vec[0].bv_len = STRIPE_SIZE;
-			bi->bi_io_vec[0].bv_offset = 0;
-			bi->bi_iter.bi_size = STRIPE_SIZE;
-			bi->bi_write_hint = sh->dev[i].write_hint;
-			if (!rrdev)
-				sh->dev[i].write_hint = RWF_WRITE_LIFE_NOT_SET;
+            sh->dev[i].vec.bv_page = sh->dev[i].page;
+            bi->bi_vcnt = 1;
+            bi->bi_io_vec[0].bv_len = STRIPE_SIZE;
+            bi->bi_io_vec[0].bv_offset = 0;
+            bi->bi_iter.bi_size = STRIPE_SIZE;
+            bi->bi_write_hint = sh->dev[i].write_hint;
+            if (!rrdev)
+                sh->dev[i].write_hint = RWF_WRITE_LIFE_NOT_SET;
 
-			if (should_defer && op_is_write(op))
-				bio_list_add(&pending_bios, bi);
-			else
-				generic_make_request(bi);
-		}
-		
-		if (!head_sh->batch_head)
-			continue;
-		sh = list_first_entry(&sh->batch_list, struct stripe_head,
-				      batch_list);
-		if (sh != head_sh)
-			goto again;
+            if (should_defer && op_is_write(op))
+                bio_list_add(&pending_bios, bi);
+            else
+                generic_make_request(bi);
+        }
+        
+        if (!head_sh->batch_head)
+            continue;
+        sh = list_first_entry(&sh->batch_list, struct stripe_head,
+                      batch_list);
+        if (sh != head_sh)
+            goto again;
 <font color="blue">
-	// Handle the ios in the same chunk as they are contiguous in same device
+    // Handle the ios in the same chunk as they are contiguous in same device
 </font>
-	}
+    }
 
 </pre>
 </ul>
@@ -312,53 +317,53 @@ again:
 fetch_block
 ---
 <font color="blue">
-	// All of the other disks has been uptodate,
-	// compute the left one.
+    // All of the other disks has been uptodate,
+    // compute the left one.
 </font>
-		if ((s->uptodate == disks - 1) &&
-		    ((sh->qd_idx >= 0 && sh->pd_idx == disk_idx) ||
-		    (s->failed && (disk_idx == s->failed_num[0] ||
-				   disk_idx == s->failed_num[1])))) {
-			set_bit(STRIPE_COMPUTE_RUN, &sh->state);
-			set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
-			set_bit(R5_Wantcompute, &dev->flags);
+        if ((s->uptodate == disks - 1) &&
+            ((sh->qd_idx >= 0 && sh->pd_idx == disk_idx) ||
+            (s->failed && (disk_idx == s->failed_num[0] ||
+                   disk_idx == s->failed_num[1])))) {
+            set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+            set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+            set_bit(R5_Wantcompute, &dev->flags);
 <font color="red">
-			sh->ops.target = disk_idx;
+            sh->ops.target = disk_idx;
 </font>
-			sh->ops.target2 = -1; /* no 2nd target */
-			s->req_compute = 1;
+            sh->ops.target2 = -1; /* no 2nd target */
+            s->req_compute = 1;
 ---
 
 handle_parity_checks5
 ---
 <font color="blue">
-		/* handle a successful check operation, if parity is correct
-		 * we are done.  Otherwise update the mismatch count and repair
-		 * parity if !MD_RECOVERY_CHECK
-		 */
+        /* handle a successful check operation, if parity is correct
+         * we are done.  Otherwise update the mismatch count and repair
+         * parity if !MD_RECOVERY_CHECK
+         */
 </font>
-		if ((sh->ops.zero_sum_result & SUM_CHECK_P_RESULT) == 0)
-			/* parity is correct (on disc,
-			 * not in buffer any more)
-			 */
-			set_bit(STRIPE_INSYNC, &sh->state);
-		else {
-			atomic64_add(STRIPE_SECTORS, &conf->mddev->resync_mismatches);
-			if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery)) {
-			...
-			} else {
-				sh->check_state = check_state_compute_run;
-				set_bit(STRIPE_COMPUTE_RUN, &sh->state);
-				set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
-				set_bit(R5_Wantcompute,
-					&sh->dev[sh->pd_idx].flags);
+        if ((sh->ops.zero_sum_result & SUM_CHECK_P_RESULT) == 0)
+            /* parity is correct (on disc,
+             * not in buffer any more)
+             */
+            set_bit(STRIPE_INSYNC, &sh->state);
+        else {
+            atomic64_add(STRIPE_SECTORS, &conf->mddev->resync_mismatches);
+            if (test_bit(MD_RECOVERY_CHECK, &conf->mddev->recovery)) {
+            ...
+            } else {
+                sh->check_state = check_state_compute_run;
+                set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+                set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+                set_bit(R5_Wantcompute,
+                    &sh->dev[sh->pd_idx].flags);
 <font color="red">
-				sh->ops.target = sh->pd_idx;
+                sh->ops.target = sh->pd_idx;
 </font>
-				sh->ops.target2 = -1;
-				s->uptodate++;
-			}
-		}
+                sh->ops.target2 = -1;
+                s->uptodate++;
+            }
+        }
 
 ---
 
@@ -366,15 +371,15 @@ handle_parity_checks5
 ops_run_compute5
 ---
 DEST:
-  	target = sh->ops.target;
-	tgt = &sh->dev[target];
-	xor_dest = tgt->page;
+      target = sh->ops.target;
+    tgt = &sh->dev[target];
+    xor_dest = tgt->page;
 SRCS:
-	for (i = disks; i--; )
-		if (i != target)
-			xor_srcs[count++] = sh->dev[i].page;
+    for (i = disks; i--; )
+        if (i != target)
+            xor_srcs[count++] = sh->dev[i].page;
 COMPLETE:
-	ops_complete_compute
+    ops_complete_compute
 ---
 </pre>
 <li> STRIPE_OP_PREXOR
@@ -383,31 +388,31 @@ COMPLETE:
 schedule_reconstruction
 ---
 RMW
-		for (i = disks; i--; ) {
-			struct r5dev *dev = &sh->dev[i];
-			if (i == pd_idx || i == qd_idx)
-				continue;
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (i == pd_idx || i == qd_idx)
+                continue;
 
-			if (dev->towrite &&
-			    (test_bit(R5_UPTODATE, &dev->flags) ||
-			     test_bit(R5_Wantcompute, &dev->flags))) {
+            if (dev->towrite &&
+                (test_bit(R5_UPTODATE, &dev->flags) ||
+                 test_bit(R5_Wantcompute, &dev->flags))) {
 <font color="red">
-				set_bit(R5_Wantdrain, &dev->flags);
+                set_bit(R5_Wantdrain, &dev->flags);
 </font>
-				set_bit(R5_LOCKED, &dev->flags);
-				clear_bit(R5_UPTODATE, &dev->flags);
-				s->locked++;
-			}
-		}
-		if (!s->locked)
-			/* False alarm - nothing to do */
-			return;
-		sh->reconstruct_state = reconstruct_state_prexor_drain_run;
+                set_bit(R5_LOCKED, &dev->flags);
+                clear_bit(R5_UPTODATE, &dev->flags);
+                s->locked++;
+            }
+        }
+        if (!s->locked)
+            /* False alarm - nothing to do */
+            return;
+        sh->reconstruct_state = reconstruct_state_prexor_drain_run;
 <font color="red">
-		set_bit(STRIPE_OP_PREXOR, &s->ops_request);
+        set_bit(STRIPE_OP_PREXOR, &s->ops_request);
 </font>
-		set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);
-		set_bit(STRIPE_OP_RECONSTRUCT, &s->ops_request);
+        set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);
+        set_bit(STRIPE_OP_RECONSTRUCT, &s->ops_request);
 
 ---
 
@@ -415,17 +420,17 @@ RMW
 <B>HANDLE</B>
 op
 DEST:
-	xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+    xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
 SRCS:
-	for (i = disks; i--; ) {
-		struct r5dev *dev = &sh->dev[i];
+    for (i = disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
 <font color="red">
-		if (test_bit(R5_Wantdrain, &dev->flags))
+        if (test_bit(R5_Wantdrain, &dev->flags))
 </font>
-			xor_srcs[count++] = dev->page;
-	}
+            xor_srcs[count++] = dev->page;
+    }
 COMPLETE:
-	ops_complete_prexor (DO nothing)
+    ops_complete_prexor (DO nothing)
 
 </pre>
 
@@ -439,56 +444,56 @@ schedule_reconstruction
 Move the data from bio to sh->dev[].page
 ops_run_biodrain
 ---
-	for (i = disks; i--; ) {
-		struct r5dev *dev;
-		struct bio *chosen;
+    for (i = disks; i--; ) {
+        struct r5dev *dev;
+        struct bio *chosen;
 
-		sh = head_sh;
-		if (test_and_clear_bit(R5_Wantdrain, &head_sh->dev[i].flags)) {
-			struct bio *wbi;
+        sh = head_sh;
+        if (test_and_clear_bit(R5_Wantdrain, &head_sh->dev[i].flags)) {
+            struct bio *wbi;
 
 again:
-			dev = &sh->dev[i];
-			spin_lock_irq(&sh->stripe_lock);
-			chosen = dev->towrite;
+            dev = &sh->dev[i];
+            spin_lock_irq(&sh->stripe_lock);
+            chosen = dev->towrite;
 <font color="red">
-			dev->towrite = NULL;
-			sh->overwrite_disks = 0;
-			BUG_ON(dev->written);
-			wbi = dev->written = chosen;
+            dev->towrite = NULL;
+            sh->overwrite_disks = 0;
+            BUG_ON(dev->written);
+            wbi = dev->written = chosen;
 </font>
-			spin_unlock_irq(&sh->stripe_lock);
+            spin_unlock_irq(&sh->stripe_lock);
 
-			while (wbi && wbi->bi_iter.bi_sector <
-				dev->sector + STRIPE_SECTORS) {
-				if (wbi->bi_opf & REQ_FUA)
-					set_bit(R5_WantFUA, &dev->flags);
-				if (wbi->bi_opf & REQ_SYNC)
-					set_bit(R5_SyncIO, &dev->flags);
-				if (bio_op(wbi) == REQ_OP_DISCARD)
-					set_bit(R5_Discard, &dev->flags);
-				else {
+            while (wbi && wbi->bi_iter.bi_sector <
+                dev->sector + STRIPE_SECTORS) {
+                if (wbi->bi_opf & REQ_FUA)
+                    set_bit(R5_WantFUA, &dev->flags);
+                if (wbi->bi_opf & REQ_SYNC)
+                    set_bit(R5_SyncIO, &dev->flags);
+                if (bio_op(wbi) == REQ_OP_DISCARD)
+                    set_bit(R5_Discard, &dev->flags);
+                else {
 <font color="red">
-					// frombio is '1' here
+                    // frombio is '1' here
 </font>
-					tx = async_copy_data(1, wbi, &dev->page,
-							     dev->sector, tx, sh,
-							     r5c_is_writeback(conf->log));
-					...
-				}
-				wbi = r5_next_bio(wbi, dev->sector);
-			}
+                    tx = async_copy_data(1, wbi, &dev->page,
+                                 dev->sector, tx, sh,
+                                 r5c_is_writeback(conf->log));
+                    ...
+                }
+                wbi = r5_next_bio(wbi, dev->sector);
+            }
 
-			if (head_sh->batch_head) {
-				sh = list_first_entry(&sh->batch_list,
-						      struct stripe_head,
-						      batch_list);
-				if (sh == head_sh)
-					continue;
-				goto again;
-			}
-		}
-	}
+            if (head_sh->batch_head) {
+                sh = list_first_entry(&sh->batch_list,
+                              struct stripe_head,
+                              batch_list);
+                if (sh == head_sh)
+                    continue;
+                goto again;
+            }
+        }
+    }
 ---
 </pre>
 
@@ -500,28 +505,28 @@ schedule_reconstruction
 <B>HANDLE</B>
 ops_run_reconstruct5
 ---
-	if (head_sh->reconstruct_state == reconstruct_state_prexor_drain_run) {
-		prexor = 1;
-		xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
-		for (i = disks; i--; ) {
-			struct r5dev *dev = &sh->dev[i];
-			if (head_sh->dev[i].written ||
-			    test_bit(R5_InJournal, &head_sh->dev[i].flags))
-				xor_srcs[count++] = dev->page;
-		}
+    if (head_sh->reconstruct_state == reconstruct_state_prexor_drain_run) {
+        prexor = 1;
+        xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (head_sh->dev[i].written ||
+                test_bit(R5_InJournal, &head_sh->dev[i].flags))
+                xor_srcs[count++] = dev->page;
+        }
 <font color="blue">
-	//Same with STRIPE_OP_PREXOR, the difference is
-	// it use the sh->dev[].written
-	// STRIPE_OP_BIODRAIN will set .written.
+    //Same with STRIPE_OP_PREXOR, the difference is
+    // it use the sh->dev[].written
+    // STRIPE_OP_BIODRAIN will set .written.
 </font>
-	} else {
-		xor_dest = sh->dev[pd_idx].page;
-		for (i = disks; i--; ) {
-			struct r5dev *dev = &sh->dev[i];
-			if (i != pd_idx)
-				xor_srcs[count++] = dev->page;
-		}
-	}
+    } else {
+        xor_dest = sh->dev[pd_idx].page;
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (i != pd_idx)
+                xor_srcs[count++] = dev->page;
+        }
+    }
 ---
 </pre>
 <li> STRIPE_OP_CHECK
@@ -529,35 +534,35 @@ ops_run_reconstruct5
 <B>SET</B>
 handle_stripe
 ---
-	if (sh->check_state ||
-	    (s.syncing && s.locked == 0 &&
-	     !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
-	     !test_bit(STRIPE_INSYNC, &sh->state))) {
-		if (conf->level == 6)
-			handle_parity_checks6(conf, sh, &s, disks);
-		else
-			handle_parity_checks5(conf, sh, &s, disks);
-	}
+    if (sh->check_state ||
+        (s.syncing && s.locked == 0 &&
+         !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
+         !test_bit(STRIPE_INSYNC, &sh->state))) {
+        if (conf->level == 6)
+            handle_parity_checks6(conf, sh, &s, disks);
+        else
+            handle_parity_checks5(conf, sh, &s, disks);
+    }
 ---
 
 s.syncing is set to 1 in analyse_stripe when
 ---
-	if (test_bit(STRIPE_SYNCING, &sh->state)) {
-		/* If there is a failed device being replaced,
-		 *     we must be recovering.
-		 * else if we are after recovery_cp, we must be syncing
-		 * else if MD_RECOVERY_REQUESTED is set, we also are syncing.
-		 * else we can only be replacing
-		 * sync and recovery both need to read all devices, and so
-		 * use the same flag.
-		 */
-		if (do_recovery ||
-		    sh->sector >= conf->mddev->recovery_cp ||
-		    test_bit(MD_RECOVERY_REQUESTED, &(conf->mddev->recovery)))
-			s->syncing = 1;
-		else
-			s->replacing = 1;
-	}
+    if (test_bit(STRIPE_SYNCING, &sh->state)) {
+        /* If there is a failed device being replaced,
+         *     we must be recovering.
+         * else if we are after recovery_cp, we must be syncing
+         * else if MD_RECOVERY_REQUESTED is set, we also are syncing.
+         * else we can only be replacing
+         * sync and recovery both need to read all devices, and so
+         * use the same flag.
+         */
+        if (do_recovery ||
+            sh->sector >= conf->mddev->recovery_cp ||
+            test_bit(MD_RECOVERY_REQUESTED, &(conf->mddev->recovery)))
+            s->syncing = 1;
+        else
+            s->replacing = 1;
+    }
 ---
 Looks like this will not be common case
 <B>HANDLE</B>
@@ -576,12 +581,12 @@ Looks like this will not be common case
 --------------------------
 raid5_make_request
 ---
-			set_bit(STRIPE_HANDLE, &sh->state);
-			clear_bit(STRIPE_DELAYED, &sh->state);
-			if ((!sh->batch_head || sh == sh->batch_head) &&
-			    (bi->bi_opf & REQ_SYNC) &&
-			    !test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
-				atomic_inc(&conf->preread_active_stripes);
+            set_bit(STRIPE_HANDLE, &sh->state);
+            clear_bit(STRIPE_DELAYED, &sh->state);
+            if ((!sh->batch_head || sh == sh->batch_head) &&
+                (bi->bi_opf & REQ_SYNC) &&
+                !test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+                atomic_inc(&conf->preread_active_stripes);
 ---
 The synchronous request would have STRIPE_PREREAD_ACTIVE and they will be
 handled prior to the ones that doesn't have this flag.
@@ -589,18 +594,18 @@ handled prior to the ones that doesn't have this flag.
 raid5_activate_delayed
 ---
 if (atomic_read(&conf->preread_active_stripes) < IO_THRESHOLD) {
-		while (!list_empty(&conf->delayed_list)) {
-			struct list_head *l = conf->delayed_list.next;
-			struct stripe_head *sh;
-			sh = list_entry(l, struct stripe_head, lru);
-			list_del_init(l);
-			clear_bit(STRIPE_DELAYED, &sh->state);
-			if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
-				atomic_inc(&conf->preread_active_stripes);
-			list_add_tail(&sh->lru, &conf->hold_list);
-			raid5_wakeup_stripe_thread(sh);
-		}
-	}
+        while (!list_empty(&conf->delayed_list)) {
+            struct list_head *l = conf->delayed_list.next;
+            struct stripe_head *sh;
+            sh = list_entry(l, struct stripe_head, lru);
+            list_del_init(l);
+            clear_bit(STRIPE_DELAYED, &sh->state);
+            if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+                atomic_inc(&conf->preread_active_stripes);
+            list_add_tail(&sh->lru, &conf->hold_list);
+            raid5_wakeup_stripe_thread(sh);
+        }
+    }
 ---
 
 It seems that the shs on conf->delayed_list would only be handled
@@ -2262,9 +2267,9 @@ fix it by journal.
 
 But if disk1 fail before the recovery,
 
-	   Disk Fail !
+       Disk Fail !
            |
-	       V
+           V
 Dev0_o ^ Dev1 ^ Dev2 ^ Dev3 != Devp_n
 
 We could lose the data of disk1 in the assocaited stripe, as the
@@ -2276,12 +2281,31 @@ equation cannot stand.
 </font>
 </p>
 
-<h3><a name="sync">sync</a></h3>
+<h3><a name="sync_and_recovery">sync and recovery</a></h3>
 <p>
 <font size="2">
-<B>STEP #1</B><br/>
-raid5_sync_request
+
+Here we need to clarify the difference between resync and recovery.<br/>
+https://raid.wiki.kernel.org/index.php/Reconstruction#recovery_and_resync
+<ul>
+<li>recovery
 <pre>
+Namely rebuild.
+The purpose of recovery/rebuild process is to fill the new disk with the
+relevant information from a running array.
+</pre>
+<li>resync
+<pre>
+The purpose of resync is to ensure all the data in array are synchronized.
+</pre>
+</ul>
+
+<B>#STEP 1</B><br/>
+From the raid5_sync_request, 
+
+<pre>
+raid5_sync_request
+---
     sh = raid5_get_active_stripe(conf, sector_nr, 0, 1, 0);
     if (sh == NULL) {
         sh = raid5_get_active_stripe(conf, sector_nr, 0, 0, 0);
@@ -2295,10 +2319,12 @@ raid5_sync_request
     set_bit(STRIPE_HANDLE, &sh->state);
 
     raid5_release_stripe(sh);
+---
 </pre>
-<B>STEP #2</B><br/>
-handle_stripe, set STRIPE_SYNCING
+<B>#STEP 2</B><br/>
 <pre>
+handle_stripe
+---
     if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state) && !sh->batch_head) {
         spin_lock(&sh->stripe_lock);
         /*
@@ -2317,10 +2343,51 @@ handle_stripe, set STRIPE_SYNCING
         }
         spin_unlock(&sh->stripe_lock);
     }
+---
 </pre>
-<B>STEP #3</B><br/>
-handle_stripe, read in all including parity
+handle_stripe set STRIPE_SYNCING on the sh.<br/>
+There is no difference between MD_RECOVERY_RESYNC and MD_RECOVERY_RECOVER. <br/>
+Things start to change in <font color="red">analyse_stripe</font><br/>
+<br/>
+<B>#STEP 3</B><br/>
 <pre>
+analyse_stripe
+---
+        clear_bit(R5_Insync, &dev->flags);
+        if (!rdev)
+            /* Not in-sync */;
+        else if (is_bad) {
+            /* also not in-sync */
+            if (!test_bit(WriteErrorSeen, &rdev->flags) &&
+                test_bit(R5_UPTODATE, &dev->flags)) {
+                /* treat as in-sync, but with a read error
+                 * which we can now try to correct
+                 */
+                set_bit(R5_Insync, &dev->flags);
+                set_bit(R5_ReadError, &dev->flags);
+            }
+<font color="red">
+        } else if (test_bit(In_sync, &rdev->flags))
+            set_bit(R5_Insync, &dev->flags);
+        else if (sh->sector + STRIPE_SECTORS <= rdev->recovery_offset)
+            /* in sync if before recovery_offset */
+            set_bit(R5_Insync, &dev->flags);
+</font>
+---
+</pre>
+In the analyse_stripe, the difference is
+<pre>
+<ul>
+<li> For resync, given all of the device are OK, sh will get all R5_Insync
+<li> For recovery (rebuild), given there is a device which is not in-sync
+     with other device, the sh would lost one R5_Insync.
+</ul>
+</pre>
+Consequently, recovery case would get a failed device in analyse_stripe and this would influence the following sequence.<br/>
+<B>#STEP 4</B><br/>
+<pre>
+handle_stripe
+---
     /* Now we might consider reading some blocks, either to check/generate
      * parity, or to satisfy requests
      * or to load a block that is being partially written.
@@ -2341,21 +2408,42 @@ handle_stripe, read in all including parity
                  */
                 return 1;
             ---
-
-
-    fetch_block will set <font color="red">R5_LOCKED and R5_Wantread</font>.
-
+---
+fetch_block
+---
+       if ((s->uptodate == disks - 1) &&
+            ((sh->qd_idx >= 0 && sh->pd_idx == disk_idx) ||
+            (s->failed && (disk_idx == s->failed_num[0] ||
+                   disk_idx == s->failed_num[1])))) {
+            set_bit(STRIPE_COMPUTE_RUN, &sh->state);
+            set_bit(STRIPE_OP_COMPUTE_BLK, &s->ops_request);
+            set_bit(R5_Wantcompute, &dev->flags);
+            sh->ops.target = disk_idx;
+            sh->ops.target2 = -1; /* no 2nd target */
+            s->req_compute = 1;
+            s->uptodate++;
+            return 1;
+        } else if (s->uptodate == disks-2 && s->failed >= 2) {
+            ...
+<font color="red">
+        } else if (test_bit(R5_Insync, &dev->flags)) {
+</font>
+            set_bit(R5_LOCKED, &dev->flags);
+            set_bit(R5_Wantread, &dev->flags);
+            s->locked++;
+        }
     <B>When R5_LOCKED is set, no other steps could be started.</B>
+
+---
 </pre>
-<B>STEP #4</B><br/>
-ops_run_io, set out IO
+For the resync case, all of the block will be read in, <br/>
+However, for the recovery case, <font color="red">we may need to calculate the block which fall on the non-in-sync disk.</font>
+<br/>
+<B>#STEP 5</B><br/>
+After the compute is completed,
 <pre>
-send out the IO
-after complete, the raid5_end_read_request will clean the R5_LOCKED.
-</pre>
-<B>STEP #5</b><br/>
-handle_stripe, parity check
-<pre>
+handle_stripe
+---
     if (sh->check_state ||
 <font color="red">
         (s.syncing && s.locked == 0 &&
@@ -2367,28 +2455,57 @@ handle_stripe, parity check
         else
             handle_parity_checks5(conf, sh, &s, disks);
     }
+---
 
 handle_parity_checks5
 ---
-    set_bit(STRIPE_HANDLE, &sh->state);
-
     switch (sh->check_state) {
     case check_state_idle:
+<font color="blue">
         /* start a new check operation if there are no failures */
+    <B>This is for the resync case, it will proceed to STEP 6</B>
+</font>
         if (s->failed == 0) {
             BUG_ON(s->uptodate != disks);
-<font color="red">
             sh->check_state = check_state_run;
             set_bit(STRIPE_OP_CHECK, &s->ops_request);
             clear_bit(R5_UPTODATE, &sh->dev[sh->pd_idx].flags);
-</font>
             s->uptodate--;
             break;
         }
+<font color="blue">
+    <B>This is for the recovery case, it will jump to STEP 9 directly</B>
+</font>
+<font color="red">
+        dev = &sh->dev[s->failed_num[0]];
+<B>
+    what is written out is the data of the failed device (non-in-sync device), this is recovery
+    instead of new parity, which is resync
+</B>
+</font>
+        /* fall through */
+    case check_state_compute_result:
+        sh->check_state = check_state_idle;
+        if (!dev)
+            dev = &sh->dev[sh->pd_idx];
+
+        /* check that a write has not made the stripe insync */
+        if (test_bit(STRIPE_INSYNC, &sh->state))
+            break;
+
+        set_bit(R5_LOCKED, &dev->flags);
+        s->locked++;
+        set_bit(R5_Wantwrite, &dev->flags);
+
+        clear_bit(STRIPE_DEGRADED, &sh->state);
+        set_bit(STRIPE_INSYNC, &sh->state);
+        break;
 ---
 </pre>
-<B>STEP #6</b><br/>
+
+<B>#STEP 6</B><br/>
 raid_run_ops, do parity check
+
 <pre>
 raid_run_ops
 ---
@@ -2411,7 +2528,7 @@ The complete callback is ops_complete_check
     raid5_release_stripe(sh);
 ---
 </pre>
-<B>STEP #7</b><br/>
+<B>#STEP 7</B><br/>
 handle_stripe, check whether the parity is correct
 <pre>
 <font color="red">
@@ -2474,7 +2591,7 @@ handle_parity_checks5
         break;
 ---
 </pre>
-<B>STEP #8</b><br/>
+<B>#STEP 8</B><br/>
 raid_run_ops, compute new parity
 <pre>
 ---
@@ -2508,8 +2625,8 @@ ops_complete_compute
 ---
 </pre>
 
-<B>STEP #8</b><br/>
-handle_stripe, write out the new parity
+<B>#STEP 9</B><br/>
+handle_stripe, write out the new parity or data of failed device
 <pre>
 <font color="red">
     if (sh->check_state ||
@@ -2552,7 +2669,7 @@ handle_parity_checks5
 
 Then the ops_run_io will write it out.
 </pre>
-<B>STEP #10</B><br/>
+<B>#STEP 10</B><br/>
 handle_stripe, sync done
 <pre>
 handle_stripe
@@ -2570,6 +2687,107 @@ handle_stripe
 </font>
 </p>
 
+<h2><a name="raid6">raid6</a></h2>
+
+
+<h3><a name="how_to_calculate_the_Q">how to calculate the Q</a></h3>
+<p>
+<font size="2">
+For a raid5 array, there could be one disk out of work. For some scenes that<br/>
+needs more reliability, it maybe not enough. So raid6 comes up with allowing two<br/>
+two disks out of work. But how to achieve it ?<br/>
+As we know, in raid5
+<pre>
+P = D0 xor D1 xor D2 xor D3
+</pre>
+Two allow two disks out of work, we need another different equation.
+In raid6
+<pre>
+P = D0 xor D1 xor D2 xor D3
+<font color="red">
+Q = (K0 * D0) xor (K1 * D1) xor (K2 * D2) xor (K3 * D3)
+</font>
+</pre>
+Next, we will explain how does the second equation stand.<br/>
+<br/>
+The foundamental is Galois Field (GF). In this field,
+<ul>
+<li> All of the result of ADD, SUB, MUL and DIV around the elements in this field are also in this field.
+<li> The operations of ADD, SUB, MUL and DIV are reversible and result is unique.
+</ul>
+RAID6 is based on GF(2^8) (A byte is 8 bits) and following equation is used to implement the <br/>
+transition.
+<pre>
+         A^8 = A^4 + A^3 + A^2 + 1
+
+         '+'  =  'xor'
+
+    x                                           y
+    0          a^0                            1
+    1          a^1                            2
+    2          a^2                            4
+    3          a^3                            8
+    4          a^4                            16
+    5          a^5                            32
+    6          a^6                            64
+    7          a^7                            128
+    8          a^4 + a^3 + a^2 + 1            29
+    9          a(a^4 + a^3 + a^2 + 1)         58
+    10         a^2(a^4 + a^3 + a^2 + 1)       116
+    ....
+
+    In the equation, every a^8 is modified to (a^4 + a^3 + a^2 + 1), then
+    the y will be always in 0 ~ 255 and unique.
+
+    The table contains X -> Y is gftable, the reverse one which contains Y -> X
+    is gfitable.
+
+    The MUL and DIV operations in GF(2^8) is,
+
+    D * K = gftable[(gfitable[D] + gfitable[K]) mod 255]
+    D / K = gftable[(gfitable[D] - gfitable[K] + 255) mod 255]
+</pre>
+<br/>
+We have known how to do the calculating of the Q, but where is the K0 ~ K3 from
+in the following equation ?
+<pre>
+Q = (K0 * D0) xor (K1 * D1) xor (K2 * D2) xor (K3 * D3)
+</pre>
+Look at async_syndrome_val,
+<pre>
+        for (i = 0; i < disks-2; i++)
+            if (likely(blocks[i])) {
+                dma_src[src_cnt] = dma_map_page(dev, blocks[i],
+                                offset, len,
+                                DMA_TO_DEVICE);
+<font color="red">
+                coefs[src_cnt] = raid6_gfexp[i];
+</font>
+                src_cnt++;
+            }
+</pre>
+</font>
+</p>
+
+
+<h3><a name="Handle_disk_failure">Handle disk failure</a></h3>
+<p>
+<font size="2">
+We have know that raid6 could tolerate 2 out of work disks, but due to the P and
+Q are distriuted among the all of the disks in the array, the handling of disk
+failure could be very different based on the position of the failed disks in the
+stripe.
+<ul>
+<li> 1 failed disk
+<pre>
+If one data block in the stripe falls into the failed disk unfortunately, we
+have to calculate it based on the P. This is the worst case.
+
+</pre>
+<li> 2 failed disks
+</ul>
+</font>
+</p>
 
 <h2><a name="TRACE_LOG">TRACE LOG</a></h2>
 <hr style="height:5px;border:none;border-top:2px solid black;" />
