@@ -10,6 +10,16 @@
 </div>
 <p>
 <font size="2">
+<a href="#readahead">readahead</a>
+<ul>
+<li> <a href="#readahead_concepts">concepts</a>
+<li> <a href="#readahead_implementation">implementation</a>
+<ul>
+<li> <a href="#readahead_pipelining">pipelining</a>
+<li> <a href="#readahead_REQ_RAHEAD">REQ_RAHEAD</a>
+<li> <a href="#readahead_fs_metadata">fs metadata</a>
+</ul>
+</ul>
 <a href="#writeback">writeback</a><br/>
 <ul>
 <li><a href="#dirty_balance">dirty balance</a>
@@ -40,6 +50,499 @@
 </ul>
 </font>
 </p>
+
+
+
+<h2><a name="readahead">readahead</a></h2>
+<h3><a name="readahead_concepts">concepts</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> Readahead is file based, including the block device (every block device has a
+     standalone inode, the metadata of filesystem which depends on vfs pagecache will
+     use it)
+<li> Readahead can only work for sequential read case.
+                                 ^^^^^^^^^^
+</ul>
+</font>
+</p>
+
+
+<h3><a name="readahead_implementation">implementation</a></h3>
+<p>
+<font size="2">
+<pre>
+(Quote from the comment in mm/readahead.c)
+The fields in struct file_ra_state represent the most-recently readahead
+attempt.
+
+
+                        |<----- async_size ---------|
+     |------------------- size -------------------->|
+     |==================#===========================|
+     ^start             ^page marked with PG_readahead
+
+
+</pre>
+
+</font>
+</p>
+
+<h4><a name="readahead_pipelining">pipelining</a></h4>
+<p>
+<font size="2">
+<pre>
+To overlap application thinking time and disk I/O time, we do `readahead pipelining':
+
+Do not wait until the application consumed all  readahead pages and stalled on the
+missing page at readahead_index;  Instead, submit an asynchronous readahead I/O as
+soon as there are only async_size pages left in the readahead window.
+
+<font color="red">
+Normally async_size will be equal to size, for maximum pipelining.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+
+ondemand_readahead
+---
+    if ((offset == (ra->start + ra->size - ra->async_size) ||
+         offset == (ra->start + ra->size))) {
+        ra->start += ra->size;
+        ra->size = get_next_ra_size(ra, max_pages);
+        ra->async_size = ra->size; //<font color="blue">for maximum pipelining</font>
+        goto readit;
+    }
+---
+
+
+ra_submit
+---
+    return __do_page_cache_readahead(mapping, filp,
+                    ra->start, ra->size, ra->async_size);
+---
+
+__do_page_cache_readahead
+---
+    for (page_idx = 0; page_idx < nr_to_read; page_idx++) {
+        pgoff_t page_offset = offset + page_idx;
+
+        if (page_offset > end_index)
+            break;
+
+        page = xa_load(&mapping->i_pages, page_offset);
+        ...
+
+        page = __page_cache_alloc(gfp_mask);
+        if (!page)
+            break;
+        page->index = page_offset;
+        list_add(&page->lru, &page_pool);
+<font color="red">
+        if (page_idx == nr_to_read - lookahead_size)
+            SetPageReadahead(page);
+</font>
+        nr_pages++;
+    }
+
+    if (nr_pages)
+        read_pages(mapping, filp, &page_pool, nr_pages, gfp_mask);
+
+---
+
+
+generic_file_buffered_read
+---
+        if (PageReadahead(page)) {
+            page_cache_async_readahead(mapping,
+                    ra, filp, page,
+                    index, last_index - index);
+        }
+---
+</pre>
+</font>
+</p>
+
+<h4><a name="readahead_REQ_RAHEAD">REQ_RAHEAD</a></h4>
+<p>
+<font size="2">
+<pre>
+When to set this flag ?
+<ul>
+<li> aops.readpages
+<pre>
+<font color="red">
+The aops.readpages is only used by the read_pages.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+
+ext4_readpages
+  -> ext4_mpage_readpages //<font color="blue">is_readahead is true</font>
+  ---
+    bio = bio_alloc(GFP_KERNEL,
+                min_t(int, nr_pages, BIO_MAX_PAGES));
+            if (!bio) {
+                if (ctx)
+                    fscrypt_release_ctx(ctx);
+                goto set_error_page;
+            }
+            bio_set_dev(bio, bdev);
+            bio->bi_iter.bi_sector = blocks[0] << (blkbits - 9);
+            bio->bi_end_io = mpage_end_io;
+            bio->bi_private = ctx;
+            bio_set_op_attrs(bio, REQ_OP_READ,
+                        is_readahead ? REQ_RAHEAD : 0);
+
+  ---
+
+blkdev_readpages
+  -> mpage_readpages
+  ---
+    struct mpage_readpage_args args = {
+        .get_block = get_block,
+        .is_readahead = true,
+    };
+    unsigned page_idx;
+
+    for (page_idx = 0; page_idx < nr_pages; page_idx++) {
+        struct page *page = lru_to_page(pages);
+
+        prefetchw(&page->flags);
+        list_del(&page->lru);
+        if (!add_to_page_cache_lru(page, mapping,
+                    page->index,
+                    readahead_gfp_mask(mapping))) {
+            args.page = page;
+            args.nr_pages = nr_pages - page_idx;
+            args.bio = do_mpage_readpage(&args);
+        }
+        put_page(page);
+    }
+    BUG_ON(!list_empty(pages));
+    if (args.bio)
+        mpage_bio_submit(REQ_OP_READ, REQ_RAHEAD, args.bio);
+
+  ---
+
+All of the common filesystem should provide this aops.readpages callback.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+</pre>
+<li> ___breadahead
+<pre>
+sb_breadahead
+  -> __breadahead(sb->s_bdev, block, sb->s_blocksize);
+---
+    struct buffer_head *bh = __getblk(bdev, block, size);
+    if (likely(bh)) {
+        ll_rw_block(REQ_OP_READ, REQ_RAHEAD, 1, &bh);
+        brelse(bh);
+    }
+---
+
+This sb_breadahead is used by ext4 to readahead metadata
+
+__ext4_get_inode_loc
+---
+    if (EXT4_SB(sb)->s_inode_readahead_blks) {
+            ext4_fsblk_t b, end, table;
+            unsigned num;
+            __u32 ra_blks = EXT4_SB(sb)->s_inode_readahead_blks;
+
+            table = ext4_inode_table(sb, gdp);
+            /* s_inode_readahead_blks is always a power of 2 */
+            b = block & ~((ext4_fsblk_t) ra_blks - 1);
+            if (table > b)
+                b = table;
+            end = b + ra_blks;
+            num = EXT4_INODES_PER_GROUP(sb);
+            if (ext4_has_group_desc_csum(sb))
+                num -= ext4_itable_unused_count(sb, gdp);
+            table += num / inodes_per_block;
+            if (end > table)
+                end = table;
+            while (b <= end)
+                sb_breadahead(sb, b++);
+        }
+
+---
+
+</pre>
+<li> _xfs_buf_ioapply
+</ul>
+</pre>
+In block layer, REQ_RAHEAD is not important.
+<ul>
+<li> blk core
+<pre>
+blk_init_request_from_bio
+---
+    if (bio->bi_opf & REQ_RAHEAD)
+        req->cmd_flags |= REQ_FAILFAST_MASK;
+---
+
+#define REQ_FAILFAST_MASK \
+    (REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT | REQ_FAILFAST_DRIVER)
+</pre>
+<li> bcache
+<pre>
+check_should_bypass
+---
+    /*
+     * Flag for bypass if the IO is for read-ahead or background,
+     * unless the read-ahead request is for metadata
+     * (eg, for gfs2 or xfs).
+     */
+    if (bio->bi_opf & (REQ_RAHEAD|REQ_BACKGROUND) &&
+        !(bio->bi_opf & (REQ_META|REQ_PRIO)))
+        goto skip;
+---
+</pre>
+<li> dm
+<pre>
+dm_make_request
+---
+    /* if we're suspended, we have to queue this io for later */
+    if (unlikely(test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags))) {
+        dm_put_live_table(md, srcu_idx);
+
+        if (!(bio->bi_opf & REQ_RAHEAD))
+            queue_io(md, bio);
+        else
+            bio_io_error(bio);
+        return ret;
+    }
+---
+</pre>
+<li> raid5
+<pre>
+raid5_make_request
+---
+        sh = raid5_get_active_stripe(conf, new_sector, previous,
+                       (bi->bi_opf & REQ_RAHEAD), 0);
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^
+                          is nonblock
+---
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h4><a name="readahead_fs_metadata">fs metadata</a></h4>
+<p>
+<font size="2">
+Since the fs metadata is through the pagecache of the block device,<br/>
+does it could use this readahead ?<br/>
+Let's take some examples from ext4
+<ul>
+<li> inode table and inode bitmap 
+<pre>
+__ext4_get_inode_loc
+---
+    /*
+     * Figure out the offset within the block group inode table
+     */
+    inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
+    inode_offset = ((inode->i_ino - 1) %
+            EXT4_INODES_PER_GROUP(sb));
+    block = ext4_inode_table(sb, gdp) + (inode_offset / inodes_per_block);
+    iloc->offset = (inode_offset % inodes_per_block) * EXT4_INODE_SIZE(sb);
+
+<font color="red">
+    // sb_getblk just setup the page in the pagecache and its bhs
+</font>
+    bh = sb_getblk(sb, block);
+    ...
+    if (!buffer_uptodate(bh)) {
+        lock_buffer(bh);
+    ...
+make_io:
+    ...
+        /*
+         * There are other valid inodes in the buffer, this inode
+         * has in-inode xattrs, or we don't have this inode in memory.
+         * Read the block from disk.
+         */
+        trace_ext4_load_inode(inode);
+        get_bh(bh);
+        bh->b_end_io = end_buffer_read_sync;
+<font color="red">
+        submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+        wait_on_buffer(bh);
+</font>
+        ...
+    }
+---
+
+ext4_read_inode_bitmap
+---
+    desc = ext4_get_group_desc(sb, block_group, NULL);
+    ...
+    bitmap_blk = ext4_inode_bitmap(sb, desc);
+    ...
+    bh = sb_getblk(sb, bitmap_blk);
+    ...
+    if (bitmap_uptodate(bh))
+        goto verify;
+
+    lock_buffer(bh);
+    if (bitmap_uptodate(bh)) {
+        unlock_buffer(bh);
+        goto verify;
+    }
+    ...
+    /*
+     * submit the buffer_head for reading
+     */
+    trace_ext4_load_inode_bitmap(sb, block_group);
+    bh->b_end_io = ext4_end_bitmap_read;
+    get_bh(bh);
+    submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+    wait_on_buffer(bh);
+    ...
+---
+</pre>
+<li> directory entries
+<pre>
+ext4_readdir
+---
+    while (ctx->pos < inode->i_size) {
+        struct ext4_map_blocks map;
+        ...
+        cond_resched();
+        map.m_lblk = ctx->pos >> EXT4_BLOCK_SIZE_BITS(sb);
+        map.m_len = 1;
+        err = ext4_map_blocks(NULL, inode, &map, 0);
+        if (err > 0) {
+            pgoff_t index = map.m_pblk >>
+                    (PAGE_SHIFT - inode->i_blkbits);
+            if (!ra_has_index(&file->f_ra, index))
+                page_cache_sync_readahead(
+                    sb->s_bdev->bd_inode->i_mapping,
+                    &file->f_ra, file,
+                    index, 1);
+            file->f_ra.prev_pos = (loff_t)index << PAGE_SHIFT;
+            bh = ext4_bread(NULL, inode, map.m_lblk, 0);
+        }
+        ...
+    }
+---
+
+There are two points here,
+1. <B>ext4_bread</B>
+   ext4_bread
+   ---
+    bh = ext4_getblk(handle, inode, block, map_flags);
+    if (IS_ERR(bh))
+        return bh;
+    if (!bh || buffer_uptodate(bh))
+        return bh;
+<font color="red">
+    ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1, &bh);
+</font>
+    wait_on_buffer(bh);
+    if (buffer_uptodate(bh))
+        return bh;
+   ---
+2. <B>there is indeed readahead here</B>
+   page_cache_sync_readahead is invoked here.
+   the parameters is very interesting,
+
+        page_cache_sync_readahead(
+            sb->s_bdev->bd_inode->i_mapping,
+            &file->f_ra, file,
+            index, 1);
+   the address_space is the block device's,
+   the file_ra_state is the directory's
+
+ext4_create
+  -> ext4_add_nondir
+    -> ext4_add_entry
+    ---
+    blocks = dir->i_size >> sb->s_blocksize_bits;
+    for (block = 0; block < blocks; block++) {
+        bh = ext4_read_dirblock(dir, block, DIRENT);
+          -> __ext4_read_dirblock
+<font color="red">
+            -> ext4_bread
+</font>
+        retval = add_dirent_to_buf(handle, &fname, dir, inode,
+                       NULL, bh);
+        if (retval != -ENOSPC)
+            goto out;
+
+        if (blocks == 1 && !dx_fallback &&
+            ext4_has_feature_dir_index(sb)) {
+            retval = make_indexed_dir(handle, &fname, dir,
+                          inode, bh);
+            bh = NULL; /* make_indexed_dir releases bh */
+            goto out;
+        }
+        brelse(bh);
+    }
+    bh = ext4_append(handle, dir, &block);
+    ---
+
+__ext4_find_entry
+---
+    do {
+        /*
+         * We deal with the read-ahead logic here.
+         */
+        if (ra_ptr >= ra_max) {
+            /* Refill the readahead buffer */
+            ra_ptr = 0;
+            if (block < start)
+                ra_max = start - block;
+            else
+                ra_max = nblocks - block;
+            ra_max = min(ra_max, ARRAY_SIZE(bh_use));
+            retval = ext4_bread_batch(dir, block, ra_max,
+                          false /* wait */, bh_use);
+            ...
+        }
+        if ((bh = bh_use[ra_ptr++]) == NULL)
+            goto next;
+        wait_on_buffer(bh);
+        ...
+        set_buffer_verified(bh);
+        i = search_dirblock(bh, dir, fname,
+                block << EXT4_BLOCK_SIZE_BITS(sb), res_dir);
+        ...
+    next:
+        if (++block >= nblocks)
+            block = 0;
+    } while (block != start);
+---
+
+ext4_bread_batch
+---
+    for (i = 0; i < bh_count; i++)
+        bhs[i] = ext4_getblk(NULL, inode, block + i, 0 /* map_flags */);
+
+    for (i = 0; i < bh_count; i++)
+        /* Note that NULL bhs[i] is valid because of holes. */
+        if (bhs[i] && !buffer_uptodate(bhs[i]))
+            ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1,
+                    &bhs[i]);
+
+    if (!wait)
+        return 0;
+
+    for (i = 0; i < bh_count; i++)
+        if (bhs[i])
+            wait_on_buffer(bhs[i]);
+---
+</pre>
+</ul>
+<B>
+So we know the fs metadata doesn't use the readahead directly, the fs could
+implement its own readahead stuff.
+</B>
+</font>
+</p>
+
+
 
 <h2><a name="writeback">writeback</a></h2>
 <h3><a name="dirty_balance">dirty balance</a></h3>

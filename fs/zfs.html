@@ -11,13 +11,914 @@
 
 <p>
 <font size="2">
+<a href="#Build">Build</a>
+<a href="#DMU"></a>
+<ul>
+<li><a href="#objects">objects</a>
+<li><a href="#COW">COW</a>
+</ul>
+<a href=""#ZIL>ZIL</a>
+<ul>
+<li><a href="#zil_where">Where to log</a>
+<li><a href="#zil_what">What to log</a>
+</ul>
+<a href="#space_management">space management</a>
+<ul>
+<li><a href="#COW_of_spacemap">COW of spacemap</a>
+<li><a href="#original_blocks">original blocks</a>
+</ul>
 
 <a href="#Talking">Talking</a>
 <ul>
-<li> <a href="#self_healing">self healing</a>
+<li><a href="#self_healing">self healing</a>
+<li><a href="#update_uberblock">update_uberblock</a>
 </ul>
 </font>
 </p>
+
+<h2><a name="Build">Build</a></h2>
+<p>
+<font size="2">
+<pre>
+
+https://github.com/zfsonlinux/zfs/wiki/Building-ZFS
+https://github.com/zfsonlinux/zfs/wiki/Custom-Packages
+
+sudo dnf install autoconf automake libtool rpm-build
+$ sudo dnf install zlib-devel libuuid-devel libattr-devel libblkid-devel libselinux-devel libudev-devel
+$ sudo dnf install libacl-devel libaio-devel device-mapper-devel openssl-devel libtirpc-devel elfutils-libelf-devel
+$ sudo dnf install kernel-devel-$(uname -r)
+
+# To enable the pyzfs packages additionally install the following:
+
+# Fedora
+$ sudo dnf install python3 python3-devel python3-setuptools python3-cffi 
+
+# For Red Hat / CentOS 7
+$ sudo yum install epel-release
+$ sudo yum install python36 python36-devel python36-setuptools python36-cffi
+
+There are 3 kinds of mode to build the rpm packages
+DKMS  kmods  kABI-tracking kmod
+
+We use the kmods
+           ^^^^^^
+kmods packages are binary kernel modules which are compiled against 
+a specific version of the kernel. This means that if you update the 
+kernel you must compile and install a new kmod package. If you don't 
+frequently update your kernel, or if you're managing a large number 
+of systems, then kmod packages are a good choice.
+
+$ cd zfs
+$ ./configure --with-config=srpm
+$ make -j1 pkg-utils rpm-dkms
+$ sudo yum localinstall *.$(uname -p).rpm *.noarch.rpm
+
+<font color="blue">
+./configure
+LC_TIME=C make -j1 pkg-utils pkg-kmod //LC_TIME=C kill the bug of bad changelog
+
+
+When install the rpm packages,
+The zfs module actually only need these 3 packages
+zfs-0.7.12-1.el7.centos.x86_64
+libzfs2-0.7.12-1.el7.centos.x86_64
+kmod-zfs-3.10.0-327.el7.centos.scst72.x86_64-0.7.12-1.el7.centos.x86_64
+And the zfs and kmod-zfs depends on each other
+</font>
+</pre>
+
+</font>
+</p>
+
+<h2><a name="DMU">DMU</a></h2>
+
+<h3><a name="objects">objects</a></h3>
+<p>
+<font size="2">
+A object in DMU is described by dnode
+<pre>
+
+   +----------+
+   | dn_type  |
+   | dn_indblkshift
+   | dn_nlevels = 2
+   | dn_nblkptr = 2
+   | .......  |     +-------+-------+-------+
+   |          |   / |blkptr0|blkptr1|blkptr2|
+   | dn_blkptr[3]   |       |       |       |
+   |          |   \ |       |       |       |
+   +----------+     +-------+-------+-------+
+                       |||
+                       v||  
+                    +---v|-+      indirect blocks (metatdata), there are 3 replicas in blkptr for it
+                    | +--v---+
+                    | | +------+  the size of indirect block is determined by dn_indblkshift
+                    +-| |      |  it is a array of blkptrs that point to another  level indirect block or block
+                      +-|      | ---+
+                        +------+    | for regular data, there is only 1 replica
+                                    v
+                                 +-----+
+                                 |     |  the blocks described by a blkptr in the indirect block
+                                 |     |
+                                 +-----+
+
+
+                          I I I                         level 2    Every 'I' or 'D' here is a blkptr, the
+                    I I I I I I I I I                   level 1    space that the blkptr points
+        D D D D D D D D D D D D D D D D D D D D D       level 0    contains an array of blkptrs
+                         
+
+        Every 'D' here points to a block, it has a block id, the linear index in level 0
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+        We could calculate the block id of the level 1 indirect blocks  through
+
+        level 1 blkid = (level 0 blkid) % ((size of level 1 indirect block)/(size of blkptr))
+
+</pre>
+The objects are collected in a object set.<br/>
+The interesting thing is the type of the object set
+<ul>
+<li> DMU_OST_NONE
+<li> DMU_OST_META, DSL object set
+<li> DMU_OST_ZFS, ZPL object set
+<li> DMU_OST_ZVOL, ZVOL object set
+</ul>
+<pre>
+
+    +-----------+
+    | metadnode |
+    | os_zil_header
+    | os_type   |
+    | os_pad[]  |
+    +-----------+
+
+    The metadnode here points to an object that contains array of dnodes that
+    describe the objects in this object set.
+
+<font color="red">
+    Every object in an object set is uniquely identified by a 64bits integer
+    called object number. We could address the location of the dnode structure
+    of an object through this object number.
+</font>
+</pre>
+</font>
+</p>
+
+<h3><a name="COW">COW</a></h3>
+<p>
+<font size="2">
+How does the COW happen, especially, it need to iterate the bp tree <B>from buttom<br/>
+to top</B> to update the new blkptr_t which includes the new position and checksum ?<br/>
+<pre>
+
+spa_sync
+  -> spa_sync_iterate_to_convergence
+    -> dsl_pool_sync
+      -> dsl_dataset_sync
+        -> dmu_objset_sync
+          -> dnode_sync
+            -> list_t *list = &dn->dn_dirty_records[txgoff]
+            -> dbuf_sync_list // itertate down to the level 0
+               ---
+                if (dr->dr_dbuf->db_level > 0)
+                    dbuf_sync_indirect(dr, tx);
+                else
+                    dbuf_sync_leaf(dr, tx);
+               ---
+               -> dbuf_sync_indirect
+                 -> dbuf_write // indirect dbuf
+                 -> dbuf_sync_list(&dr->dt.di.dr_children, db->db_level - 1, tx)
+                   -> dbuf_sync_leaf
+
+
+The block is finally issued by dbuf_write
+
+dbuf_write
+---
+    dr->dr_zio = arc_write(zio, os->os_spa, txg,
+            &dr->dr_bp_copy, data, DBUF_IS_L2CACHEABLE(db),
+            &zp, dbuf_write_ready,
+            children_ready_cb, dbuf_write_physdone,
+            dbuf_write_done, db, ZIO_PRIORITY_ASYNC_WRITE,
+            ZIO_FLAG_MUSTSUCCEED, &zb);
+---
+  ->  arc_write
+      ---
+        callback->awcb_ready = ready;
+        callback->awcb_children_ready = children_ready;
+        callback->awcb_physdone = physdone;
+        callback->awcb_done = done;
+        callback->awcb_private = private;
+        callback->awcb_buf = buf;
+        ...
+    
+        zio = zio_write(pio, spa, txg, bp,
+            abd_get_from_buf(buf->b_data, HDR_GET_LSIZE(hdr)),
+            HDR_GET_LSIZE(hdr), arc_buf_size(buf), &localprop, arc_write_ready,
+            (children_ready != NULL) ? arc_write_children_ready : NULL,
+            arc_write_physdone, arc_write_done, callback,
+                priority, zio_flags, zb);
+      ---
+      -> zio_write
+        ---
+            zio = zio_create(pio, spa, txg, bp, data, lsize, psize, done, private,
+                   ZIO_TYPE_WRITE, priority, flags, NULL, 0, zb,
+                   ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
+                   ZIO_DDT_CHILD_WRITE_PIPELINE : ZIO_WRITE_PIPELINE);
+
+
+            zio->io_ready = ready;
+            zio->io_children_ready = children_ready;
+            zio->io_physdone = physdone;
+            zio->io_prop = *zp;
+        ---
+
+
+<B>The pipeline of the write is</B>
+#define    ZIO_INTERLOCK_STAGES            \
+    (ZIO_STAGE_READY |            \
+    ZIO_STAGE_DONE)
+
+#define    ZIO_WRITE_COMMON_STAGES            \
+    (ZIO_INTERLOCK_STAGES |            \
+    ZIO_VDEV_IO_STAGES |            \
+    ZIO_STAGE_ISSUE_ASYNC |            \
+<font color="red">
+    ZIO_STAGE_CHECKSUM_GENERATE)
+</font>
+
+#define    ZIO_WRITE_PIPELINE            \
+    (ZIO_WRITE_COMMON_STAGES |        \
+    ZIO_STAGE_WRITE_BP_INIT |        \
+    ZIO_STAGE_WRITE_COMPRESS |        \
+    ZIO_STAGE_ENCRYPT |            \
+    ZIO_STAGE_DVA_THROTTLE |        \
+<font color="red">
+    ZIO_STAGE_DVA_ALLOCATE)
+</font>
+
+zio_dva_allocate
+  -> metaslab_alloc
+    -> metaslab_alloc_dva
+    ---
+            DVA_SET_VDEV(&dva[d], vd->vdev_id);
+            DVA_SET_OFFSET(&dva[d], offset);
+            DVA_SET_GANG(&dva[d],
+                ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
+            DVA_SET_ASIZE(&dva[d], asize);
+    ---
+
+We could see that the new checksum calculating and new block allocation all
+happen during the write pipeline. These new information would be saved in the
+<font color="red"><B>zio->io_bp</B></font>
+
+
+<B>But how does the parent block knows these newly updated zio->io_bp ?</B>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+zio_pipeline
+---
+    zio_dva_allocate,
+    zio_dva_free,
+    zio_dva_claim,
+    zio_ready,        //<font color="red">After the zio_dva_allocate</font>
+---
+
+zio_ready
+  -> zio->io_ready
+     arc_write_ready
+      -> callback->awcb_ready
+         dbuf_write_ready
+         ---
+            rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
+            *db->db_blkptr = *bp;
+            rw_exit(&dn->dn_struct_rwlock);
+         ---
+<font color="red">
+    The db->db_blkptr points to blkptr_t structure in the dn's buffer.
+    And at this moment, the new checksum has been calculated. The parent knows
+    the new data location and new data checksum.
+</font>
+For example,
+dnode_increase_indirection
+---
+        child->db_parent = db;
+        dbuf_add_ref(db, child);
+        if (db->db.db_data)
+            child->db_blkptr = (blkptr_t *)db->db.db_data + i;
+        else
+            child->db_blkptr = NULL;
+
+---
+
+Or
+
+dbuf_check_blkptr
+---
+    if (db->db_level == dn->dn_phys->dn_nlevels-1) {
+        db->db_parent = dn->dn_dbuf;
+<font color="blue">
+    //dn_phys pointers into dn->dn_dbuf->db.db_data
+</font>
+        db->db_blkptr = &dn->dn_phys->dn_blkptr[db->db_blkid];
+        DBUF_VERIFY(db);
+    } 
+---
+
+<B>Another question is that how to ensure the zios' pipeline of different level are
+executed from buttom to top ?</B>
+
+To figure it out, what we need to know first is that no matter zio_write or
+arc_write will not kick off the zio pipeline but just create a zio.
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If we want to start the zio, we need to invoke zio_wait or zio_nowait.
+
+Look at the dbuf_sync_indirect and dbuf_sync_leaf which are typical example,
+
+dbuf_sync_indirect
+---
+<font color="blue">
+    // The zio is not kicked off but just created here
+</font>
+    dbuf_write(dr, db->db_buf, tx);
+
+    zio = dr->dr_zio;
+    mutex_enter(&dr->dt.di.dr_mtx);
+<font color="blue">
+    // Iterate the lower level
+</font>
+    dbuf_sync_list(&dr->dt.di.dr_children, db->db_level - 1, tx);
+    mutex_exit(&dr->dt.di.dr_mtx);
+<font color="red">
+    zio_nowait(zio);
+</font>
+---
+
+dbuf_sync_leaf
+---
+    dbuf_write(dr, *datap, tx);
+
+    if (dn->dn_object == DMU_META_DNODE_OBJECT) {
+        ...
+    } else {
+        /*
+         * Although zio_nowait() does not "wait for an IO", it does
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * initiate the IO. If this is an empty write it seems plausible
+           ^^^^^^^^^^^^^^^
+         * that the IO could actually be completed before the nowait
+         * returns. We need to DB_DNODE_EXIT() first in case
+         * zio_nowait() invalidates the dbuf.
+         */
+        DB_DNODE_EXIT(db);
+<font color="red">
+        zio_nowait(dr->dr_zio);
+</font>
+    }
+---
+
+<B>The zio of the upper level is always kicked off after iterate the underlying level.</B>
+
+Question:
+The write zio's pipeline will enter zio_issue_async, all zios will be executed
+in parallel with multiple threads. Then we could get bigger throughput.
+
+Refer to taskq_create and zio_taskqs
+
+But this also means the zios of children and parents maybe executed out of order.
+This is a big problem because the zio_checksum_generate must be executed after the
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+children zios are ready, then the new checksum could include the new blkptrs of children.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+How to handle this ?
+
+The answer is <font color="red">ZIO_STAGE_WRITE_COMPRESS</font>
+zio_write_compress
+---
+    /*
+     * If our children haven't all reached the ready stage,
+     * wait for them and then repeat this pipeline stage.
+     */
+    if (zio_wait_for_children(zio, <font color="red">ZIO_CHILD_LOGICAL_BIT</font> |
+        ZIO_CHILD_GANG_BIT, ZIO_WAIT_READY)) {
+        return (NULL);
+    }
+---
+
+zio_write
+---
+    zio = zio_create(pio, spa, txg, bp, data, lsize, psize, done, private,
+        ZIO_TYPE_WRITE, priority, flags, NULL, 0, zb,
+                                       <font color="red"> <B> ^^^^</B></font>
+        ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
+        ZIO_DDT_CHILD_WRITE_PIPELINE : ZIO_WRITE_PIPELINE);
+---
+
+zio_create
+---
+    if (vd != NULL)
+        zio->io_child_type = ZIO_CHILD_VDEV;
+    else if (flags & ZIO_FLAG_GANG_CHILD)
+        zio->io_child_type = ZIO_CHILD_GANG;
+    else if (flags & ZIO_FLAG_DDT_CHILD)
+        zio->io_child_type = ZIO_CHILD_DDT;
+    else
+        zio->io_child_type = <font color="red">ZIO_CHILD_LOGICAL;</font>
+---
+
+<B>All of the zio created in DMU should be logical one</B>
+<ul>
+<li> mirro and raidz use zio_vdev_child_io which has vd assigned
+<li> vdisk uses __vdev_disk_physio which doesn't create zio but dio_request
+</ul>
+</pre>
+
+</font>
+</p>
+
+<h2><a name="ZIL">ZIL</a></h2>
+<p>
+<font size="2">
+Why does the ZILexist?
+<pre>
+Writes in ZFS are "write-back"
+Data is first written and stored in-memory, in DMU layer
+Later, data for whole pool written to disk via spa_sync()
+Without the ZIL, sync operations could wait for spa_sync()
+<font color="red"><B>
+spa_sync() can take tens of seconds (or more) to complete
+</font></B>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Further, with the ZIL, write amplification can be mitigated
+A single ZPL operation can cause many writes to occur
+ZIL allows operation to "complete" with minimal data written
+ZIL needed to provide "fast" synchronous semantics to applications
+Correctness could be acheived without it, but would be "too slow"
+</pre>
+</font>
+</p>
+
+
+<h3><a name="zil_where">Where</a></h3>
+<p>
+<font size="2">
+
+<B>Log block chain</B>
+<pre>
+
+
+Header -> +-----------+      +--->  +-----------+      +--->  +-----------+
+          | zil_chain | -----+      | zil_chain | -----+      | zil_chain |
+          +-----------+             +-----------+             +-----------+
+          |    LR     |             |    LR     |             |    LR     |
+          +-----------+             +-----------+             +-----------+
+          |    LR     |             |    LR     |             |    LR     |
+          +-----------+             +-----------+             +-----------+
+
+typedef struct zil_chain {
+    uint64_t zc_pad;
+    blkptr_t zc_next_blk;    /* next block in chain */
+    uint64_t zc_nused;    /* bytes in log block used */
+    zio_eck_t zc_eck;    /* block trailer */
+} zil_chain_t;
+
+</pre>
+
+zil_lwb_write_issue will issue the old lwb and allocate a new one.
+<pre>
+zil_lwb_write_issue
+---
+    if (BP_GET_CHECKSUM(&lwb->lwb_blk) == ZIO_CHECKSUM_ZILOG2) {
+        zilc = (zil_chain_t *)lwb->lwb_buf;
+<font color="red">
+        // This bp here points to the old log block's zil_chain_t
+        // Finally, it will be assigned to the next new log block's
+        //lwb->lwb_blk.
+</font>
+        bp = &zilc->zc_next_blk;
+    }
+    ...
+    error = zio_alloc_zil(spa, zilog->zl_os, txg, bp, zil_blksz, &slog);
+    ...
+    if (error == 0) {
+        ASSERT3U(bp->blk_birth, ==, txg);
+        bp->blk_cksum = lwb->lwb_blk.blk_cksum;
+        bp->blk_cksum.zc_word[ZIL_ZC_SEQ]++;
+
+        /*
+         * Allocate a new log write block (lwb).
+         */
+        nlwb = zil_alloc_lwb(zilog, bp, slog, txg, TRUE);
+    }
+
+    ...
+
+    zilc->zc_pad = 0;
+    zilc->zc_nused = lwb->lwb_nused;
+    zilc->zc_eck.zec_cksum = lwb->lwb_blk.blk_cksum;
+
+    /*
+     * clear unused data for security
+     */
+    bzero(lwb->lwb_buf + lwb->lwb_nused, wsz - lwb->lwb_nused);
+
+<font color="blue">
+    // update the lwb_vdev_tree which includes vdevs to flush after lwb write
+</font>
+    zil_lwb_add_block(lwb, &lwb->lwb_blk);
+    lwb->lwb_issued_timestamp = gethrtime();
+    lwb->lwb_state = LWB_STATE_ISSUED;
+
+    zio_nowait(lwb->lwb_root_zio);
+    zio_nowait(lwb->lwb_write_zio);
+---
+</pre>
+The lwb_root_zio and lwb_write_zio is created here
+<pre>
+zil_lwb_commit
+  -> zil_lwb_write_open
+  ---
+        lwb->lwb_root_zio = zio_root(zilog->zl_spa,
+            zil_lwb_flush_vdevs_done, lwb, ZIO_FLAG_CANFAIL);
+
+        lwb->lwb_write_zio = zio_rewrite(lwb->lwb_root_zio,
+            zilog->zl_spa, 0, &lwb->lwb_blk, lwb_abd,
+            BP_GET_LSIZE(&lwb->lwb_blk), zil_lwb_write_done, lwb,
+            prio, ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_PROPAGATE |
+            ZIO_FLAG_FASTWRITE, &zb);
+
+        lwb->lwb_state = LWB_STATE_OPENED;
+  ---
+The zio pipeline of the zio_rewrite is special.
+
+#define    ZIO_REWRITE_PIPELINE            \
+    (ZIO_WRITE_COMMON_STAGES |        \
+    ZIO_STAGE_WRITE_COMPRESS |        \
+    ZIO_STAGE_ENCRYPT |            \
+    ZIO_STAGE_WRITE_BP_INIT)
+
+There is no ZIO_STAGE_DVA_ALLOCATE. So the zil seems not COWed.
+
+Question:
+The log block's checksum is checked in zil_read_log_block
+---
+    error = arc_read(NULL, zilog->zl_spa, bp, arc_getbuf_func,
+        &abuf, ZIO_PRIORITY_SYNC_READ, zio_flags, &aflags, &zb);
+
+    if (error == 0) {
+        zio_cksum_t cksum = bp->blk_cksum;
+
+        /*
+         * Validate the checksummed log block.
+         *
+         * Sequence numbers should be... sequential.  The checksum
+         * verifier for the next block should be bp's checksum plus 1.
+         *
+         * Also check the log chain linkage and size used.
+         */
+        cksum.zc_word[ZIL_ZC_SEQ]++;
+
+        if (BP_GET_CHECKSUM(bp) == ZIO_CHECKSUM_ZILOG2) {
+            zil_chain_t *zilc = abuf->b_data;
+            char *lr = (char *)(zilc + 1);
+            uint64_t len = zilc->zc_nused - sizeof (zil_chain_t);
+
+            if (bcmp(&cksum, &zilc->zc_next_blk.blk_cksum,
+                sizeof (cksum)) || BP_IS_HOLE(&zilc->zc_next_blk)) {
+                error = SET_ERROR(ECKSUM);
+            } else {
+                ASSERT3U(len, <=, SPA_OLD_MAXBLOCKSIZE);
+                bcopy(lr, dst, len);
+                *end = (char *)dst + len;
+                *nbp = zilc->zc_next_blk;
+            }
+        } 
+---
+
+Not quite understand how to do the check.
+</pre>
+
+</font>
+</p>
+
+<h3><a name="zil_where">Where</a></h3>
+<p>
+<font size="2">
+What will be recorded in the zil ?
+<pre>
+zil_commit
+  -> zil_commit_impl
+    -> zil_commit_writer
+      -> zil_process_commit_list
+        -> zil_lwb_commit
+        ---
+            if (itx->itx_wr_state == WR_NEED_COPY) {
+                dbuf = lr_buf + reclen;
+                lrcb->lrc_reclen += dnow;
+                if (lrwb->lr_length > dnow)
+                    lrwb->lr_length = dnow;
+                lrw->lr_offset += dnow;
+                lrw->lr_length -= dnow;
+                ZIL_STAT_BUMP(zil_itx_needcopy_count);
+                ZIL_STAT_INCR(zil_itx_needcopy_bytes, dnow);
+            } else {
+                dbuf = NULL;
+                ZIL_STAT_BUMP(zil_itx_indirect_count);
+                ZIL_STAT_INCR(zil_itx_indirect_bytes,
+                    lrw->lr_length);
+            }
+
+            error = zilog->zl_get_data(itx->itx_private,
+                lrwb, dbuf, lwb, lwb->lwb_write_zio);
+
+        ---
+
+zfs_log_write
+---
+    if (zilog->zl_logbias == ZFS_LOGBIAS_THROUGHPUT)
+        write_state = WR_INDIRECT;
+    else if (!spa_has_slogs(zilog->zl_spa) &&
+        resid >= zfs_immediate_write_sz)
+        write_state = WR_INDIRECT;
+    else if (ioflag & (FSYNC | FDSYNC))
+        write_state = WR_COPIED;
+    else
+        write_state = WR_NEED_COPY;
+---
+
+
+zfs_get_data  //<font color="blue">Get data to generate a TX_WRITE intent log record </font>
+
+The specific header for write intent log is
+
+typedef struct {
+    lr_t        lr_common;    /* common portion of log record */
+    uint64_t    lr_foid;    /* file object to write */
+    uint64_t    lr_offset;    /* offset to write to */
+    uint64_t    lr_length;    /* user data length to write */
+    uint64_t    lr_blkoff;    /* no longer used */
+    blkptr_t    lr_blkptr;    /* spa block pointer for replay */
+<font color="red">
+    /* write data will follow for small writes */
+</font>
+} lr_write_t;
+
+
+There are two flavors of writing log records
+<ul>
+<li> immediate
+<pre>
+For small writes it's cheaper to store the data with the log record
+zfs_get_data
+---
+    if (buf != NULL) { /* immediate write */
+        zgd->zgd_lr = rangelock_enter(&zp->z_rangelock,
+            offset, size, RL_READER);
+        /* test for truncation needs to be done while range locked */
+        if (offset >= zp->z_size) {
+            error = SET_ERROR(ENOENT);
+        } else {
+<font color="blue">
+            // the object here is the target of the write operation which this
+            // ZIL want to record. dmu_read will read the content into the buf
+            which should be part of the ZIL block following the lr_write_t
+</font>
+<font color="red">
+            error = dmu_read(os, object, offset, size, buf,
+                DMU_READ_NO_PREFETCH);
+</font>
+        }
+    } 
+---
+
+</pre>
+<li> indirect
+<pre>
+for large writes it's cheaper to sync the data and get a pointer
+to it (indirect) so that we don't have to write the data twice.
+
+        if (error == 0)
+<font color="blue">
+</font>
+            error = dmu_buf_hold(os, object, offset, zgd, &db,
+                DMU_READ_NO_PREFETCH);
+
+        if (error == 0) {
+<font color="blue">
+            // the lr_blkptr is not pointer but part of the lr_write_t structure
+            // we get the pointer here.
+</font>
+            blkptr_t *bp = &lr->lr_blkptr;
+
+            zgd->zgd_db = db;
+            zgd->zgd_bp = bp;
+
+
+            error = dmu_sync(zio, lr->lr_common.lrc_txg,
+                zfs_get_done, zgd);
+            ...
+        }
+        dmu_sync
+          -> arc_write //<font color="blue"> the parameter bp is zgd->zgd_bp</font>
+            -> zio_write
+               the bp pointer will be set to zio->io_bp
+          -> zio_nowait
+
+      in the zio_dva_allocate, the zio->io_bp will be assigned with new value
+      where the io will be store on disk. And finally, the lr_write_t.lr_blkptr
+      will be set during this.
+
+</pre>
+</ul>
+
+</pre>
+</font>
+</p>
+
+
+<h3><a name="checkpoint">checkpoint</a></h3>
+<p>
+<font size="2">
+<pre>
+dmu_objset_sync
+---
+    /*
+     * Free intent log blocks up to this tx.
+     */
+    zil_sync(os->os_zil, tx);
+    os->os_phys->os_zil_header = os->os_zil_header;
+    zio_nowait(zio)
+---
+zil_sync
+---
+    while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
+<font color="blue">
+        // update the zil header
+</font>
+        zh->zh_log = lwb->lwb_blk;
+        if (lwb->lwb_buf != NULL || <font color="red">lwb->lwb_max_txg > txg</font>)
+            break;
+        list_remove(&zilog->zl_lwb_list, lwb);
+        zio_free(spa, txg, &lwb->lwb_blk);
+        zil_free_lwb(zilog, lwb);
+
+        /*
+         * If we don't have anything left in the lwb list then
+         * we've had an allocation failure and we need to zero
+         * out the zil_header blkptr so that we don't end
+         * up freeing the same block twice.
+         */
+        if (list_head(&zilog->zl_lwb_list) == NULL)
+            BP_ZERO(&zh->zh_log);
+    }
+
+---
+</pre>
+</font>
+</p>
+
+<h2><a name="space_management">space management</a></h2>
+
+
+<h3><a name="COW_of_spacemap">COW of spacemap</a></h3>
+<p>
+<font size="2">
+Where is the spacemap stored ?
+<pre>
+The vdev lable
+
+vdev_tree nvlist 
+
+Name: “metaslab_array”
+Value: DATA_TYPE_UINT64
+Description: Object number of an object containing an array of object numbers.
+Each element of this array (ma[i]) is, in turn, an object number of a space map
+for metaslab 'i'. 
+
+Name: “metaslab_shift” 
+Value: DATA_TYPE_UINT64
+Description: log base 2 of the metaslab size
+
+<B><font color="red">
+The objset of the object above is the MOS (meta object set)
+</font></B>
+
+Look at vdev_metaslab_init
+---
+    for (m = oldc; m < newc; m++) {
+        uint64_t object = 0;
+
+        if (txg == 0 && vd->vdev_ms_array != 0) {
+            error = dmu_read(mos, vd->vdev_ms_array,
+                m * sizeof (uint64_t), sizeof (uint64_t), &object,
+                DMU_READ_PREFETCH);
+                ...
+        }
+
+        error = metaslab_init(vd->vdev_mg, m, object, txg,
+            &(vd->vdev_ms[m]));
+            ...
+    }
+---
+
+When it do dmu_read, the 3 parameters are very important
+<ul>
+<li> objset         ->  mos (Yes, it is the MOS)
+<li> object id      ->  vd->vdev_ms_array (the metaslab array object id)
+<li> offset and len ->  m * sizeof (uint64_t), sizeof (uint64_t)
+</ul>
+
+space_map_write_impl only dirty the associated dmu_buf_t and thus finally dirty
+the MOS.
+
+Look at the spa_sync_iterate_to_convergence
+---
+    do {
+        int pass = ++spa->spa_sync_pass;
+        ...
+        dsl_pool_sync(dp, txg);
+          -> dsl_pool_sync_mos
+        ...
+        vdev_t *vd = NULL;
+        while ((vd = txg_list_remove(&spa->spa_vdev_txg_list, txg))
+            != NULL)
+            vdev_sync(vd, txg);
+<font color="blue">
+            // The dsl_pool_sync could cause new allocation/free operation,
+            // so the metaslab sync must be invoked it.
+</font>
+              -> metaslab_sync
+        ...
+        spa_sync_deferred_frees(spa, tx);
+    } while (<font color="red">dmu_objset_is_dirty(mos, txg)</font>);
+
+---
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="original_blocks">original blocks</a></h3>
+<p>
+<font size="2">
+How does the zfs handle the original unused blocks after COWed ?<br/>
+When to free them ?<br/>
+Look at here
+<pre>
+dbuf_write
+---
+    dr->dr_zio = arc_write(zio, os->os_spa, txg,
+            &dr->dr_bp_copy, data, DBUF_IS_L2CACHEABLE(db),
+            &zp, dbuf_write_ready,
+            children_ready_cb, dbuf_write_physdone,
+            dbuf_write_done, db, ZIO_PRIORITY_ASYNC_WRITE,
+            ZIO_FLAG_MUSTSUCCEED, &zb);
+---
+
+
+zio_done
+  -> zio->io_done
+     arc_write_done
+       -> callback->awcb_done
+          dbuf_write_done
+          ---
+
+        blkptr_t *bp_orig = &zio->io_bp_orig;
+        if (zio->io_flags & (ZIO_FLAG_IO_REWRITE | ZIO_FLAG_NOPWRITE)) {
+            ASSERT(BP_EQUAL(bp, bp_orig));
+        } else {
+            dsl_dataset_t *ds = os->os_dsl_dataset;
+<font color="red">
+            (void) dsl_dataset_block_kill(ds, bp_orig, tx, B_TRUE);
+</font>
+            dsl_dataset_block_born(ds, bp, tx);
+        }
+
+          ---
+
+dsl_dataset_block_kill
+  -> dsl_free
+    -> zio_free
+    ---
+    if (BP_IS_GANG(bp) || BP_GET_DEDUP(bp) ||
+        txg != spa->spa_syncing_txg ||
+        spa_sync_pass(spa) >= zfs_sync_pass_deferred_free) {
+        bplist_append(&spa->spa_free_bplist[txg & TXG_MASK], bp);
+    } else {
+        VERIFY0(zio_wait(zio_free_sync(NULL, spa, txg, bp, 0)));
+    }
+    ---
+</pre>
+
+</font>
+</p>
+
+
 
 <h2><a name="Talking">Talking</a></h2>
 <p>
@@ -393,6 +1294,122 @@ to repair the errors.
 </font>
 </p>
 
+
+<h3><a name="update_uberblock">update_uberblock</a></h3>
+<p>
+<font size="2">
+The structure of the uberblock
+<pre>
+struct uberblock {
+    uint64_t    ub_magic;    /* UBERBLOCK_MAGIC        */
+    uint64_t    ub_version;    /* SPA_VERSION            */
+    uint64_t    ub_txg;        /* txg of last sync        */
+    uint64_t    ub_guid_sum;    /* sum of all vdev guids    */
+    uint64_t    ub_timestamp;    /* UTC time of last sync    */
+    blkptr_t    ub_rootbp;    /* MOS objset_phys_t        */
+    ...
+    }
+
+The MOS (Meta Object set) is <B><font color="red">unique around one pool.</font></B>
+</pre>
+
+The process of update uberblock
+<pre>
+spa_sync_iterate_to_convergence
+  -> dsl_pool_sync
+    -> dsl_pool_sync_mos
+     ---
+    zio_t *zio = zio_root(dp->dp_spa, NULL, NULL, ZIO_FLAG_MUSTSUCCEED);
+    dmu_objset_sync(dp->dp_meta_objset, zio, tx);
+    VERIFY0(zio_wait(zio));
+    dprintf_bp(&dp->dp_meta_rootbp, "meta objset rootbp is %s", "");
+    spa_set_rootblkptr(dp->dp_spa, &dp->dp_meta_rootbp);
+     ---
+
+dmu_objset_sync
+---
+    zio = arc_write(pio, os->os_spa, tx->tx_txg,
+        blkptr_copy, os->os_phys_buf, DMU_OS_IS_L2CACHEABLE(os),
+        &zp, dmu_objset_write_ready, NULL, NULL, dmu_objset_write_done,
+             ^^^^^^^^^^^^^^^^^^^^^^
+        os, ZIO_PRIORITY_ASYNC_WRITE, ZIO_FLAG_MUSTSUCCEED, &zb);
+
+---
+dmu_objset_write_ready
+---
+    if (os->os_dsl_dataset != NULL)
+        rrw_enter(&os->os_dsl_dataset->ds_bp_rwlock, RW_WRITER, FTAG);
+    *os->os_rootbp = *bp;
+    if (os->os_dsl_dataset != NULL)
+        rrw_exit(&os->os_dsl_dataset->ds_bp_rwlock, FTAG);
+---
+
+This os_rootbp points to the dsl_pool_t.dp_meta_rootbp
+dsl_pool_init
+---
+    err = dmu_objset_open_impl(spa, NULL, &dp->dp_meta_rootbp,
+        &dp->dp_meta_objset);
+---
+
+dsl_pool_sync_mos will set this dp->dp_meta_rootbp to uberblock.
+void
+spa_set_rootblkptr(spa_t *spa, const blkptr_t *bp)
+{
+    spa->spa_uberblock.ub_rootbp = *bp;
+}
+
+The spa->spa_uberblock will be set to disk
+spa_sync
+  -> spa_sync_iterate_to_convergence
+  -> spa_sync_rewrite_vdev_config
+    -> vdev_config_sync
+      -> vdev_label_sync_list
+        -> vdev_uberblock_sync_list
+        ---
+        for (int v = 0; v < svdcount; v++)
+            vdev_uberblock_sync(zio, &good_writes, ub, svd[v], flags);
+
+        <font color="red">(void) zio_wait(zio);</font>
+
+        /*
+         * Flush the uberblocks to disk.  This ensures that the odd labels
+         * are no longer needed (because the new uberblocks and the even
+         * labels are safely on disk), so it is safe to overwrite them.
+         */
+        zio = zio_root(spa, NULL, NULL, flags);
+
+        for (int v = 0; v < svdcount; v++) {
+            if (vdev_writeable(svd[v])) {
+                zio_flush(zio, svd[v]);
+            }
+        }
+
+        (void) zio_wait(zio);
+        ---
+
+vdev_uberblock_sync
+---
+    /* Copy the uberblock_t into the ABD */
+    abd_t *ub_abd = abd_alloc_for_io(VDEV_UBERBLOCK_SIZE(vd), B_TRUE);
+    abd_zero(ub_abd, VDEV_UBERBLOCK_SIZE(vd));
+    abd_copy_from_buf(ub_abd, ub, sizeof (uberblock_t));
+
+    for (int l = 0; l < VDEV_LABELS; l++)
+        vdev_label_write(zio, vd, l, ub_abd,
+            VDEV_UBERBLOCK_OFFSET(vd, n), VDEV_UBERBLOCK_SIZE(vd),
+            vdev_uberblock_sync_done, good_writes,
+            flags | ZIO_FLAG_DONT_PROPAGATE);
+        -> 
+        ---
+        zio_nowait(zio_write_phys(zio, vd,
+            vdev_label_offset(vd->vdev_psize, l, offset),
+            size, buf, ZIO_CHECKSUM_LABEL, done, private,
+            ZIO_PRIORITY_SYNC_WRITE, flags, B_TRUE));
+        ---
+---
+</pre>
+</font>
+</p>
 
 
 </body>
