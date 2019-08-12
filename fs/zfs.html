@@ -19,8 +19,10 @@
 </ul>
 <a href=""#ZIL>ZIL</a>
 <ul>
-<li><a href="#zil_where">Where to log</a>
-<li><a href="#zil_what">What to log</a>
+<li><a href="#lwb_write">lwb write</a>
+<li><a href="#log_record">log record</a>
+<li><a href="#checkpoint">checkpoint</a>
+<li><a href="#checksum_of_zil_block">checksum of the zil block</a>
 </ul>
 <a href="#space_management">space management</a>
 <ul>
@@ -28,10 +30,29 @@
 <li><a href="#original_blocks">original blocks</a>
 </ul>
 
+<a href="#ARC">ARC</a>
+<ul>
+<li><a href="#L2ARC">L2ARC</a>
+<li><a href="#arc_sm">arc state machine</a>
+</ul>
+<a href="#Scrub_and_Resilvering">Scrub and Resilvering</a>
+<ul>
+<li> <a href="#Scrub_and_Resilvering_DTL">DTL</a>
+<li> <a href="#Scrub_and_Resilvering_DSL_Scan">DSL_Scan</a>
+<li> <a href="#Scrub_and_Resilvering_Mirror">Mirror</a>
+</ul>
 <a href="#Talking">Talking</a>
 <ul>
 <li><a href="#self_healing">self healing</a>
 <li><a href="#update_uberblock">update_uberblock</a>
+<li><a href="#dmu_transaction_quiesce">dmu transaction quiescing</a>
+<li><a href="#multiple_dva_of_bp">multiple DVAs of blkptr</a>
+<li><a href="#raidz_dynamic_stripe_layout">raidz dynamic stripe layout</a>
+<li><a href="#Compression">Compression</a>
+<li><a href="#zfs_prefetch">prefetch</a>
+<li><a href="#zfs_ddt">deduplication table</a>
+<li><a href="#zfs_write_throttle">write throttle</a>
+<li><a href="#dynamically_stripes">dynamically stripes</a>
 </ul>
 </font>
 </p>
@@ -463,7 +484,7 @@ Correctness could be acheived without it, but would be "too slow"
 </p>
 
 
-<h3><a name="zil_where">Where</a></h3>
+<h3><a name="lwb_write">lwb write</a></h3>
 <p>
 <font size="2">
 
@@ -488,44 +509,21 @@ typedef struct zil_chain {
 
 </pre>
 
-zil_lwb_write_issue will issue the old lwb and allocate a new one.
+zil_lwb_write_issue will issue the old lwb and allocate a new one.<br/>
+The log record chain are also built up here.
 <pre>
 zil_lwb_write_issue
 ---
     if (BP_GET_CHECKSUM(&lwb->lwb_blk) == ZIO_CHECKSUM_ZILOG2) {
         zilc = (zil_chain_t *)lwb->lwb_buf;
-<font color="red">
-        // This bp here points to the old log block's zil_chain_t
-        // Finally, it will be assigned to the next new log block's
-        //lwb->lwb_blk.
-</font>
         bp = &zilc->zc_next_blk;
     }
     ...
+<font color="blue">
+    // the bp points to the previous log block's zil_chain_t.zc_next_blk
+</font>
     error = zio_alloc_zil(spa, zilog->zl_os, txg, bp, zil_blksz, &slog);
     ...
-    if (error == 0) {
-        ASSERT3U(bp->blk_birth, ==, txg);
-        bp->blk_cksum = lwb->lwb_blk.blk_cksum;
-        bp->blk_cksum.zc_word[ZIL_ZC_SEQ]++;
-
-        /*
-         * Allocate a new log write block (lwb).
-         */
-        nlwb = zil_alloc_lwb(zilog, bp, slog, txg, TRUE);
-    }
-
-    ...
-
-    zilc->zc_pad = 0;
-    zilc->zc_nused = lwb->lwb_nused;
-    zilc->zc_eck.zec_cksum = lwb->lwb_blk.blk_cksum;
-
-    /*
-     * clear unused data for security
-     */
-    bzero(lwb->lwb_buf + lwb->lwb_nused, wsz - lwb->lwb_nused);
-
 <font color="blue">
     // update the lwb_vdev_tree which includes vdevs to flush after lwb write
 </font>
@@ -537,6 +535,7 @@ zil_lwb_write_issue
     zio_nowait(lwb->lwb_write_zio);
 ---
 </pre>
+<br/>
 The lwb_root_zio and lwb_write_zio is created here
 <pre>
 zil_lwb_commit
@@ -563,96 +562,132 @@ The zio pipeline of the zio_rewrite is special.
 
 There is no ZIO_STAGE_DVA_ALLOCATE. So the zil seems not COWed.
 
-Question:
-The log block's checksum is checked in zil_read_log_block
+zil_lwb_write_done would trigger flush on the vdevs involved in this zio
 ---
-    error = arc_read(NULL, zilog->zl_spa, bp, arc_getbuf_func,
-        &abuf, ZIO_PRIORITY_SYNC_READ, zio_flags, &aflags, &zb);
-
-    if (error == 0) {
-        zio_cksum_t cksum = bp->blk_cksum;
-
-        /*
-         * Validate the checksummed log block.
-         *
-         * Sequence numbers should be... sequential.  The checksum
-         * verifier for the next block should be bp's checksum plus 1.
-         *
-         * Also check the log chain linkage and size used.
-         */
-        cksum.zc_word[ZIL_ZC_SEQ]++;
-
-        if (BP_GET_CHECKSUM(bp) == ZIO_CHECKSUM_ZILOG2) {
-            zil_chain_t *zilc = abuf->b_data;
-            char *lr = (char *)(zilc + 1);
-            uint64_t len = zilc->zc_nused - sizeof (zil_chain_t);
-
-            if (bcmp(&cksum, &zilc->zc_next_blk.blk_cksum,
-                sizeof (cksum)) || BP_IS_HOLE(&zilc->zc_next_blk)) {
-                error = SET_ERROR(ECKSUM);
-            } else {
-                ASSERT3U(len, <=, SPA_OLD_MAXBLOCKSIZE);
-                bcopy(lr, dst, len);
-                *end = (char *)dst + len;
-                *nbp = zilc->zc_next_blk;
-            }
-        } 
+    while ((zv = avl_destroy_nodes(t, &cookie)) != NULL) {
+        vdev_t *vd = vdev_lookup_top(spa, zv->zv_vdev);
+        if (vd != NULL)
+            zio_flush(lwb->lwb_root_zio, vd);
+        kmem_free(zv, sizeof (*zv));
+    }
 ---
 
-Not quite understand how to do the check.
+After these flushes are done,
+zil_lwb_flush_vdevs_done
+---
+    while ((zcw = list_head(&lwb->lwb_waiters)) != NULL) {
+        mutex_enter(&zcw->zcw_lock);
+
+        list_remove(&lwb->lwb_waiters, zcw);
+
+        zcw->zcw_lwb = NULL;
+
+        zcw->zcw_zio_error = zio->io_error;
+
+        zcw->zcw_done = B_TRUE;
+<font color="blue">
+        //Notify the waiter in zil_commit_waiter
+</font>
+        cv_broadcast(&zcw->zcw_cv);
+
+        mutex_exit(&zcw->zcw_lock);
+    }
+
+    mutex_exit(&zilog->zl_lock);
+
+<font color="blue">
+    /*
+     * Now that we've written this log block, we have a stable pointer
+     * to the next block in the chain, so it's OK to let the txg in
+     * which we allocated the next block sync.
+     */
+</font>
+    dmu_tx_commit(tx);
+---
+</pre>
+
+Why must we stop the next block's allocation tgx ?<br/>
+<pre>
+Think about following scene,
+
+before zil block lwb_A is written to disk, the zil block lwb_B is allocated in
+tgx T.
+
+lwb_A is issued to disk and concurrently, tgx T is synced.
+
+If the tgx T is synced to disk before the lwb_A and system crash at the moment,
+
+lwb_B's allocation is persistent on disk but noone knows it any more.
+lwb_A is lost
+then we leak t he lwb_B
+</pre>
+
+This could lead to a new scene
+<pre>
+lwb_A is on disk, but the tgx T is not synced successfully before crash,
+isn't lwb_B a invalid block ?
+
+spa_ld_claim_log_blocks will claim these blocks for us.
+</pre>
+
+And there is another amazing facts that we even don't need to do any real
+allocation on disk for the normal case.
+<pre>
+The lwbs we allocated in txg T would be freed finally
+zil_sync
+---
+    while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
+        zh->zh_log = lwb->lwb_blk;
+        if (lwb->lwb_buf != NULL || lwb->lwb_max_txg > txg)
+            break;
+        list_remove(&zilog->zl_lwb_list, lwb);
+<font color="red">
+        zio_free(spa, txg, &lwb->lwb_blk);
+</font>
+        zil_free_lwb(zilog, lwb);
+    }
+
+---
+The zil is per objset and the spacemap's objset is MOS.
+
+
 </pre>
 
 </font>
 </p>
 
-<h3><a name="zil_where">Where</a></h3>
+<h3><a name="log_record">log record</a></h3>
 <p>
 <font size="2">
-What will be recorded in the zil ?
+The zil means zfs intend log.<br/>
+The core here is the <B>intend</B>
+What will be recorded in the zil ?<br/>
+Let's first look at a example
 <pre>
-zil_commit
-  -> zil_commit_impl
-    -> zil_commit_writer
-      -> zil_process_commit_list
-        -> zil_lwb_commit
-        ---
-            if (itx->itx_wr_state == WR_NEED_COPY) {
-                dbuf = lr_buf + reclen;
-                lrcb->lrc_reclen += dnow;
-                if (lrwb->lr_length > dnow)
-                    lrwb->lr_length = dnow;
-                lrw->lr_offset += dnow;
-                lrw->lr_length -= dnow;
-                ZIL_STAT_BUMP(zil_itx_needcopy_count);
-                ZIL_STAT_INCR(zil_itx_needcopy_bytes, dnow);
-            } else {
-                dbuf = NULL;
-                ZIL_STAT_BUMP(zil_itx_indirect_count);
-                ZIL_STAT_INCR(zil_itx_indirect_bytes,
-                    lrw->lr_length);
-            }
-
-            error = zilog->zl_get_data(itx->itx_private,
-                lrwb, dbuf, lwb, lwb->lwb_write_zio);
-
-        ---
-
-zfs_log_write
+zfs_rmdir
 ---
-    if (zilog->zl_logbias == ZFS_LOGBIAS_THROUGHPUT)
-        write_state = WR_INDIRECT;
-    else if (!spa_has_slogs(zilog->zl_spa) &&
-        resid >= zfs_immediate_write_sz)
-        write_state = WR_INDIRECT;
-    else if (ioflag & (FSYNC | FDSYNC))
-        write_state = WR_COPIED;
-    else
-        write_state = WR_NEED_COPY;
+    if (error == 0) {
+        uint64_t txtype = TX_RMDIR;
+        if (flags & FIGNORECASE)
+            txtype |= TX_CI;
+        zfs_log_remove(zilog, tx, txtype, dzp, name, ZFS_NO_OBJECT);
+    }
+
+<font color="blue">
+    // zfs_log_remove will construct the lr_remove_t
+typedef struct {
+    lr_t        lr_common;    /* common portion of log record */
+    uint64_t    lr_doid;    /* obj id of directory */
+    /* name of object to remove follows this */
+} lr_remove_t;
+
+</font>
+
 ---
+</pre>
 
-
-zfs_get_data  //<font color="blue">Get data to generate a TX_WRITE intent log record </font>
-
+The write operation is more complicated.
+<pre>
 The specific header for write intent log is
 
 typedef struct {
@@ -735,6 +770,19 @@ to it (indirect) so that we don't have to write the data twice.
 </pre>
 </ul>
 
+zil_commit
+  -> zil_commit_impl
+    -> zil_commit_writer
+      -> zil_process_commit_list
+        -> zil_lwb_commit
+        ---
+            error = zilog->zl_get_data(itx->itx_private,
+                lrwb, dbuf, lwb, lwb->lwb_write_zio);
+
+        ---
+zfs_get_data  //<font color="blue">Get data to generate a TX_WRITE intent log record </font>
+
+
 </pre>
 </font>
 </p>
@@ -744,6 +792,46 @@ to it (indirect) so that we don't have to write the data twice.
 <p>
 <font size="2">
 <pre>
+
+zil_sync
+---
+    zil_header_t *zh = zil_header_in_syncing_context(zilog);
+    ...
+    while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
+<font color="blue">
+        // update the zil header0->zh_log
+        // this is where we start to replay the log
+</font>
+        zh->zh_log = lwb->lwb_blk;
+        if (lwb->lwb_buf != NULL || <font color="red">lwb->lwb_max_txg > txg</font>)
+            break;
+        list_remove(&zilog->zl_lwb_list, lwb);
+        zio_free(spa, txg, &lwb->lwb_blk);
+        zil_free_lwb(zilog, lwb);
+        ...
+    }
+
+---
+
+The zil_header_t points to os->os_zil_header
+
+dmu_objset_open_impl
+  -> os->os_zil = zil_alloc(os, &os->os_zil_header)
+    -> zilog->zl_header = zh_phys 
+
+
+zil_header_t is parts of the objset_phys_t
+typedef struct objset_phys {
+    dnode_phys_t os_meta_dnode;
+<font color="red">
+    zil_header_t os_zil_header;
+</font>
+    uint64_t os_type;
+    uint64_t os_flags;
+    ...
+    }
+
+
 dmu_objset_sync
 ---
     /*
@@ -753,33 +841,107 @@ dmu_objset_sync
     os->os_phys->os_zil_header = os->os_zil_header;
     zio_nowait(zio)
 ---
-zil_sync
----
-    while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
-<font color="blue">
-        // update the zil header
-</font>
-        zh->zh_log = lwb->lwb_blk;
-        if (lwb->lwb_buf != NULL || <font color="red">lwb->lwb_max_txg > txg</font>)
-            break;
-        list_remove(&zilog->zl_lwb_list, lwb);
-        zio_free(spa, txg, &lwb->lwb_blk);
-        zil_free_lwb(zilog, lwb);
-
-        /*
-         * If we don't have anything left in the lwb list then
-         * we've had an allocation failure and we need to zero
-         * out the zil_header blkptr so that we don't end
-         * up freeing the same block twice.
-         */
-        if (list_head(&zilog->zl_lwb_list) == NULL)
-            BP_ZERO(&zh->zh_log);
-    }
-
----
 </pre>
 </font>
 </p>
+
+<h3><a name="checksum_of_zil_block">checksum of the zil block</a></h3>
+<p>
+<font size="2">
+The zil_chain_t of a zil block contains the next block's blkptr.<br/>
+Due to the previous zil block is always written before the next, it cannot get<br/>
+the correct checksum of the next zil block.<br/>
+How to calculate and verify the checksum of the zil block ?
+<pre>
+The answer is embedded checksum.
+
+See zio_checksum_table
+    {{abd_fletcher_2_native,    abd_fletcher_2_byteswap},
+        NULL, NULL, ZCHECKSUM_FLAG_EMBEDDED, "zilog"},
+
+    {{abd_fletcher_4_native,    abd_fletcher_4_byteswap},
+        NULL, NULL, ZCHECKSUM_FLAG_EMBEDDED, "zilog2"},
+
+ZCHECKSUM_FLAG_EMBEDDED is there.
+
+zio_checksum_error_impl
+---
+    if (ci->ci_flags & ZCHECKSUM_FLAG_EMBEDDED) {
+        zio_cksum_t verifier;
+        size_t eck_offset;
+
+        if (checksum == ZIO_CHECKSUM_ZILOG2) {
+            zil_chain_t zilc;
+            uint64_t nused;
+
+            abd_copy_to_buf(&zilc, abd, sizeof (zil_chain_t));
+
+            eck = zilc.zc_eck;
+            eck_offset = offsetof(zil_chain_t, zc_eck) +
+                offsetof(zio_eck_t, zec_cksum);
+            ...
+        } else {
+            eck_offset = size - sizeof (zio_eck_t);
+            abd_copy_to_buf_off(&eck, abd, eck_offset,
+                sizeof (zio_eck_t));
+            eck_offset += offsetof(zio_eck_t, zec_cksum);
+        }
+        ...
+<font color="red">
+        expected_cksum = eck.zec_cksum;
+</font>
+
+        ci->ci_func[byteswap](abd, size,
+            spa->spa_cksum_tmpls[checksum], &actual_cksum);
+    }
+---
+
+
+When compute the checksum,
+zio_checksum_compute
+---
+    if (ci->ci_flags & ZCHECKSUM_FLAG_EMBEDDED) {
+        zio_eck_t eck;
+        size_t eck_offset;
+
+        bzero(&saved, sizeof (zio_cksum_t));
+
+        if (checksum == ZIO_CHECKSUM_ZILOG2) {
+            zil_chain_t zilc;
+            abd_copy_to_buf(&zilc, abd, sizeof (zil_chain_t));
+
+            size = P2ROUNDUP_TYPED(zilc.zc_nused, ZIL_MIN_BLKSZ,
+                uint64_t);
+            eck = zilc.zc_eck;
+            eck_offset = offsetof(zil_chain_t, zc_eck);
+        } else {
+            eck_offset = size - sizeof (zio_eck_t);
+            abd_copy_to_buf_off(&eck, abd, eck_offset,
+                sizeof (zio_eck_t));
+        }
+        ...
+        ci->ci_func[0](abd, size, spa->spa_cksum_tmpls[checksum],
+            &cksum);
+        ...
+        abd_copy_from_buf_off(abd, &cksum,
+            eck_offset + offsetof(zio_eck_t, zec_cksum),
+            sizeof (zio_cksum_t));
+    } else {
+        saved = bp->blk_cksum;
+        ci->ci_func[0](abd, size, spa->spa_cksum_tmpls[checksum],
+            &cksum);
+        if (BP_USES_CRYPT(bp) && BP_GET_TYPE(bp) != DMU_OT_OBJSET)
+            zio_checksum_handle_crypt(&cksum, &saved, insecure);
+        bp->blk_cksum = cksum;
+    }
+
+---
+
+</pre>
+</font>
+</p>
+
+
 
 <h2><a name="space_management">space management</a></h2>
 
@@ -805,6 +967,9 @@ Description: log base 2 of the metaslab size
 
 <B><font color="red">
 The objset of the object above is the MOS (meta object set)
+plus,
+every spacemap of a metaslab is an object (dnode)
+      ^^^^^^^^                     ^^^^^^
 </font></B>
 
 Look at vdev_metaslab_init
@@ -857,6 +1022,58 @@ Look at the spa_sync_iterate_to_convergence
     } while (<font color="red">dmu_objset_is_dirty(mos, txg)</font>);
 
 ---
+
+<B>
+Here is a question answered by Matthew Ahrens which is the core developer of zfs
+</B>
+Q: Space map store on disk as dnode, writing dnode blocks again needs allocation and free, 
+   is this a feedback loop and how to break this cycling dependence ?
+   
+A: Yes, we call this "sync to convergence". The cycle is broken by overwriting the block in place, 
+                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   thus not requiring any change of the allocation information. This is safe since we are only
+   overwriting blocks that were allocated in the current txg, so if we crash it's as if nothing happened.
+
+
+Where does the 'broken by overwriting the block in place' happen ?
+
+
+Aha, it is the magic <B>zio_write_compress</B>
+
+zio_write_compress
+---
+<font color="blue">
+    /*
+     * The final pass of spa_sync() must be all rewrites, but the first
+     * few passes offer a trade-off: allocating blocks defers convergence,
+     * but newly allocated blocks are sequential, so they can be written
+     * to disk faster.  Therefore, we allow the first few passes of
+     * spa_sync() to allocate new blocks, but force rewrites after that.
+     * There should only be a handful of blocks after pass 1 in any case.
+     */
+</font>
+    if (!BP_IS_HOLE(bp) && bp->blk_birth == zio->io_txg &&
+        BP_GET_PSIZE(bp) == psize &&
+        pass >= zfs_sync_pass_rewrite) {
+        enum zio_stage gang_stages = zio->io_pipeline & ZIO_GANG_STAGES;
+
+        zio->io_pipeline = ZIO_REWRITE_PIPELINE | gang_stages;
+        zio->io_flags |= ZIO_FLAG_IO_REWRITE;
+    } 
+---
+
+There are two critical conditions
+<ul>
+<li> bp->blk_birth == zio->io_txg
+     This indicates that this bp is born in this txg
+
+<li> pass >= zfs_sync_pass_rewrite
+     Note, the operator here is <B>GREATER OR EQUAL</B>. The comment has
+     explained this.
+    The zfs_sync_pass_rewrite is 2
+
+</ul>
+
 </pre>
 
 </font>
@@ -914,6 +1131,1032 @@ dsl_dataset_block_kill
     }
     ---
 </pre>
+
+</font>
+</p>
+
+
+<h2><a name="ARC">ARC</a></h2>
+<p>
+<font size="2">
+<pre>
+
+                                  c
+                  ________________^________________
+                 /                                 \
+     MRU_Ghost          MRU               MFU           MFU_Ghost
+|_ _ _ _ _ _ _ _ |________________|________________|_ _ _ _ _ _ _ _ |
+                  \_______ _______/
+                          v
+                          p
+
+MRU          Most Recently Used (arc header and data)
+MRU_Ghost    Most Recently Used (arc header, <font color="red">no data</font>)
+MFU          Most Frequently Used (arc header and data)
+MFU_Ghost    Most Frequently Used (arc header, <font color="red">no data</font>)
+
+The initial state of c and p
+   c_min = MAX(1/32 of all mem, 64Mb)
+   c_max = MAX(3/4 of all mem, all but 1Gb)
+   c = MIN(1/8 physmem, 1/8 VM size)
+   p = arc_c / 2
+
+
+The core of the ARC is that <font color="red">adapts c ( cache size ) and p ( used pages in MRU ) in response to workloads </font>
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  c
+                                  
+     MRU_Ghost          MRU               MFU           MFU_Ghost
+|_ _ _ _ _ _ _ _ |________________|________________|_ _ _ _ _ _ _ _ |
+                         p        |     c-p
+                                     |   
+-9- - -8- - -7- - [5] - [3] - [0] |  [9] - [8] - [7] - -6- - -3- - -2-
+                                  |    
+            Acess time              |           Access frequency
+                                  |
+
+When evicting during cache insert, then:
+<ul>
+<li> Inserting in MRU & MRU < p then arc_evict(MFU)
+<li> Inserting in MRU & MRU > p then arc_evict(MRU)
+<li> Inserting in MFU & MFU < (c-p) then arc_evict(MRU)
+<li> Inserting in MFU & MFU > (c-p) then arc_evict(MFU) 
+</ul>
+<font color="red">Try to keep MRU close to p</font>
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When adding new content:
+<ul>
+<li> If (hit in MRU_Ghost) then increase p
+<li> If (hit in MFU_Ghost) then decrease p
+<li> If (arc_size within (2*maxblocksize) of c) then increase c
+</ul>
+
+When shrinking or reclaiming: 
+<ul>
+<li> If (MRU > p) then arc_evict(MRU)
+<li> If (MRU+MRU_Ghost > c) then arc_evict(MRU_Ghost)
+<li> If (arc_size > c) then arc_evict(MFU)
+<li> If (arc_size + Ghosts > 2*c) then arc_evict(MFU_Ghost)
+</ul>
+
+<B>In conclusion,</B>
+<ul>
+<li> The bigger the <B><font color="red">MRU</font></B> is, the higher the hit rate of <B><font color="red">second access</font></B>
+<li> The bigger the <B><font color="red">MFU</font></B> is, the higher the hit rate of <B><font color="red">third access</font></B>
+</ul>
+</pre>
+</p>
+
+dmu_tx_try_assign
+  -> dsl_dir_tempreserve_space
+    -> arc_tempreserve_space
+<font color="blue">
+// Throttle writes when the amount of dirty data in the cache
+// gets too large.  We try to keep the cache less than half full
+// of dirty blocks so that our sync times don't grow too large.
+
+</font>
+
+<h3><a name="L2ARC">L2ARC</a></h3>
+<p>
+<font size="2">
+<pre>
+
+ 
+                  +-----------------------+
+                  |         ARC           |
+                  +-----------------------+
+                     |         ^     ^
+                     |         |     |
+       l2arc_feed_thread()    arc_read()
+                     |         |     |
+                     |  l2arc read   |
+                     V         |     |
+                +---------------+    |
+                |     L2ARC     |    |
+                +---------------+    |
+                    |    ^           |
+           l2arc_write() |           |
+                    |    |           |
+                    V    |           |
+                  +-------+      +-------+
+                  | vdev  |      | vdev  |
+                  | cache |      | cache |
+                  +-------+      +-------+
+                  +=========+     .-----.
+                  :  L2ARC  :    |-_____-|
+                  : devices :    | Disks |
+                  +=========+    `-_____-'
+ 
+
+
+           head -->                        tail
+            +---------------------+----------+
+    ARC_mfu |:::::#:::::::::::::::|o#o###o###|-->.   # already on L2ARC
+            +---------------------+----------+   |   o L2ARC eligible
+    ARC_mru |:#:::::::::::::::::::|#o#ooo####|-->|   : ARC buffer
+            +---------------------+----------+   |
+                 15.9 Gbytes      ^ 32 Mbytes    |
+                               headroom          |
+                                          l2arc_feed_thread()
+                                                 |
+                     l2arc write hand <--[oooo]--'
+                             |           8 Mbyte
+                             |          write max
+                             V
+          +==============================+
+    L2ARC dev |####|#|###|###|    |####| ... |
+              +==============================+
+                         32 Gbytes
+
+
+Note:
+  The main role of this cache is to boost the performance of random read workloads.
+  The L2ARC does not store dirty content, it never needs to flush write buffers
+  back to disk based storage.
+  ITOW, we needn't save any metadata for the mapping on disk
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  But only save them in memory.
+
+</pre>
+How does L2ARC only select the clean arc buf ?
+<pre>
+  Note that buffers can be in one of 6 states:
+     ARC_anon    - anonymous (discussed below)
+     ARC_mru        - recently used, currently cached
+     ARC_mru_ghost    - recentely used, no longer in cache
+     ARC_mfu        - frequently used, currently cached
+     ARC_mfu_ghost    - frequently used, no longer in cache
+     ARC_l2c_only    - exists in L2ARC but not other states
+
+Anonymous buffers are buffers that are not associated with
+a DVA.  These are buffers that hold dirty block copies
+before they are written to stable storage.  By definition,
+they are "ref'd" and are considered part of arc_mru
+that cannot be freed.  Generally, they will acquire a DVA
+as they are written and migrate onto the arc_mru list.
+
+The l2arc only cares about the arc_mru and arc_mfu.
+
+static multilist_sublist_t *
+l2arc_sublist_lock(int list_num)
+{
+    multilist_t *ml = NULL;
+    unsigned int idx;
+
+    ASSERT(list_num >= 0 && list_num < L2ARC_FEED_TYPES);
+
+    switch (list_num) {
+    case 0:
+        ml = arc_mfu->arcs_list[ARC_BUFC_METADATA];
+        break;
+    case 1:
+        ml = arc_mru->arcs_list[ARC_BUFC_METADATA];
+        break;
+    case 2:
+        ml = arc_mfu->arcs_list[ARC_BUFC_DATA];
+        break;
+    case 3:
+        ml = arc_mru->arcs_list[ARC_BUFC_DATA];
+        break;
+    default:
+        return (NULL);
+    }
+
+    /*
+     * Return a randomly-selected sublist. This is acceptable
+     * because the caller feeds only a little bit of data for each
+     * call (8MB). Subsequent calls will result in different
+     * sublists being selected.
+     */
+    idx = multilist_get_random_index(ml);
+    return (multilist_sublist_lock(ml, idx));
+}
+</pre>
+
+<B>Let's look at how does the l2arc write data out</B>
+<pre>
+l2arc_write_buffers
+---
+    for (int try = 0; try < L2ARC_FEED_TYPES; try++) {
+        multilist_sublist_t *mls = l2arc_sublist_lock(try);
+        uint64_t passed_sz = 0;
+
+         * L2ARC fast warmup.
+         *
+         * Until the ARC is warm and starts to evict, read from the
+         * head of the ARC lists rather than the tail.
+         */
+        if (arc_warm == B_FALSE)
+            hdr = multilist_sublist_head(mls);
+        else
+            hdr = multilist_sublist_tail(mls);
+
+        headroom = target_sz * l2arc_headroom;
+        if (zfs_compressed_arc_enabled)
+            headroom = (headroom * l2arc_headroom_boost) / 100;
+
+        for (; hdr; hdr = hdr_prev) {
+            kmutex_t *hash_lock;
+            abd_t *to_write = NULL;
+
+            if (arc_warm == B_FALSE)
+                hdr_prev = multilist_sublist_next(mls, hdr);
+            else
+                hdr_prev = multilist_sublist_prev(mls, hdr);
+<font color="blue">
+            // HASH Lock
+</font>
+            hash_lock = HDR_LOCK(hdr);
+            if (!mutex_tryenter(hash_lock)) {
+                /*
+                 * Skip this buffer rather than waiting.
+                 */
+                continue;
+            }
+
+            passed_sz += HDR_GET_LSIZE(hdr);
+            if (passed_sz > headroom) {
+                /*
+                 * Searched too far.
+                 */
+                mutex_exit(hash_lock);
+                break;
+            }
+
+            if (!l2arc_write_eligible(guid, hdr)) {
+                mutex_exit(hash_lock);
+                continue;
+            }
+            ...
+            if (pio == NULL) {
+                /*
+                 * Insert a dummy header on the buflist so
+                 * l2arc_write_done() can find where the
+                 * write buffers begin without searching.
+                 */
+                mutex_enter(&dev->l2ad_mtx);
+                list_insert_head(&dev->l2ad_buflist, head);
+                mutex_exit(&dev->l2ad_mtx);
+
+                cb = kmem_alloc(
+                    sizeof (l2arc_write_callback_t), KM_SLEEP);
+                cb->l2wcb_dev = dev;
+                cb->l2wcb_head = head;
+                pio = zio_root(spa, l2arc_write_done, cb,
+                    ZIO_FLAG_CANFAIL);
+            }
+
+            hdr->b_l2hdr.b_dev = dev;
+            hdr->b_l2hdr.b_hits = 0;
+
+            hdr->b_l2hdr.b_daddr = dev->l2ad_hand;
+            arc_hdr_set_flags(hdr, ARC_FLAG_HAS_L2HDR);
+
+            mutex_enter(&dev->l2ad_mtx);
+            list_insert_head(&dev->l2ad_buflist, hdr);
+            mutex_exit(&dev->l2ad_mtx);
+
+            (void) zfs_refcount_add_many(&dev->l2ad_alloc,
+                arc_hdr_size(hdr), hdr);
+
+            wzio = zio_write_phys(pio, dev->l2ad_vdev,
+                hdr->b_l2hdr.b_daddr, asize, to_write,
+                ZIO_CHECKSUM_OFF, NULL, hdr,
+                ZIO_PRIORITY_ASYNC_WRITE,
+                ZIO_FLAG_CANFAIL, B_FALSE);
+
+            ...
+            mutex_exit(hash_lock);
+
+            (void) zio_nowait(wzio);
+        }
+
+        multilist_sublist_unlock(mls);
+
+        if (full == B_TRUE)
+            break;
+    }
+
+    ...
+    dev->l2ad_writing = B_TRUE;
+    (void) zio_wait(pio);
+    dev->l2ad_writing = B_FALSE;
+
+    return (write_asize);
+}
+
+
+</pre>
+<B>How does the data in l2arc read in</B><br/>
+<pre>
+arc_read
+---
+        if (HDR_HAS_L2HDR(hdr) &&
+            (vd = hdr->b_l2hdr.b_dev->l2ad_vdev) != NULL) {
+            devw = hdr->b_l2hdr.b_dev->l2ad_writing;
+            addr = hdr->b_l2hdr.b_daddr;
+            /*
+             * Lock out L2ARC device removal.
+             */
+            if (vdev_is_dead(vd) ||
+                !spa_config_tryenter(spa, SCL_L2ARC, vd, RW_READER))
+                vd = NULL;
+        }
+        ...
+        if (vd != NULL && l2arc_ndev != 0 && !(l2arc_norw && devw)) {
+            /*
+             * Read from the L2ARC if the following are true:
+             * 1. The L2ARC vdev was previously cached.
+             * 2. This buffer still has L2ARC metadata.
+             * 3. This buffer isn't currently writing to the L2ARC.
+             * 4. The L2ARC entry wasn't evicted, which may
+             *    also have invalidated the vdev.
+             * 5. This isn't prefetch and l2arc_noprefetch is set.
+             */
+            if (HDR_HAS_L2HDR(hdr) &&
+                !HDR_L2_WRITING(hdr) && !HDR_L2_EVICTED(hdr) &&
+                !(l2arc_noprefetch && HDR_PREFETCH(hdr))) {
+                l2arc_read_callback_t *cb;
+                abd_t *abd;
+                uint64_t asize;
+
+                atomic_inc_32(&hdr->b_l2hdr.b_hits);
+
+                cb = kmem_zalloc(sizeof (l2arc_read_callback_t),
+                    KM_SLEEP);
+                cb->l2rcb_hdr = hdr;
+                cb->l2rcb_bp = *bp;
+                cb->l2rcb_zb = *zb;
+                cb->l2rcb_flags = zio_flags;
+
+                asize = vdev_psize_to_asize(vd, size);
+                if (asize != size) {
+                    abd = abd_alloc_for_io(asize,
+                        HDR_ISTYPE_METADATA(hdr));
+                    cb->l2rcb_abd = abd;
+                } else {
+                    abd = hdr_abd;
+                }
+
+                /*
+                 * l2arc read.  The SCL_L2ARC lock will be
+                 * released by l2arc_read_done().
+                 * Issue a null zio if the underlying buffer
+                 * was squashed to zero size by compression.
+                 */
+                rzio = zio_read_phys(pio, vd, addr,
+                    asize, abd,
+                    <font color="red">ZIO_CHECKSUM_OFF,</font>
+                    l2arc_read_done, cb, priority,
+                    zio_flags | ZIO_FLAG_DONT_CACHE |
+                    ZIO_FLAG_CANFAIL |
+                    ZIO_FLAG_DONT_PROPAGATE |
+                    ZIO_FLAG_DONT_RETRY, B_FALSE);
+                acb->acb_zio_head = rzio;
+
+                if (hash_lock != NULL)
+                    mutex_exit(hash_lock);
+
+                if (*arc_flags & ARC_FLAG_NOWAIT) {
+                    zio_nowait(rzio);
+                    goto out;
+                }
+
+                if (zio_wait(rzio) == 0)
+                    goto out;
+
+                /* l2arc read error; goto zio_read() */
+                if (hash_lock != NULL)
+                    mutex_enter(hash_lock);
+            } 
+---
+
+
+l2arc_read_done
+---
+    zio->io_bp_copy = cb->l2rcb_bp;    /* XXX fix in L2ARC 2.0    */
+    zio->io_bp = &zio->io_bp_copy;    /* XXX fix in L2ARC 2.0    */
+
+<font>
+    // checksum is checked here
+</font>
+    valid_cksum = arc_cksum_is_equal(hdr, zio);
+
+    /*
+     * b_rabd will always match the data as it exists on disk if it is
+     * being used. Therefore if we are reading into b_rabd we do not
+     * attempt to untransform the data.
+     */
+    if (valid_cksum && !using_rdata)
+        tfm_error = l2arc_untransform(zio, cb);
+
+    if (valid_cksum && tfm_error == 0 && zio->io_error == 0 &&
+        !HDR_L2_EVICTED(hdr)) {
+        mutex_exit(hash_lock);
+        zio->io_private = hdr;
+<font color="red">
+        arc_read_done(zio);
+</font>
+    } else {
+        mutex_exit(hash_lock);
+        /*
+         * Buffer didn't survive caching.  Increment stats and
+         * reissue to the original storage device.
+         */
+         ...
+        /*
+         * If there's no waiter, issue an async i/o to the primary
+         * storage now.  If there *is* a waiter, the caller must
+         * issue the i/o in a context where it's OK to block.
+         */
+        if (zio->io_waiter == NULL) {
+            zio_t *pio = zio_unique_parent(zio);
+            void *abd = (using_rdata) ?
+                hdr->b_crypt_hdr.b_rabd : hdr->b_l1hdr.b_pabd;
+
+            zio_nowait(zio_read(pio, zio->io_spa, zio->io_bp,
+                abd, zio->io_size, arc_read_done,
+                hdr, zio->io_priority, cb->l2rcb_flags,
+                &cb->l2rcb_zb));
+        }
+    }
+
+
+---
+</pre>
+ </font>
+</p>
+
+<h3><a name="arc_sm">arc state machine</a></h3>
+<p>
+<font size="2">
+There are following state for an arc buffer,
+<pre>
+ARC_anon        - anonymous (not associated with a DVA,
+                  hold dirty block copies)
+ARC_mru            - recently used, currently cached
+ARC_mru_ghost    - recentely used, no longer in cache
+ARC_mfu            - frequently used, currently cached
+ARC_mfu_ghost    - frequently used, no longer in cache
+ARC_l2c_only    - exists in L2ARC but not other states
+</pre>
+
+Another thing we need to know is the method of organizing arc_buf_hdr_t.
+<pre>
+buf_hash_find
+---
+    const dva_t *dva = BP_IDENTITY(bp);
+    uint64_t birth = BP_PHYSICAL_BIRTH(bp);
+    uint64_t idx = BUF_HASH_INDEX(spa, dva, birth);
+    kmutex_t *hash_lock = BUF_HASH_LOCK(idx);
+    arc_buf_hdr_t *hdr;
+
+    mutex_enter(hash_lock);
+    for (hdr = buf_hash_table.ht_table[idx]; hdr != NULL;
+        hdr = hdr->b_hash_next) {
+        if (HDR_EQUAL(spa, dva, birth, hdr)) {
+            *lockp = hash_lock;
+            return (hdr);
+        }
+    }
+    mutex_exit(hash_lock);
+    *lockp = NULL;
+    return (NULL);
+---
+
+The buf_hash_table.ht_table is a hash table.
+The hash_lock is also a array contains locks.
+
+<font color="red">
+#define    BUF_LOCKS 8192
+</font>
+typedef struct buf_hash_table {
+    uint64_t ht_mask;
+    arc_buf_hdr_t **ht_table;
+    struct ht_lock ht_locks[BUF_LOCKS];
+} buf_hash_table_t;
+
+This is a very common implementation is zfs.
+</pre>
+<br/>
+The entry of the arc state machine is arc_access.<br/>
+Let's first look at it.
+<pre>
+All of the policy that how does the arc state machine run is here.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+arc_access
+---
+    if (hdr->b_l1hdr.b_state == arc_anon) {
+<font color="blue">
+        /*
+         * This buffer is not in the cache, and does not
+         * appear in our "ghost" list.  Add the new buffer
+         * to the MRU state.
+         */
+</font>
+        hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+        arc_change_state(arc_mru, hdr, hash_lock);
+
+    } else if (hdr->b_l1hdr.b_state == arc_mru) {
+        now = ddi_get_lbolt();
+        ...
+<font color="blue">
+        /*
+         * This buffer has been "accessed" only once so far,
+         * but it is still in the cache. Move it to the MFU
+         * state.
+         */
+
+        #define    ARC_MINTIME    (hz>>4) /* 62 ms */
+</font>
+        if (ddi_time_after(now, hdr->b_l1hdr.b_arc_access +
+            ARC_MINTIME)) {
+            /*
+             * More than 125ms have passed since we
+             * instantiated this buffer.  Move it to the
+             * most frequently used state.
+             */
+            hdr->b_l1hdr.b_arc_access = now;
+            arc_change_state(arc_mfu, hdr, hash_lock);
+<font color="red">
+            // Note here, it is ddi_time_after here,
+            // The arc buf is only moved to mfu after ARC_MINTIME
+                                                ^^^^^
+</font>
+        }
+        atomic_inc_32(&hdr->b_l1hdr.b_mru_hits);
+    } else if (hdr->b_l1hdr.b_state == arc_mru_ghost) {
+        arc_state_t    *new_state;
+
+<font color="blue">
+        /*
+         * This buffer has been "accessed" recently, but
+         * was evicted from the cache.  Move it to the
+         * MFU state.
+         */
+</font>
+        if (HDR_PREFETCH(hdr) || HDR_PRESCIENT_PREFETCH(hdr)) {
+            ...
+        } else {
+            new_state = arc_mfu;
+        }
+
+        hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+        arc_change_state(new_state, hdr, hash_lock);
+
+        atomic_inc_32(&hdr->b_l1hdr.b_mru_ghost_hits);
+    } else if (hdr->b_l1hdr.b_state == arc_mfu) {
+<font color="blue">
+        /*
+         * This buffer has been accessed more than once and is
+         * still in the cache.  Keep it in the MFU state.
+         *
+         * NOTE: an add_reference() that occurred when we did
+         * the arc_read() will have kicked this off the list.
+         * If it was a prefetch, we will explicitly move it to
+         * the head of the list now.
+         */
+</font>
+        atomic_inc_32(&hdr->b_l1hdr.b_mfu_hits);
+        hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+    } else if (hdr->b_l1hdr.b_state == arc_mfu_ghost) {
+        arc_state_t    *new_state = arc_mfu;
+<font color="blue">
+        /*
+         * This buffer has been accessed more than once but has
+         * been evicted from the cache.  Move it back to the
+         * MFU state.
+         */
+</font>>
+        hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+        arc_change_state(new_state, hdr, hash_lock);
+        atomic_inc_32(&hdr->b_l1hdr.b_mfu_ghost_hits);
+    } else if (hdr->b_l1hdr.b_state == arc_l2c_only) {
+<font color="blue">
+        /*
+         * This buffer is on the 2nd Level ARC.
+         */
+</font>
+        hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+        arc_change_state(arc_mfu, hdr, hash_lock);
+    } else {
+        cmn_err(CE_PANIC, "invalid arc state 0x%p",
+            hdr->b_l1hdr.b_state);
+    }
+---
+</pre>
+<br/>
+Where to push the arc state machine forward ?
+<ul> arc_buf_access
+<pre>
+dbuf_hold_impl_arg
+  -> arc_buf_access
+
+This should be the hotest one.
+</pre>
+<li> arc_read
+<li> arc_write_done
+</ul>
+</font>
+</p>
+
+
+<h2><a name="Scrub_and_Resilvering">Scrub and Resilvering</a></h2>
+<p>
+<font size="2">
+
+
+
+</font>
+</p>
+
+<h3><a name="Scrub_and_Resilvering_DTL">DTL</a></h3>
+<p>
+<font size="2">
+The DTL means 'Dirty Time Logging' which is based on the blkptr_t.blk_birth and the txg.<br/>
+<pre>
+For each drive in a storage pool, ZFS keeps track of which transaction groups have been applied,
+so if a drive is offline for a period of time the same birth time comparison used in replication
+is used to identify what parts of the file system changes need to be applied to the drive when
+it comes back online
+</pre>
+<font color="red">
+The most important thing here is that the DTL will not be written on disk but kept in memory.<br/>
+</font>
+Look at the code,
+<ul>
+<li> when a new devie is added
+<pre>
+spa_vdev_attach
+---
+<font color="blue">
+    /*
+     * Set newvd's DTL to [TXG_INITIAL, dtl_max_txg) so that we account
+     * for any dmu_sync-ed blocks.  It will propagate upward when
+     * spa_vdev_exit() calls vdev_dtl_reassess().
+     */
+</font>
+    dtl_max_txg = txg + TXG_CONCURRENT_STATES;
+
+    vdev_dtl_dirty(newvd, DTL_MISSING, TXG_INITIAL,
+        dtl_max_txg - TXG_INITIAL);
+---
+</pre>
+<li> IO runtime
+<pre>
+zio_done
+  -> vdev_stat_update
+---
+    if (spa->spa_load_state == SPA_LOAD_NONE &&
+        type == ZIO_TYPE_WRITE && txg != 0 &&
+        (!(flags & ZIO_FLAG_IO_REPAIR) ||
+        (flags & ZIO_FLAG_SCAN_THREAD) ||
+        spa->spa_claiming)) {
+<font color="blue">
+        /*
+         * This is either a normal write (not a repair), or it's
+         * a repair induced by the scrub thread, or it's a repair
+         * made by zil_claim() during spa_load() in the first txg.
+         * In the normal case, we commit the DTL change in the same
+         * txg as the block was born.  In the scrub-induced repair
+         * case, we know that scrubs run in first-pass syncing context,
+         * so we commit the DTL change in spa_syncing_txg(spa).
+         * In the zil_claim() case, we commit in spa_first_txg(spa).
+         *
+         * We currently do not make DTL entries for failed spontaneous
+         * self-healing writes triggered by normal (non-scrubbing)
+         * reads, because we have no transactional context in which to
+         * do so -- and it's not clear that it'd be desirable anyway.
+         */
+</font>
+        if (vd->vdev_ops->vdev_op_leaf) {
+            uint64_t commit_txg = txg;
+            if (flags & ZIO_FLAG_SCAN_THREAD) {
+                vdev_dtl_dirty(vd, DTL_SCRUB, txg, 1);
+                commit_txg = spa_syncing_txg(spa);
+            } else if (spa->spa_claiming) {
+                ASSERT(flags & ZIO_FLAG_IO_REPAIR);
+                commit_txg = spa_first_txg(spa);
+            }
+            if (vdev_dtl_contains(vd, DTL_MISSING, txg, 1))
+                return;
+            for (pvd = vd; pvd != rvd; pvd = pvd->vdev_parent)
+                vdev_dtl_dirty(pvd, DTL_PARTIAL, txg, 1);
+            vdev_dirty(vd->vdev_top, VDD_DTL, vd, commit_txg);
+        }
+        if (vd != rvd)
+            vdev_dtl_dirty(vd, DTL_MISSING, txg, 1);
+    }
+
+---
+</pre>
+</ul>
+</pre>
+</font>
+</p>
+
+
+
+<h3><a name="Scrub_and_Resilvering_DSL_Scan">DSL_Scan</a></h3>
+<p>
+<font size="2">
+
+The core of the scan is dsl_scan_visitbp.
+<pre>
+dsl_scan_visitbp
+  -> dsl_scan_recurse
+
+---
+<font color="red">
+    if (BP_GET_LEVEL(bp) > 0) {
+</font>
+        arc_flags_t flags = ARC_FLAG_WAIT;
+        int i;
+        blkptr_t *cbp;
+        int epb = BP_GET_LSIZE(bp) >> SPA_BLKPTRSHIFT;
+        arc_buf_t *buf;
+
+        err = arc_read(NULL, dp->dp_spa, bp, arc_getbuf_func, &buf,
+            ZIO_PRIORITY_SCRUB, zio_flags, &flags, zb);
+        if (err) {
+            scn->scn_phys.scn_errors++;
+            return (err);
+        }
+        for (i = 0, cbp = buf->b_data; i < epb; i++, cbp++) {
+            zbookmark_phys_t czb;
+
+            SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
+                zb->zb_level - 1,
+                zb->zb_blkid * epb + i);
+<font color="red">
+            dsl_scan_visitbp(cbp, &czb, dnp,
+                ds, scn, ostype, tx);
+</font>
+        }
+        arc_buf_destroy(buf, &buf);
+
+<font color="red">
+    } else if (BP_GET_TYPE(bp) == DMU_OT_DNODE) {
+</font>
+        arc_flags_t flags = ARC_FLAG_WAIT;
+        dnode_phys_t *cdnp;
+        int i;
+        int epb = BP_GET_LSIZE(bp) >> DNODE_SHIFT;
+        arc_buf_t *buf;
+        ...
+        err = arc_read(NULL, dp->dp_spa, bp, arc_getbuf_func, &buf,
+            ZIO_PRIORITY_SCRUB, zio_flags, &flags, zb);
+        if (err) {
+            scn->scn_phys.scn_errors++;
+            return (err);
+        }
+        for (i = 0, cdnp = buf->b_data; i < epb;
+            i += cdnp->dn_extra_slots + 1,
+            cdnp += cdnp->dn_extra_slots + 1) {
+<font color="red">
+            dsl_scan_visitdnode(scn, ds, ostype,
+                cdnp, zb->zb_blkid * epb + i, tx);
+</font>
+        }
+
+        arc_buf_destroy(buf, &buf);
+    } else if (BP_GET_TYPE(bp) == DMU_OT_OBJSET) {
+        arc_flags_t flags = ARC_FLAG_WAIT;
+        objset_phys_t *osp;
+        arc_buf_t *buf;
+
+        err = arc_read(NULL, dp->dp_spa, bp, arc_getbuf_func, &buf,
+            ZIO_PRIORITY_SCRUB, zio_flags, &flags, zb);
+        if (err) {
+            scn->scn_phys.scn_errors++;
+            return (err);
+        }
+
+        osp = buf->b_data;
+
+        dsl_scan_visitdnode(scn, ds, osp->os_type,
+            &osp->os_meta_dnode, DMU_META_DNODE_OBJECT, tx);
+        ...
+        arc_buf_destroy(buf, &buf);
+    }
+---
+
+In one word, it will recurr into the tree and check every bp.
+
+dsl_scan_visitbp
+  -> scan_funcs[scn->scn_phys.scn_func](dp, bp, zb);
+     dsl_scan_scrub_cb
+    ---
+    if (phys_birth <= scn->scn_phys.scn_min_txg ||
+        phys_birth >= scn->scn_phys.scn_max_txg) {
+        count_block(scn, dp->dp_blkstats, bp);
+        return (0);
+    }
+
+    if (scn->scn_phys.scn_func == POOL_SCAN_SCRUB) {
+        zio_flags |= ZIO_FLAG_SCRUB;
+        needs_io = B_TRUE;
+    } else {
+        zio_flags |= ZIO_FLAG_RESILVER;
+        needs_io = B_FALSE;
+    }
+    ...
+    for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+        const dva_t *dva = &bp->blk_dva[d];
+
+        /*
+         * Keep track of how much data we've examined so that
+         * zpool(1M) status can make useful progress reports.
+         */
+        scn->scn_phys.scn_examined += DVA_GET_ASIZE(dva);
+        spa->spa_scan_pass_exam += DVA_GET_ASIZE(dva);
+
+<font color="red">
+        /* if it's a resilver, this may not be in the target range */
+</font>
+        if (!needs_io)
+            needs_io = dsl_scan_need_resilver(spa, dva, psize,
+                phys_birth);
+    }
+
+    if (needs_io && !zfs_no_scrub_io) {
+        dsl_scan_enqueue(dp, bp, zio_flags, zb);
+    } else {
+        count_block(scn, dp->dp_blkstats, bp);
+    }
+    ---
+
+dsl_scan_enqueue
+---
+    if (!dp->dp_scan->scn_is_sorted || BP_IS_GANG(bp)) {
+        scan_exec_io(dp, bp, zio_flags, zb, NULL);
+        return;
+    }
+
+    for (int i = 0; i < BP_GET_NDVAS(bp); i++) {
+        dva_t dva;
+        vdev_t *vdev;
+
+        dva = bp->blk_dva[i];
+        vdev = vdev_lookup_top(spa, DVA_GET_VDEV(&dva));
+
+        mutex_enter(&vdev->vdev_scan_io_queue_lock);
+        if (vdev->vdev_scan_io_queue == NULL)
+            vdev->vdev_scan_io_queue = scan_io_queue_create(vdev);
+        scan_io_queue_insert(vdev->vdev_scan_io_queue, bp,
+            i, zio_flags, zb);
+        mutex_exit(&vdev->vdev_scan_io_queue_lock);
+    }
+---
+
+scan_exec_io
+---
+    if (queue == NULL) {
+        mutex_enter(&spa->spa_scrub_lock);
+        while (spa->spa_scrub_inflight >= scn->scn_maxinflight_bytes)
+            cv_wait(&spa->spa_scrub_io_cv, &spa->spa_scrub_lock);
+        spa->spa_scrub_inflight += BP_GET_PSIZE(bp);
+        mutex_exit(&spa->spa_scrub_lock);
+    } else {
+        kmutex_t *q_lock = &queue->q_vd->vdev_scan_io_queue_lock;
+
+        mutex_enter(q_lock);
+        while (queue->q_inflight_bytes >= queue->q_maxinflight_bytes)
+            cv_wait(&queue->q_zio_cv, q_lock);
+        queue->q_inflight_bytes += BP_GET_PSIZE(bp);
+        mutex_exit(q_lock);
+    }
+
+    count_block(scn, dp->dp_blkstats, bp);
+    zio_nowait(zio_read(scn->scn_zio_root, spa, bp, data, size,
+        dsl_scan_scrub_done, queue, ZIO_PRIORITY_SCRUB, zio_flags, zb));
+
+---
+
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="Scrub_and_Resilvering_Mirror">Mirror</a></h3>
+<p>
+<font size="2">
+
+vdev_mirror_io_start
+---
+    if (zio->io_type == ZIO_TYPE_READ) {
+        if (zio->io_bp != NULL &&
+            (zio->io_flags & ZIO_FLAG_SCRUB) && !mm->mm_resilvering) {
+<font color="blue">
+            /*
+             * For scrubbing reads (if we can verify the
+             * checksum here, as indicated by io_bp being
+             * non-NULL) we need to allocate a read buffer for
+             * each child and issue reads to all children.  If
+             * any child succeeds, it will copy its data into
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+             * zio->io_data in vdev_mirror_scrub_done.
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+               But do we need to copy for every good one ?
+             */
+</font>
+            for (c = 0; c < mm->mm_children; c++) {
+                mc = &mm->mm_child[c];
+                zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+                    mc->mc_vd, mc->mc_offset,
+                    abd_alloc_sametype(zio->io_abd,
+                    zio->io_size), zio->io_size,
+                    zio->io_type, zio->io_priority, 0,
+                    vdev_mirror_scrub_done, mc));
+            }
+            zio_execute(zio);
+            return;
+        }
+        /*
+         * For normal reads just pick one child.
+         */
+        c = vdev_mirror_child_select(zio);
+        children = (c >= 0);
+    } 
+---
+
+The child zio will do the checksum verification.
+
+
+vdev_mirror_io_done
+---
+    if (good_copies && spa_writeable(zio->io_spa) &&
+        (unexpected_errors ||
+        (zio->io_flags & ZIO_FLAG_RESILVER) ||
+        ((zio->io_flags & ZIO_FLAG_SCRUB) && mm->mm_resilvering))) {
+<font color="blue">
+        /*
+         * Use the good data we have in hand to repair damaged children.
+         */
+</font>
+        for (c = 0; c < mm->mm_children; c++) {
+<font color="blue">
+            /*
+             * Don't rewrite known good children.
+             * Not only is it unnecessary, it could
+             * actually be harmful: if the system lost
+             * power while rewriting the only good copy,
+             * there would be no good copies left!
+             */
+</font>
+            mc = &mm->mm_child[c];
+
+            if (mc->mc_error == 0) {
+<font color="blue">
+            // For the scrub, it will read every child, the successful one
+            // would have a 'mc_error == 0' and 'mc_tried = 1'. Only the failed one
+            // will be repaired.
+
+            // For the resilvering one, only one is readin, it will try to repair
+            // the one which is missing in DTL table.
+</font>
+                if (mc->mc_tried)
+                    continue;
+<font color="blue">
+                /*
+                 * We didn't try this child.  We need to
+                 * repair it if:
+                 * 1. it's a scrub (in which case we have
+                 * tried everything that was healthy)
+                 *  - or -
+                 * 2. it's an indirect vdev (in which case
+                 * it could point to any other vdev, which
+                 * might have a bad DTL)
+                 *  - or -
+                 * 3. the DTL indicates that this data is
+                 * missing from this vdev
+                 */
+</font>
+                if (!(zio->io_flags & ZIO_FLAG_SCRUB) &&
+                    mc->mc_vd->vdev_ops != &vdev_indirect_ops &&
+                    !vdev_dtl_contains(mc->mc_vd, DTL_PARTIAL,
+                    zio->io_txg, 1))
+                    continue;
+                mc->mc_error = SET_ERROR(ESTALE);
+            }
+
+            zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+                mc->mc_vd, mc->mc_offset,
+                zio->io_abd, zio->io_size,
+                ZIO_TYPE_WRITE, ZIO_PRIORITY_ASYNC_WRITE,
+                ZIO_FLAG_IO_REPAIR | (unexpected_errors ?
+                ZIO_FLAG_SELF_HEAL : 0), NULL, NULL));
+        }
+    }
+
+---
+
 
 </font>
 </p>
@@ -1410,6 +2653,1234 @@ vdev_uberblock_sync
 </pre>
 </font>
 </p>
+
+
+
+<h3><a name="dmu_transaction_quiesce">dmu transaction quiescing</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> A quiescing txg doesn't accept new tx
+<li> All of its entering txs need to be completed before hand off a quiesced txg
+     to sync thread
+</ul>
+Next, let's look at how to do that.
+<pre>
+dmu_tx_assign
+  -> dmu_tx_try_assign
+    -> txg_hold_open
+    ---
+    kpreempt_disable();
+    tc = &tx->tx_cpu[CPU_SEQID];
+    kpreempt_enable();
+
+    mutex_enter(&tc->tc_open_lock);
+<font color="red">
+    txg = tx->tx_open_txg;
+</font>
+    mutex_enter(&tc->tc_lock);
+    tc->tc_count[txg & TXG_MASK]++;
+    mutex_exit(&tc->tc_lock);
+    ---
+
+dmu_tx_commit
+  -> txg_rele_to_sync
+  ---
+      tx_cpu_t *tc = th->th_cpu;
+    int g = th->th_txg & TXG_MASK;
+
+    mutex_enter(&tc->tc_lock);
+    if (--tc->tc_count[g] == 0)
+        cv_broadcast(&tc->tc_cv[g]);
+    mutex_exit(&tc->tc_lock);
+  ---
+
+txg_quiesce_thread
+  ---
+<font color="blue">
+        // we can only have one txg in "quiescing" or
+        // "quiesced, waiting to sync" state.  So we wait until
+        // the "quiesced, waiting to sync" txg has been consumed
+        // by the sync thread.
+</fong>
+        while (!tx->tx_exiting &&
+            (tx->tx_open_txg >= tx->tx_quiesce_txg_waiting ||
+            txg_has_quiesced_to_sync(dp)))
+            txg_thread_wait(tx, &cpr, &tx->tx_quiesce_more_cv, 0);
+
+        txg = tx->tx_open_txg;
+        tx->tx_quiescing_txg = txg;
+
+        mutex_exit(&tx->tx_sync_lock);
+<font color="red">
+        txg_quiesce(dp, txg);
+</font>
+        mutex_enter(&tx->tx_sync_lock);
+
+        /*
+         * Hand this txg off to the sync thread.
+         */
+        tx->tx_quiescing_txg = 0;
+        tx->tx_quiesced_txg = txg;
+        cv_broadcast(&tx->tx_sync_more_cv); //<font color="blue">Wake up the sync thread</font>
+  ---
+
+txg_quiesce
+---
+    for (c = 0; c < max_ncpus; c++)
+        mutex_enter(&tx->tx_cpu[c].tc_open_lock);
+<font color="red">
+    tx->tx_open_txg++;
+</font>
+    tx->tx_open_time = tx_open_time = gethrtime();
+<font color="blue">
+    /*
+     * Now that we've incremented tx_open_txg, we can let threads
+     * enter the next transaction group.
+     */
+</font>
+    for (c = 0; c < max_ncpus; c++)
+        mutex_exit(&tx->tx_cpu[c].tc_open_lock);
+
+    /*
+     * Quiesce the transaction group by waiting for everyone to txg_exit().
+     */
+    for (c = 0; c < max_ncpus; c++) {
+        tx_cpu_t *tc = &tx->tx_cpu[c];
+        mutex_enter(&tc->tc_lock);
+        while (tc->tc_count[g] != 0)
+            cv_wait(&tc->tc_cv[g], &tc->tc_lock);
+        mutex_exit(&tc->tc_lock);
+    }
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="multiple_dva_of_bp">multiple DVAs of blkptr</a></h3>
+<p>
+<font size="2">
+Look at here
+<pre>
+zio_write
+---
+    zio = zio_create(pio, spa, txg, bp, data, lsize, psize, done, private,
+        ZIO_TYPE_WRITE, priority, flags, NULL, 0, zb,
+        ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
+        ZIO_DDT_CHILD_WRITE_PIPELINE : ZIO_WRITE_PIPELINE);
+---
+
+zio_read
+---
+    zio = zio_create(pio, spa, BP_PHYSICAL_BIRTH(bp), bp,
+        data, size, size, done, private,
+        ZIO_TYPE_READ, priority, flags, NULL, 0, zb,
+        ZIO_STAGE_OPEN, (flags & ZIO_FLAG_DDT_CHILD) ?
+        ZIO_DDT_CHILD_READ_PIPELINE : ZIO_READ_PIPELINE);
+---
+</pre>
+The vdev and io_offset parameter are both zero.
+<br/>
+And look at the bottom of the zfs io stack,
+<pre>
+vdev_disk_io_start
+---
+<font color="blue">
+    // the bio is issued here !!!
+</font>
+    error = __vdev_disk_physio(vd->vd_bdev, zio,
+        zio->io_size, zio->io_offset, rw, flags);
+---
+</pre>
+Where is the vdev and io_offset set ?
+<br/>
+The zfs code is really tricky.
+<br/>
+Look at the ZIO_STAGE_VDEV_IO_START of zio_pipeline,
+<pre>
+zio_vdev_io_start
+---
+    if (vd == NULL) {
+        if (!(zio->io_flags & ZIO_FLAG_CONFIG_WRITER))
+            spa_config_enter(spa, SCL_ZIO, zio, RW_READER);
+
+<font color="blue">
+        // The mirror_ops handle multiple DVAs in a single BP.
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        // This also includes the single DVA one
+</font>
+        vdev_mirror_ops.vdev_op_io_start(zio);
+        return (NULL);
+    }
+---
+
+
+vdev_mirror_io_start
+  -> vdev_mirror_map_init
+---
+    vdev_t *vd = zio->io_vd;
+    ...
+    if (vd == NULL) {
+        dva_t *dva = zio->io_bp->blk_dva;
+        spa_t *spa = zio->io_spa;
+        dsl_scan_t *scn = spa->spa_dsl_pool->dp_scan;
+        dva_t dva_copy[SPA_DVAS_PER_BP];
+
+        if ((zio->io_flags & ZIO_FLAG_SCRUB) &&
+            !(zio->io_flags & ZIO_FLAG_IO_RETRY) &&
+            dsl_scan_scrubbing(spa->spa_dsl_pool) &&
+            scn->scn_is_sorted) {
+            c = 1;
+        } else {
+<font color="red">
+            c = BP_GET_NDVAS(zio->io_bp);
+</font>
+        }
+        ...
+        mm = vdev_mirror_map_alloc(c, B_FALSE, B_TRUE);
+        for (c = 0; c < mm->mm_children; c++) {
+            mc = &mm->mm_child[c];
+
+            mc->mc_vd = vdev_lookup_top(spa, DVA_GET_VDEV(&dva[c]));
+            mc->mc_offset = DVA_GET_OFFSET(&dva[c]);
+        }
+    } 
+---
+
+Then vdev_mirror_io_start
+---
+    while (children--) {
+        mc = &mm->mm_child[c];
+        zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
+            mc->mc_vd, mc->mc_offset, zio->io_abd, zio->io_size,
+            zio->io_type, zio->io_priority, 0,
+            vdev_mirror_child_done, mc));
+        c++;
+    }
+
+    zio_execute(zio);
+---
+</pre>
+
+Then if the underlying vdev is still mirror, it will enter vdev_mirror_io_start
+<pre>
+vdev_mirror_io_start
+  -> vdev_mirror_map_init
+
+---
+    if (vd == NULL) {
+        ...
+    } else {
+        boolean_t replacing = (vd->vdev_ops == &vdev_replacing_ops ||
+            vd->vdev_ops == &vdev_spare_ops) &&
+            spa_load_state(vd->vdev_spa) == SPA_LOAD_NONE &&
+            dsl_scan_resilvering(vd->vdev_spa->spa_dsl_pool);
+
+        mm = vdev_mirror_map_alloc(vd->vdev_children, replacing,
+            B_FALSE);
+        for (c = 0; c < mm->mm_children; c++) {
+            mc = &mm->mm_child[c];
+            mc->mc_vd = vd->vdev_child[c];
+            mc->mc_offset = zio->io_offset;
+        }
+    }
+---
+</pre>
+So all of the things look like this
+<pre>
+          blkptr with multiple DVAs
+
+          +----+   +----+
+          :    :   :    :    dumy mirror layer for the multiple DVAs
+          :    :   :    :    different position on the underlying vdev
+          +----+   +----+
+             \       /   
+              +-----+
+              |     |
+              |     |        the real mirror vdev
+              +-----+
+             /       \
+          +----+   +----+
+          |    |   |    |    the physical disk
+          +----+   +----+
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="raidz_dynamic_stripe_layout">raidz dynamic stripe layout</a></h3>
+<p>
+<font size="2">
+<pre>
+
+RAIDZ has dynamic stripe width
+
+<font color="green">                 +--+--+--+--+--+
+                 |P0|D0|D2|D4|D6|
+                 +--+--+--+--+--+
+                 |P1|D1|D3|D5|D7|</font>
+                 +--+--+--+--+--+
+<font color="blue">                 |P0|D1|D2|D3</font><font color="red">|P0|
+                 +--+--+--+--+--+
+                 |D1|D2|D3</font><font color="green">|P0|D0|</font>
+                 +--+--+--+--+--+
+<font color="blue">                 |P0|D0|D1|D2|D3|</font>
+                 +--+--+--+--+--+
+
+dynamic stripe allocation of raidz is done in vdev_raidz_map_alloc
+
+vdev_raidz_map_alloc
+
+The code is a bit tricky. Let's look at the following example,
+
+dcols     vd->vdev_children     4
+nparity   vd->vdev_nparity      1
+
+device physical block size is 4K
+
+There is a IO is 20K
+
+    s = 5
+
+The 3 critical value of the dynamic stripe layout is
+    q = s / (dcols - nparity)
+    r = s - q * (dcols - nparity);
+    bc = (r == 0 ? 0 : r + nparity);
+
+    q = 1
+    r = 2
+    bc = 3
+
+<font color="red">
+    (r must be less than (dcols - nparity))
+</font>
+
+The stripe layout is
+
+         Parity   Data    Data    Data
+          +--+    +--+    +--+    +--+
+          |  |    |00|    |02|    |04|
+          +--+    +--+    +--+    +--+
+          |  |    |01|    |03|
+          +--+    +--+    +--+
+
+    +--+
+    |00|    data block with offset in the IO
+    +--+
+    Parity  The parity is always at first, see <a href="#parity_first">here</a>
+
+Based on the following code segment
+---
+    for (c = 0; c < scols; c++) {
+        col = f + c;
+        coff = o;
+        if (col >= dcols) {
+            col -= dcols;
+            coff += 1ULL << ashift;
+        }
+        rm->rm_col[c].rc_devidx = col;
+        ...
+        if (c >= acols)
+            rm->rm_col[c].rc_size = 0;
+        else if (c < bc)
+            rm->rm_col[c].rc_size = (q + 1) << ashift;
+        else
+            rm->rm_col[c].rc_size = q << ashift;
+
+        asize += rm->rm_col[c].rc_size;
+    }
+    ...
+<font color="blue">
+<a name="parity_first">//parity is always at first</a>
+</font>
+<font color="red">    for (c = 0; c < rm->rm_firstdatacol; c++)</font>
+        rm->rm_col[c].rc_abd =
+            abd_alloc_linear(rm->rm_col[c].rc_size, B_FALSE);
+
+    for (; c < acols; c++) {
+        rm->rm_col[c].rc_abd = abd_get_offset_size(zio->io_abd, off,
+            rm->rm_col[c].rc_size);
+        off += rm->rm_col[c].rc_size;
+    }
+---
+
+
+The only question is the IO is spread across the child vdev's based on the raidz
+vdev->vdev_ashift which come from vdev_raidz_open
+---
+    for (c = 0; c < vd->vdev_children; c++) {
+        cvd = vd->vdev_child[c];
+
+        if (cvd->vdev_open_error != 0) {
+            lasterror = cvd->vdev_open_error;
+            numerrors++;
+            continue;
+        }
+
+        *asize = MIN(*asize - 1, cvd->vdev_asize - 1) + 1;
+        *max_asize = MIN(*max_asize - 1, cvd->vdev_max_asize - 1) + 1;
+        *ashift = MAX(*ashift, cvd->vdev_ashift);
+    }
+---
+
+It is the physical block size of the child vdev.
+Is it too fine ?
+</pre>
+
+</font>
+</p>
+
+<h3><a name="Compression">Compression</a></h3>
+<p>
+<font size="2">
+Do compression with some overhead of cpu cycles could get following benefits
+<ul>
+<li> save disk space, this maybe a good thing for replicas ?
+<li> less IO, may get higher performance with fixed bandwith
+</ul>
+zio_write_compress is responsible for compression.
+<br/>
+<br/>
+Actually, it is a common part of the zio write pipeline, <br/>
+except for the compression, it will do following things, <br/>
+<ul>
+<li> wait for all of children IO to <font color="red">ready stage</font>
+<pre>
+This is a very important point of constructing COWed tree of blkptr_t.
+Because the parent zio needs the new blkptr_t of the children zio
+
+    /*
+     * If our children haven't all reached the ready stage,
+     * wait for them and then repeat this pipeline stage.
+     */
+    if (zio_wait_for_children(zio, ZIO_CHILD_LOGICAL_BIT |
+        ZIO_CHILD_GANG_BIT, ZIO_WAIT_READY)) {
+        return (NULL);
+    }
+
+    if (zio->io_children_ready != NULL) {
+        /*
+         * Now that all our children are ready, run the callback
+         * associated with this zio in case it wants to modify the
+         * data to be written.
+         */
+        ASSERT3U(zp->zp_level, >, 0);
+        zio->io_children_ready(zio);
+    }
+
+
+</pre>
+<li> update some fields of blkptr_t
+<pre>
+        BP_SET_LSIZE(bp, lsize);
+        BP_SET_TYPE(bp, zp->zp_type);
+        BP_SET_LEVEL(bp, zp->zp_level);
+        BP_SET_PSIZE(bp, psize);
+        BP_SET_COMPRESS(bp, compress);
+        BP_SET_CHECKSUM(bp, zp->zp_checksum);
+        BP_SET_DEDUP(bp, zp->zp_dedup);
+        BP_SET_BYTEORDER(bp, ZFS_HOST_BYTEORDER);
+
+In normal case,
+
+       lsize = pisze = zio->io_size
+
+</pre>
+</ul>
+
+Let's come back and focus on the compression
+<pre>
+zio_write_compress
+---
+    if (compress != ZIO_COMPRESS_OFF &&
+        !(zio->io_flags & ZIO_FLAG_RAW_COMPRESS)) {
+<font color="blue">
+        // cbuf is new buffer allocated for compressed data
+        // lsize is the size of the original size
+        // psize is the size of the compressed size
+</font>
+        void *cbuf = zio_buf_alloc(lsize);
+        psize = zio_compress_data(compress, zio->io_abd, cbuf, lsize);
+
+
+        if (psize == 0 || psize == lsize) {
+            compress = ZIO_COMPRESS_OFF;
+            zio_buf_free(cbuf, lsize);
+        } else if (!zp->zp_dedup && !zp->zp_encrypt &&
+            psize <= BPE_PAYLOAD_SIZE &&
+            zp->zp_level == 0 && !DMU_OT_HAS_FILL(zp->zp_type) &&
+            spa_feature_is_enabled(spa, SPA_FEATURE_EMBEDDED_DATA)) {
+
+<font color="blue">
+        // Normally, block pointers point (via their DVAs) to a block which holds data.
+        // If the data that we need to store is very small, this is an inefficient
+        // use of space, because a block must be at minimum 1 sector (typically 512
+        // bytes or 4KB).  Additionally, reading these small blocks tends to generate
+        // more random reads.
+ 
+        // Embedded-data Block Pointers allow small pieces of data (the "payload",
+        // up to 112 bytes) to be stored in the block pointer itself, instead of
+        // being pointed to. 
+</font>
+            encode_embedded_bp_compressed(bp,
+                cbuf, compress, lsize, psize);
+            BPE_SET_ETYPE(bp, BP_EMBEDDED_TYPE_DATA);
+            BP_SET_TYPE(bp, zio->io_prop.zp_type);
+            BP_SET_LEVEL(bp, zio->io_prop.zp_level);
+            zio_buf_free(cbuf, lsize);
+            bp->blk_birth = zio->io_txg;
+            zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
+            return (zio);
+        } else {
+            /*
+             * Round up compressed size up to the ashift
+             * of the smallest-ashift device, and zero the tail.
+             * This ensures that the compressed size of the BP
+             * (and thus compressratio property) are correct,
+             * in that we charge for the padding used to fill out
+             * the last sector.
+             */
+            size_t rounded = (size_t)P2ROUNDUP(psize,
+                1ULL << spa->spa_min_ashift);
+            if (rounded >= lsize) {
+                compress = ZIO_COMPRESS_OFF;
+                zio_buf_free(cbuf, lsize);
+                psize = lsize;
+            } else {
+                abd_t *cdata = abd_get_from_buf(cbuf, lsize);
+                abd_take_ownership_of_buf(cdata, B_TRUE);
+                abd_zero_off(cdata, psize, rounded - psize);
+<font color="red">
+                psize = rounded;
+                zio_push_transform(zio, cdata,
+                    psize, lsize, NULL);
+</font>
+            }
+        }
+---
+
+zio_push_transform is very important
+---
+    zio_transform_t *zt = kmem_alloc(sizeof (zio_transform_t), KM_SLEEP);
+
+    zt->zt_orig_abd = zio->io_abd;
+    zt->zt_orig_size = zio->io_size;
+    zt->zt_bufsize = bufsize;
+    zt->zt_transform = transform;
+
+    zt->zt_next = zio->io_transform_stack;
+    zio->io_transform_stack = zt;
+
+    zio->io_abd = data;
+    zio->io_size = size;
+---
+
+It saves the original io_abd into zio->io_transform_stack and
+put the newly compressed data into the zio.
+
+The original io_abd will be poped out in zio_done
+</pre>
+
+Finally, zio_dva_allocate won't feel whether the zio is compressed.
+<pre>
+zio_dva_allocate
+---
+    error = metaslab_alloc(spa, mc, zio->io_size, bp,
+        zio->io_prop.zp_copies, zio->io_txg, NULL, flags,
+        &zio->io_alloc_list, zio, zio->io_allocator);
+---
+
+<font color="red">
+The required size is the zio->io_size
+</font>
+</pre>
+<br/>
+<br/>
+The decompress process is plugged in read zio pipeline but very different with
+compress part.
+<pre>
+zio_read_bp_init
+---
+    if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_OFF &&
+        zio->io_child_type == ZIO_CHILD_LOGICAL &&
+<font color>
+        !(zio->io_flags & ZIO_FLAG_RAW_COMPRESS)) {
+</font>
+        zio_push_transform(zio, abd_alloc_sametype(zio->io_abd, psize),
+            psize, psize, zio_decompress);
+    }
+---
+<B>
+This ZIO_FLAG_RAW_COMPRESS will be discussed in Deferred Decompression
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</B>
+
+Then
+
+zio_done
+  -> zio_pop_transforms
+  ---
+    while ((zt = zio->io_transform_stack) != NULL) {
+        if (zt->zt_transform != NULL)
+            zt->zt_transform(zio,
+                zt->zt_orig_abd, zt->zt_orig_size);
+
+        if (zt->zt_bufsize != 0)
+            abd_free(zio->io_abd);
+
+        zio->io_abd = zt->zt_orig_abd;
+        zio->io_size = zt->zt_orig_size;
+        zio->io_transform_stack = zt->zt_next;
+
+        kmem_free(zt, sizeof (zio_transform_t));
+    }
+
+  ---
+
+</pre>
+<br/>
+<br/>
+<br/>
+<B>Deferred Decompression</B>
+In this feature, the decompression is deferred util data is read from cache.<br>
+It sacrifices the cpu cycles to save the more limited system memory.<br/>
+Look at the code
+<pre>
+arc_read
+---
+        if (hdr == NULL) {
+            /*
+             * This block is not in the cache or it has
+             * embedded data.
+             */
+            arc_buf_hdr_t *exists = NULL;
+            arc_buf_contents_t type = BP_GET_BUFC_TYPE(bp);
+            hdr = arc_hdr_alloc(spa_load_guid(spa), psize, lsize,
+                BP_IS_PROTECTED(bp), BP_GET_COMPRESS(bp), type,
+                encrypted_read);
+            ...
+        }
+        ...
+        if (encrypted_read) {
+            ...
+        } else {
+            size = arc_hdr_size(hdr);
+            hdr_abd = hdr->b_l1hdr.b_pabd;
+
+            if (arc_hdr_get_compress(hdr) != ZIO_COMPRESS_OFF) {
+                zio_flags |= ZIO_FLAG_RAW_COMPRESS;
+            }
+<font color="blue">
+        //arc_hdr_alloc will set the hdr compress with BP_GET_COMPRESS(bp)
+        //in our scene, it should be set
+</font>
+            ...
+        }
+---
+</pre>
+So it seems that the zio_done->zio_pop_transforms will not decompress the data.<br/>
+When to do that ?
+<pre>
+dbuf_read
+---
+    if (db->db_state == DB_CACHED) {
+        spa_t *spa = dn->dn_objset->os_spa;
+        ...
+<font color="blue">
+        /*
+         * If the arc buf is compressed or encrypted and the caller
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * requested uncompressed data, we need to untransform it
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * before returning. We also call arc_untransform() on any
+         * unauthenticated blocks, which will verify their MAC if
+         * the key is now available.
+         */
+</font>
+        if (err == 0 && db->db_buf != NULL &&
+            (flags & DB_RF_NO_DECRYPT) == 0 &&
+            (arc_is_encrypted(db->db_buf) ||
+            arc_is_unauthenticated(db->db_buf) ||
+<font color="red">
+            arc_get_compression(db->db_buf) != ZIO_COMPRESS_OFF)) {
+</font>
+            err = arc_untransform(db->db_buf, spa, &zb, B_FALSE);
+            dbuf_set_data(db, db->db_buf);
+        }
+        mutex_exit(&db->db_mtx);
+    } 
+---
+</pre>
+
+arc_buf_fill
+---
+    boolean_t hdr_compressed =
+        (arc_hdr_get_compress(hdr) != ZIO_COMPRESS_OFF);
+    boolean_t compressed = (flags & ARC_FILL_COMPRESSED) != 0;
+    ...
+<font color="blue">
+    // The data in the buf is what we want
+</font>
+    if (hdr_compressed == compressed) {
+        if (!arc_buf_is_shared(buf)) {
+            abd_copy_to_buf(buf->b_data, hdr->b_l1hdr.b_pabd,
+                arc_buf_size(buf));
+        }
+    } else {
+        if (arc_buf_is_shared(buf)) {
+            ...
+        } else if (ARC_BUF_COMPRESSED(buf)) {
+            /* We need to reallocate the buf's b_data */
+            arc_free_data_buf(hdr, buf->b_data, <font color="red">HDR_GET_PSIZE(hdr),</font>
+                buf);
+            buf->b_data =
+                arc_get_data_buf(hdr, <font color="red">HDR_GET_LSIZE(hdr)</font>, buf);
+
+        }
+
+        buf->b_flags &= ~ARC_BUF_FLAG_COMPRESSED;
+
+        /*
+         * Try copying the data from another buf which already has a
+         * decompressed version. If that's not possible, it's time to
+         * bite the bullet and decompress the data from the hdr.
+         */
+        if (arc_buf_try_copy_decompressed_data(buf)) {
+            return (0);
+        } else {
+<font color="red">
+            error = zio_decompress_data(HDR_GET_COMPRESS(hdr),
+                hdr->b_l1hdr.b_pabd, buf->b_data,
+                HDR_GET_PSIZE(hdr), HDR_GET_LSIZE(hdr));
+</font>
+            ...
+        }
+    }
+---
+</pre>
+
+
+</font>
+</p>
+
+<h3><a name="zfs_prefetch">prefetch</a></h3>
+<p>
+<font size="2">
+There are two level prefetch in zfs stack
+<ul>
+<li> File level prefetch
+<pre>
+</pre>
+<li> Vdev level prefetch
+<pre>
+This prefetch mechanism works during the zio pipeline
+
+zio_vdev_io_start
+---
+    if (vd->vdev_ops->vdev_op_leaf && (zio->io_type == ZIO_TYPE_READ ||
+        zio->io_type == ZIO_TYPE_WRITE || zio->io_type == ZIO_TYPE_TRIM)) {
+
+        if (zio->io_type == ZIO_TYPE_READ && vdev_cache_read(zio))
+            return (zio);
+        ...
+    }
+---
+
+vdev_cache_read
+---
+    mutex_enter(&vc->vc_lock);
+
+    ve_search = kmem_alloc(sizeof (vdev_cache_entry_t), KM_SLEEP);
+    ve_search->ve_offset = cache_offset;
+    ve = avl_find(&vc->vc_offset_tree, ve_search, NULL);
+    kmem_free(ve_search, sizeof (vdev_cache_entry_t));
+
+    if (ve != NULL) {
+        if (ve->ve_missed_update) {
+            mutex_exit(&vc->vc_lock);
+            return (B_FALSE);
+        }
+
+        if ((fio = ve->ve_fill_io) != NULL) {
+            zio_vdev_io_bypass(zio);
+            zio_add_child(zio, fio);
+            mutex_exit(&vc->vc_lock);
+            VDCSTAT_BUMP(vdc_stat_delegations);
+            return (B_TRUE);
+        }
+
+        vdev_cache_hit(vc, ve, zio);
+        zio_vdev_io_bypass(zio);
+
+        mutex_exit(&vc->vc_lock);
+        VDCSTAT_BUMP(vdc_stat_hits);
+        return (B_TRUE);
+    }
+
+    ve = vdev_cache_allocate(zio);
+
+    if (ve == NULL) {
+        mutex_exit(&vc->vc_lock);
+        return (B_FALSE);
+    }
+
+    fio = zio_vdev_delegated_io(zio->io_vd, cache_offset,
+        ve->ve_abd, VCBS, ZIO_TYPE_READ, ZIO_PRIORITY_NOW,
+        ZIO_FLAG_DONT_CACHE, vdev_cache_fill, ve);
+
+    ve->ve_fill_io = fio;
+    zio_vdev_io_bypass(zio);
+    zio_add_child(zio, fio);
+
+    mutex_exit(&vc->vc_lock);
+    zio_nowait(fio);
+    VDCSTAT_BUMP(vdc_stat_misses);
+
+    return (B_TRUE);
+
+---
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="zfs_ddt">deduplication table</a></h3>
+<p>
+<font size="2">
+dedup is a process of eliminating duplicate data copies.
+<pre>
+            [ block X ]    [ block Y ]    [ block Z ]
+                   \            |            /
+                    \           |           /
+                     
+                          [ block ON DISK ]
+</pre>
+</font>
+</p>
+<h4><a name="zfs_ddt_write">zfs ddt write</a></h4>
+<p>
+<font size="2">
+Look at the pipeline of a standard zio ddt write
+<pre>
+#define    ZIO_DDT_WRITE_PIPELINE            \
+    (ZIO_INTERLOCK_STAGES |            \
+    ZIO_STAGE_WRITE_BP_INIT |        \
+    ZIO_STAGE_ISSUE_ASYNC |            \
+    ZIO_STAGE_WRITE_COMPRESS |        \
+    ZIO_STAGE_ENCRYPT |            \
+    ZIO_STAGE_CHECKSUM_GENERATE |        \
+    ZIO_STAGE_DDT_WRITE)
+
+<font color="red">
+NOTE:
+     There is no ZIO_VDEV_IO_STAGES which includes IO_START and IO_DONE
+                                                   ^^^^^^^^     ^^^^^^^
+</font>
+This seems to indicate that if one write hit the ddt, it will not trigger any IO.
+We will look into the code to prove this.
+
+Another important thing is that
+static zio_pipe_stage_t *zio_pipeline[] = {
+    NULL,
+    zio_read_bp_init,
+    zio_write_bp_init,
+    zio_free_bp_init,
+    zio_issue_async,
+    zio_write_compress,
+    zio_encrypt,
+<font color="red">
+    zio_checksum_generate,
+</font>
+    zio_nop_write,
+    zio_ddt_read_start,
+    zio_ddt_read_done,
+<font color="red">
+    zio_ddt_write,
+</font>
+    ...
+    }
+
+zio_ddt_write is after the zio_checksum_generate in the zio pipeline because the
+zfs ddt need the checksum to identify the duplicated data.
+
+the checksum should be strong enough to dedup without verification (compare byte
+by byte), see ZCHECKSUM_FLAG_DEDUP
+</pre>
+Let's look at the code of zfs_ddt_write
+<pre>
+zfs_ddt_write
+---
+    blkptr_t *bp = zio->io_bp;
+    int p = zp->zp_copies;
+    ddt_t *ddt = ddt_select(spa, bp);
+
+    ddt_enter(ddt); <font color="blue">//A mutex lock</font>
+    dde = ddt_lookup(ddt, bp, B_TRUE);
+<font color="blue">
+      -> ddt_key_fill(&dde_search.dde_key, bp);
+         ---
+            ddk->ddk_cksum = bp->blk_cksum;
+            ddk->ddk_prop = 0;
+
+            DDK_SET_LSIZE(ddk, BP_GET_LSIZE(bp));
+            DDK_SET_PSIZE(ddk, BP_GET_PSIZE(bp));
+            DDK_SET_COMPRESS(ddk, BP_GET_COMPRESS(bp));
+            DDK_SET_CRYPT(ddk, BP_USES_CRYPT(bp));
+         ---
+      -> dde = avl_find(&ddt->ddt_tree, &dde_search, &where);
+</font>
+    ddp = &dde->dde_phys[p];
+    ...
+    if (ddp->ddp_phys_birth != 0 || dde->dde_lead_zio[p] != NULL) {
+        if (ddp->ddp_phys_birth != 0)
+<font color="blue">
+            // ddt hit, fill the zio->io_bp
+            // actually, at this moment, the write io is deemed to be on disk.
+</font>
+<font color="red">
+            ddt_bp_fill(ddp, bp, txg);
+</font>
+<font color="blue">
+        // The duplicate block IO is ongoing
+        // Take it as our child IO, then we will be notified after it is completed.
+</font>
+        if (dde->dde_lead_zio[p] != NULL)
+            zio_add_child(zio, dde->dde_lead_zio[p]);
+        else
+            ddt_phys_addref(ddp);
+    } else if (zio->io_bp_override) {
+        ...
+    } else {
+<font color="blue">
+        // ddt miss, we need to issue a IO to disk.
+</font>
+        cio = zio_write(zio, spa, txg, bp, zio->io_orig_abd,
+            zio->io_orig_size, zio->io_orig_size, zp,
+            zio_ddt_child_write_ready, NULL, NULL,
+            zio_ddt_child_write_done, dde, zio->io_priority,
+            ZIO_DDT_CHILD_FLAGS(zio), &zio->io_bookmark);
+
+        zio_push_transform(cio, zio->io_abd, zio->io_size, 0, NULL);
+<font color="red">
+        dde->dde_lead_zio[p] = cio;
+</font>
+    }
+
+    ddt_exit(ddt);
+
+    if (cio)
+        zio_nowait(cio);
+    if (dio)
+        zio_nowait(dio);
+
+    return (zio);
+
+---
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="zfs_write_throttle">write throttle</a></h3>
+<p>
+<font size="2">
+The dirty data in fly is limited by the write throttle mechanism.
+<pre>
+dmu_tx_assign
+---
+    while ((err = dmu_tx_try_assign(tx, txg_how)) != 0) {
+        dmu_tx_unassign(tx);
+
+        if (err != ERESTART || !(txg_how & TXG_WAIT))
+            return (err);
+
+        dmu_tx_wait(tx);
+    }
+---
+
+dmu_tx_try_assign
+---
+    if (!tx->tx_dirty_delayed &&
+        dsl_pool_need_dirty_delay(tx->tx_pool)) {
+        tx->tx_wait_dirty = B_TRUE;
+        DMU_TX_STAT_BUMP(dmu_tx_dirty_delay);
+        return (SET_ERROR(ERESTART));
+    }
+---
+
+dsl_pool_need_dirty_delay
+---
+    uint64_t delay_min_bytes =
+        zfs_dirty_data_max * zfs_delay_min_dirty_percent / 100;
+    uint64_t dirty_min_bytes =
+        zfs_dirty_data_max * zfs_dirty_data_sync_percent / 100;
+    boolean_t rv;
+
+    mutex_enter(&dp->dp_lock);
+    if (dp->dp_dirty_total > dirty_min_bytes)
+        txg_kick(dp);
+    rv = (dp->dp_dirty_total > delay_min_bytes);
+    mutex_exit(&dp->dp_lock);
+---
+
+The dsl_pool.dp_dirty_total is updated in following path
+dbuf_dirty
+  -> dmu_objset_willuse_space
+    -> dsl_pool_dirty_space
+      -> dsl_pool_dirty_delta
+      ---
+    dp->dp_dirty_total += delta;
+
+<font color="blue">
+    /*
+     * Note: we signal even when increasing dp_dirty_total.
+     * This ensures forward progress -- each thread wakes the next waiter.
+     */
+</font>
+    if (dp->dp_dirty_total < zfs_dirty_data_max)
+        cv_signal(&dp->dp_spaceavail_cv);
+
+      ---
+Who would decrease the dsl_pool->dp_dirty_total ?
+<ul>
+<li> dbuf_write_physdone
+<pre>
+    dbuf_write_physdone
+      -> dsl_pool_undirty_space
+        -> dsl_pool_dirty_delta(dp, -space);
+</pre>
+<li> dsl_pool_sync
+<pre>
+<font color="blue">
+    /*
+     * We have written all of the accounted dirty data, so our
+     * dp_space_towrite should now be zero.  However, some seldom-used
+     * code paths do not adhere to this (e.g. dbuf_undirty(), also
+     * rounding error in dbuf_write_physdone).
+     * Shore up the accounting of any dirtied space now.
+     */
+</font>
+    dsl_pool_undirty_space(dp, dp->dp_dirty_pertxg[txg & TXG_MASK], txg);
+
+
+</pre>
+</ul>
+
+Look at the dmu_tx_wait
+---
+    if (tx->tx_wait_dirty) {
+        uint64_t dirty;
+<font color="blue">
+        /*
+         * dmu_tx_try_assign() has determined that we need to wait
+         * because we've consumed much or all of the dirty buffer
+         * space.
+         */
+</font>
+        mutex_enter(&dp->dp_lock);
+        if (dp->dp_dirty_total >= zfs_dirty_data_max)
+            DMU_TX_STAT_BUMP(dmu_tx_dirty_over_max);
+<font color="blue">
+        // A hard limit, dsl_pool_dirty_delta will notify us
+</font>
+        while (dp->dp_dirty_total >= zfs_dirty_data_max)
+            cv_wait(&dp->dp_spaceavail_cv, &dp->dp_lock);
+        dirty = dp->dp_dirty_total;
+        mutex_exit(&dp->dp_lock);
+
+        dmu_tx_delay(tx, dirty);
+
+        tx->tx_wait_dirty = B_FALSE;
+
+        /*
+         * Note: setting tx_dirty_delayed only has effect if the
+         * caller used TX_WAIT.  Otherwise they are going to
+         * destroy this tx and try again.  The common case,
+         * zfs_write(), uses TX_WAIT.
+         */
+        tx->tx_dirty_delayed = B_TRUE;
+    }...
+---
+
+dmu_tx_delay is used to limit the incoming writes when the backend storage
+cannot accommodate.
+
+dmu_tx_delay(dmu_tx_t *tx, uint64_t dirty)
+{
+    dsl_pool_t *dp = tx->tx_pool;
+<font color="red">
+    uint64_t delay_min_bytes =
+        zfs_dirty_data_max * zfs_delay_min_dirty_percent / 100;
+</font>
+    hrtime_t wakeup, min_tx_time, now;
+
+    if (dirty <= delay_min_bytes)
+        return;
+
+    now = gethrtime();
+<font color="red">
+    min_tx_time = zfs_delay_scale *
+        (dirty - delay_min_bytes) / (zfs_dirty_data_max - dirty);
+    min_tx_time = MIN(min_tx_time, zfs_delay_max_ns);
+</font>
+<font color="blue">
+    // The closer we are to the zfs_dirty_data_max, the longer will'll wait.
+</font>
+    if (now > tx->tx_start + min_tx_time)
+        return;
+
+    mutex_enter(&dp->dp_lock);
+    wakeup = MAX(tx->tx_start + min_tx_time,
+        dp->dp_last_wakeup + min_tx_time);
+    dp->dp_last_wakeup = wakeup;
+    mutex_exit(&dp->dp_lock);
+
+    zfs_sleep_until(wakeup);
+}
+
+More detailed, please refer to the comment above the dmu_tx_delay.
+
+Note that the value of zfs_dirty_data_max is relevant when sizing a separate intent log device (SLOG).
+zfs_dirty_data_max puts a hard limit on the amount of data in memory that has yet been written to the
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+main pool; at most, that much data is active on the SLOG at any given time. This is why small, fast
+^^^^^^^^^           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+devices such as the DDRDrive make for great log devices. 
+</pre>
+</font>
+</p>
+
+<h3><a name="dynamically_stripes">dynamically stripes</a></h3>
+<p>
+<font size="2">
+<B><font color="red">ZFS dynamically stripes data across all top-level virtual devices.</font></B>
+<pre>
+The decision about where to place data is done at write time, so no
+fixed-width stripes are created at allocation time.
+
+When new virtual devices are added to a pool, ZFS gradually allocates
+data to the new device in order to maintain performance and disk space
+allocation policies. Each virtual device can also be a mirror or a RAID-Z
+device that contains other disk devices or files. This configuration gives
+you flexibility in controlling the fault characteristics of your pool.
+For example, you could create the following configurations out of four disks:
+<ul>
+<li> Four disks using dynamic striping
+<li> One four-way RAID-Z configuration
+<li> Two two-way mirrors using dynamic striping
+</ul>
+Although ZFS supports combining different types of virtual devices within
+the same pool, avoid this practice. For example, you can create a pool with
+a two-way mirror and a three-way RAID-Z configuration. However, your fault
+tolerance is as good as your worst virtual device, RAID-Z in this case.
+A best practice is to use top-level virtual devices of the same type with
+the same redundancy level in each device.
+</pre>
+The layout of vdevs of a pool with 4 two-way RAID-Z is
+<pre>
+                                           root vdev
+     _________________________________________^_______________________________________
+    /                                                                                 \
+
+        raidz1-0              raidz1-1                raidz1-2              raidz1-3      
+    _______^________      _______^________        _______^________      _______^________    
+   /                \    /                \      /                \    /                \   
+   disk0 disk1 disk2     disk3 disk4 disk5       disk6 disk7 disk8     disk9 disk10 disk11    
+
+
+construct_spec
+spa_config_parse
+
+The raidz1-0 raidz1-1 raidz1-2 raid1-3 are the top level vdevs.
+</pre>
+Where does the code of dynamically stripe work?
+<pre>
+The anwser is <font color="red"><B>metaslab</B></font>
+
+Look at following comment,
+
+A metaslab class encompasses a category of allocatable top-level vdevs.
+Each top-level vdev is associated with a metaslab group which defines
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+the allocatable region for that vdev. Examples of these categories include
+"normal" for data block allocations (i.e. main pool allocations) or "log"
+for allocations designated for intent log devices (i.e. slog devices).
+When a block allocation is requested from the SPA it is associated with a
+metaslab_class_t, and only top-level vdevs (i.e. metaslab groups) belonging
+to the class can be used to satisfy that request. Allocations are done
+by traversing the metaslab groups that are linked off of the mc_rotor field.
+   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+This rotor points to the next metaslab group where allocations will be
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+attempted. 
+^^^^^^^^^^
+
+Allocating a block is a 3 step process:
+-- select the metaslab group
+-- select the metaslab
+-- allocate the block
+The metaslab class defines the low-level block allocator that will be used
+as the final step in allocation. These allocators are pluggable allowing each
+class to use a block allocator that best suits that class.
+
+metaslab_alloc_dva
+---
+    if (hintdva) {
+        ...
+    } else if (d != 0) {
+        vd = vdev_lookup_top(spa, DVA_GET_VDEV(&dva[d - 1]));
+        mg = vd->vdev_mg->mg_next;
+    } else if (flags & METASLAB_FASTWRITE) {
+        ...
+    } else {
+        mg = mc->mc_rotor;
+    }
+
+    rotor = mg;
+top:
+    do {
+        boolean_t allocatable;
+
+        vd = mg->mg_vd;
+        ...
+        uint64_t asize = vdev_psize_to_asize(vd, psize);
+        uint64_t offset = metaslab_group_alloc(mg, zal, asize, txg,
+            !try_hard, dva, d, allocator);
+
+        if (offset != -1ULL) {
+            ...
+            if ((flags & METASLAB_FASTWRITE) ||
+                atomic_add_64_nv(&mc->mc_aliquot, asize) >=
+                mg->mg_aliquot + mg->mg_bias) {
+<font color="red">
+                mc->mc_rotor = mg->mg_next;
+</font>
+                mc->mc_aliquot = 0;
+            }
+            ...
+            DVA_SET_VDEV(&dva[d], vd->vdev_id);
+            DVA_SET_OFFSET(&dva[d], offset);
+            DVA_SET_GANG(&dva[d],
+                ((flags & METASLAB_GANG_HEADER) ? 1 : 0));
+            DVA_SET_ASIZE(&dva[d], asize);
+
+            return (0);
+        }
+next:
+        mc->mc_rotor = mg->mg_next;
+        mc->mc_aliquot = 0;
+    } while ((mg = mg->mg_next) != rotor);
+
+
+---
+</pre>
+
+</font>
+</p>
+
 
 
 </body>
