@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NVDIMM</title>
+</head>
+<body>
+<div>
+    <h1>NVDIMM</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#persistent_memory_mode">Persistent Memory Mode</a><br/>
+<a href="#userspace_flushing_to_persistence">Userspace flushing to persistence</a><br/>
+<a href="#nvdimm_in_kernel">nvdimm in kernel</a>
+<ul>
+<li> <a href="#nvdimm_in_kernel_pmem">PMEM</a>
+<li> <a href="#nvdimm_in_kernel_dax">DAX</a>
+<li> <a href="#nvdimm_in_kernel_blk">BLK</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="persistent_memory_mode">Persistent Memory Mode</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+There are two memory modes:
+<ul>
+<li> Memory Mode (also known as 2LM)
+<pre>
+With Memory Mode, applications get a high capacity main memory solution at
+substantially lower cost and power, while providing performance that can be
+close to DRAM performance, depending on the workload. No modifications are
+required to the application—the operating system sees the persistent memory
+module capacity as the system main memory. For example, on a common two-socket
+system, the Memory Mode can provide 6TB of main memory, something very difficult
+and expensive to do with DRAM (if it is even possible). In Memory Mode, the DRAM
+installed in the system acts as a cache to deliver DRAM-like performance for
+this high-capacity main memory.
+</pre>
+<li> Persistent Memory Mode (also known as PM or App Direct)
+<pre>
+Just as some or all of the capacity of the Intel Optane DC memory modules can be
+provisioned as Memory Mode, some or all of the capacity can be provisioned as
+persistent memory. This is known as App Direct Mode, where software has a
+byte-addressable way to talk to the persistent memory capacity
+</pre>
+</ul>
+
+We could switch the memory mode in following way:<br/>
+
+ipmctl show -topology
+<pre>
+ DimmID | MemoryType                  | Capacity    | PhysicalID| DeviceLocator 
+ ================================================================================
+  0x0010 | Logical Non-Volatile Device | 252.438 GiB | 0x0045    | CPU0_B0
+  0x0110 | Logical Non-Volatile Device | 252.438 GiB | 0x004b    | CPU0_E0
+  0x1010 | Logical Non-Volatile Device | 252.438 GiB | 0x0051    | CPU1_B0
+  0x1110 | Logical Non-Volatile Device | 252.438 GiB | 0x0057    | CPU1_E0
+  N/A    | DDR4                        | 64.000 GiB  | 0x0043    | CPU0_A0
+  N/A    | DDR4                        | 64.000 GiB  | 0x0049    | CPU0_D0
+  N/A    | DDR4                        | 64.000 GiB  | 0x004f    | CPU1_A0
+  N/A    | DDR4                        | 64.000 GiB  | 0x0055    | CPU1_D0
+</pre>
+ipmctl create -goal PersistentMemoryType=AppDirect
+<pre>
+sudo ipmctl create -goal PersistentMemoryType=AppDirect
+The following configuration will be applied:
+ SocketID | DimmID | MemorySize | AppDirect1Size | AppDirect2Size 
+ ==================================================================
+  0x0000   | 0x0010 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0000   | 0x0110 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0001   | 0x1010 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0001   | 0x1110 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  Do you want to continue? [y/n] y
+  Created following region configuration goal
+  SocketID | DimmID | MemorySize | AppDirect1Size | AppDirect2Size 
+ ==================================================================
+  0x0000   | 0x0010 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0000   | 0x0110 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0001   | 0x1010 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+  0x0001   | 0x1110 | 0.000 GiB  | 252.000 GiB    | 0.000 GiB
+A reboot is required to process new memory allocation goals.
+</pre>
+</font>
+</p>
+
+
+<h2><a name="userspace_flushing_to_persistence">Userspace flushing to persistence</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> CLFLUSH
+<pre>
+    This instruction, supported in many generations of CPU, flushes a single
+    cache line. Historically, this instruction is serialized, causing multiple
+    CLFLUSH instructions to execute one after the other, without any concurrency.
+</pre>
+<li> CLFLUSHOPT (followed by an SFENCE)
+<pre>
+    This instruction, newly introduced for persistent memory support, is like
+    CLFLUSH but without the serialization. To flush a range, software executes a
+    CLFLUSHOPT instruction for each 64-byte cache line in the range, followed by
+    <U>a single SFENCE instruction to ensure the flushes are complete </U>before continuing.
+    CLFLUSHOPT is optimized (hence the name) to allow some concurrency when executing
+    multiple CLFLUSHOPT instructions back-to-back.
+</pre>
+<li> CLWB (followed by an SFENCE)
+<pre>
+    Another newly introduced instruction, CLWB stands for cache line write back. The
+    effect is the same as CLFLUSHOPT except that <U>the cache line may remain valid</U>in
+    the cache (but no longer dirty, since it was flushed). This makes it more likely
+    to get a cache hit on this line as the data is accessed again later.
+</pre>
+<li> NT stores (followed by an SFENCE)
+<pre>
+    Another feature that has been around for a while in x86 CPUs is the non-temporal
+    store. These stores are “write combining” and bypass the CPU cache, so using them
+    does not require a flush. The final SFENCE instruction is still required to    ensure
+    the stores have reached the persistence domain.
+</pre>
+<li> WBINVD
+<pre>
+    This kernel-mode-only instruction flushes and invalidates every cache line on
+    the CPU that executes it. After executing this on all CPUs, all stores to persistent
+    memory are certainly in the persistence domain, but all cache lines are empty, impacting
+    performance. In addition, the overhead of sending a message to each CPU to execute this
+    instruction can be significant. Because of this, WBINVD is only expected to be used by
+    the kernel for flushing very large ranges, many megabytes at least.
+</pre>
+</ul>
+The PCOMMIT has been get rid of, look at the comment in linux kernel
+<pre>
+commit f0c98ebc57c2d5e535bc4f9167f35650d2ba3c90
+Merge: d94ba9e7d 0606263
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Jul 28 17:22:07 2016 -0700
+
+Replace pcommit with ADR / directed-flushing.
+         
+The pcommit instruction, which has not shipped on any product, is deprecated.
+Instead, the requirement is that platforms implement either ADR, or provide one
+or more flush addresses per nvdimm.
+<font color="red">ADR (Asynchronous DRAM Refresh)</font> flushes data in posted write buffers to the memory
+controller on a power-fail event.
+                                                    
+Flush addresses are defined in ACPI 6.x as an NVDIMM Firmware Interface Table (NFIT)
+sub-structure: "Flush Hint Address Structure". <U>A flush hint is an mmio address that
+when written and fenced assures that all previous posted writes targeting a given dimm
+have been flushed to media.</U>
+</pre>
+And an official document on intel website
+<pre>
+https://software.intel.com/blogs/2016/09/12/deprecate-pcommit-instruction
+
+Originally, the set of new instructions included one called PCOMMIT, intended
+for use on platforms where flushing from the CPU cache was not sufficient to
+reach the persistence domain.  <U>On those platforms, an additional step using
+PCOMMIT was required to ensure that stores had passed from memory controller
+write pending queues to the DIMM, </U>which is the persistence domain on those
+platforms.
+
+      +-------------+ \
+      |    Core     |  |    
+      | +----+----+ |  |    
+      | | L1 | L1 | |  |    clflush
+      | +----+----+ |  |    clflushopt + sfence
+      +-------------+   >   clwb + sfence
+             v         |    nt stores + sfence
+      +-------------+  |
+      |     L3      |  |
+      +-------------+ /
+             v
+      +-------------+                        \
+      |     WPQ     |  Write Pending Queue    |                                   
+      +-------------+  in Memory Controller   |                                   
+             v                                 > ADR (Asynchronous Dram Refresh)  
+      +-----------------------------------+   |                                   
+      |           Intel DIMM              |   |                                   
+      +-----------------------------------+  /                                    
+                                               
+When the persistent memory programming model was first designed, there was a
+concern that ADR was a rarely-available platform feature so the PCOMMIT
+instruction was added to ensure there was a way to achieve persistence on
+machines without ADR (platforms where the persistence domain is the smaller
+dashed box in the picture above).  <U>However, it turns out that platforms planning
+to support the Intel DIMM are also planning to support ADR, so the need for
+PCOMMIT is now gone.</U>
+</pre>
+</font>
+</p>
+
+<h2><a name="nvdimm_in_kernel">nvdimm in kernel</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+There are two methods to export nvdimm in kernel, namely, PMEM and BLK<br/>
+<ul>
+<li>PMEM
+<pre>
+Drives a system-physical-address range where writes are persistent.
+<U>A block device composed of PMEM is capable of DAX</U>. This range is contiguous
+in system memory and may be interleaved (hardware memory controller striped)
+across multiple DIMMs.
+</pre>
+<li> BLK
+<pre>
+This driver performs I/O using a set of platform defined apertures.  A set of
+apertures will access just one DIMM. Multiple windows (apertures) allow multiple
+concurrent accesses, much like tagged-command-queuing, and would likely be used
+by different threads or different CPUs.
+</pre>
+</ul>
+Why BLK
+<pre>
+While PMEM provides direct byte-addressable CPU-load/store access to
+NVDIMM storage, it does not provide the best system RAS (recovery,
+availability, and serviceability) model.  An access to a corrupted
+system-physical-address address causes a CPU exception while an access
+to a corrupted address through an BLK-aperture causes that block window
+to raise an error status in a register.  The latter is more aligned with
+the standard error model that host-bus-adapter attached disks present.
+</pre>
+</font>
+</p>
+
+
+<h3><a name="nvdimm_in_kernel_pmem">PMEM</a></h3>
+<p>
+<font size="2">
+PMEM mode is mainly used by the DAX(Direct Access Extension)<br/>
+It is setup in following code
+<pre>
+nd_pmem_probe()
+  -> pmem_attach_disk()
+---
+    q = blk_alloc_queue(<font color="red">pmem_make_request</font>, dev_to_node(dev));
+    ...
+
+    blk_queue_write_cache(q, true, fua); //<font color="blue">writeback cache is forced on</font>
+    blk_queue_physical_block_size(q, PAGE_SIZE);
+    blk_queue_logical_block_size(q, pmem_sector_size(ndns));
+    blk_queue_max_hw_sectors(q, UINT_MAX);
+    blk_queue_flag_set(QUEUE_FLAG_NONROT, q);
+    if (pmem->pfn_flags & PFN_MAP)
+        blk_queue_flag_set(QUEUE_FLAG_DAX, q);
+
+    disk = alloc_disk_node(0, nid);
+    pmem->disk = disk;
+
+    disk->fops        = &pmem_fops;
+    disk->queue        = q;
+    disk->flags        = GENHD_FL_EXT_DEVT;
+    disk->private_data    = pmem;
+    disk->queue->backing_dev_info->capabilities |= BDI_CAP_SYNCHRONOUS_IO;
+    nvdimm_namespace_disk_name(ndns, disk->disk_name); //<font color="blue">/dev/pmemX</font>
+    set_capacity(disk, (pmem->size - pmem->pfn_pad - pmem->data_offset)
+            / 512);
+
+    if (is_nvdimm_sync(nd_region))
+        flags = DAXDEV_F_SYNC;
+<font color="blue">
+    // DAX is supported in PMEM mode
+</font>
+    dax_dev = alloc_dax(pmem, disk->disk_name, <font color="red">&pmem_dax_ops</font>, flags);
+
+    dax_write_cache(dax_dev, nvdimm_has_cache(nd_region));
+    pmem->dax_dev = dax_dev;
+    gendev = disk_to_dev(disk);
+    gendev->groups = pmem_attribute_groups;
+
+    device_add_disk(dev, disk, NULL);
+---
+</pre>
+pmem_make_request handle the bios from /dev/pmemX<br/>
+There are following points we need to pay attetion
+<ul>
+<li> IO
+<pre>
+It is a bio-based and synchronous IO interfaces
+---
+    bio_for_each_segment(bvec, bio, iter) {
+        if (op_is_write(bio_op(bio)))
+            rc = pmem_do_write(pmem, bvec.bv_page, bvec.bv_offset,
+                iter.bi_sector, bvec.bv_len);
+        else
+            rc = pmem_do_read(pmem, bvec.bv_page, bvec.bv_offset,
+                iter.bi_sector, bvec.bv_len);
+        if (rc) {
+            bio->bi_status = rc;
+            break;
+        }
+    }
+    ...
+    if (ret)
+        bio->bi_status = errno_to_blk_status(ret);
+
+    bio_endio(bio);
+---
+pmem_do_write()
+  -> write_pmem()
+  ---
+    while (len) {
+        mem = kmap_atomic(page);
+        chunk = min_t(unsigned int, len, PAGE_SIZE - off);
+        memcpy_flushcache(pmem_addr, mem + off, chunk);
+        kunmap_atomic(mem);
+        len -= chunk;
+        off = 0;
+        page++;
+        pmem_addr += chunk;
+    }
+  ---
+ 
+memcpy_flushcache(pmem_addr, mem + off, chunk);
+  -> memcpy_flushcache()
+    -> __memcpy_flushcache
+    ---
+    if (!IS_ALIGNED(dest, 8)) {
+        unsigned len = min_t(unsigned, size, ALIGN(dest, 8) - dest);
+
+        memcpy((void *) dest, (void *) source, len);
+        clean_cache_range((void *) dest, len);
+        dest += len;
+        source += len;
+        size -= len;
+        if (!size)
+            return;
+    }
+
+    /* 4x8 movnti loop */
+    while (size >= 32) {
+        asm("movq    (%0), %%r8\n"
+            "movq   8(%0), %%r9\n"
+            "movq  16(%0), %%r10\n"
+            "movq  24(%0), %%r11\n"
+            "movnti  %%r8,   (%1)\n"
+            "movnti  %%r9,  8(%1)\n"
+            "movnti %%r10, 16(%1)\n"
+            "movnti %%r11, 24(%1)\n"
+            :: "r" (source), "r" (dest)
+            : "memory", "r8", "r9", "r10", "r11");
+        dest += 32;
+        source += 32;
+        size -= 32;
+    }
+
+    /* 1x8 movnti loop */
+    while (size >= 8) {
+        asm("movq    (%0), %%r8\n"
+            "movnti  %%r8,   (%1)\n"
+            :: "r" (source), "r" (dest)
+            : "memory", "r8");
+        dest += 8;
+        source += 8;
+        size -= 8;
+    }
+
+    /* 1x4 movnti loop */
+    while (size >= 4) {
+        asm("movl    (%0), %%r8d\n"
+            "movnti  %%r8d,   (%1)\n"
+            :: "r" (source), "r" (dest)
+            : "memory", "r8");
+        dest += 4;
+        source += 4;
+        size -= 4;
+    }
+
+    /* cache copy for remaining bytes */
+    if (size) {
+        memcpy((void *) dest, (void *) source, size);
+        clean_cache_range((void *) dest, size);
+    }
+    ---
+
+clean_cache_range()
+---
+    for (p = (void *)((unsigned long)addr & ~clflush_mask);
+         p < vend; p += x86_clflush_size)
+        clwb(p);
+---
+<font color="red">
+<U>
+nt store and clwb are used here, on x86 platform, the data could
+be ensured to reach persistent medium as ADR is supported.
+</U>
+</font>
+</pre>
+<li> FLUSH
+<pre>
+pmem_make_request()
+---
+    if (bio->bi_opf & REQ_PREFLUSH)
+        ret = nvdimm_flush(nd_region, bio);
+    ...
+    bio_for_each_segment(bvec, bio, iter) {
+        if (op_is_write(bio_op(bio)))
+            rc = pmem_do_write(pmem, bvec.bv_page, bvec.bv_offset,
+                iter.bi_sector, bvec.bv_len);
+        else
+            rc = pmem_do_read(pmem, bvec.bv_page, bvec.bv_offset,
+                iter.bi_sector, bvec.bv_len);
+        if (rc) {
+            bio->bi_status = rc;
+            break;
+        }
+    }
+    if (bio->bi_opf & REQ_FUA)
+        ret = nvdimm_flush(nd_region, bio);
+---
+
+On platform that support ADR, nvdimm_flush do nothing.
+nt store and clwb in pmem_do_write could ensure the data persistence.
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="nvdimm_in_kernel_dax">DAX</a></h3>
+<p>
+<font size="2">
+DAX, Direct Access Extension, allow the filesystem, such as ext4, xfs, to<br/>
+work on NVDIMM. At this moment, the NVDIMM works in two method,
+<ul>
+<li> a system-physical-address range where writes are persistent
+<pre>
+DAX-aware filesystem will bypass the page cache and access the NVDIMM directly
+through load/store instructions. This could be done in read/write syscalls or
+mmap.
+ext4_dax_write_iter()
+  -> dax_iomap_rw()
+    -> iomap_apply()
+      -> dax_iomap_actor()
+        -> dax_direct_access()
+        -> dax_copy_from_iter()
+          -> pmem_copy_from_iter()
+            -> _copy_from_iter_flushcache()
+              -> memcpy_flushcache() //<font color="blue">Same with pmem_do_write</font>
+</pre>
+<li> a block device
+<pre>
+Ext4-dax access the metadata and journal through /dev/pmemX in which bios are
+handled by pmem_make_request. At this moment, /dev/pmemX works as a real block
+device and page caches are involved in the IO path.
+
+One thing need to be noted that, <U>PMEM mode block device doesn't provide
+sector writing atomicity guarantees</U>
+
+How does the ext4-dax handle this ?
+
+(1) All of the metadata updates are logged by jbd2
+(2) The final commit record of jbd2 has checksum to ensure the correction.
+
+journal_submit_commit_record()
+---
+    bh = jbd2_journal_get_descriptor_buffer(commit_transaction,
+                        JBD2_COMMIT_BLOCK);
+    tmp = (struct commit_header *)bh->b_data;
+    ktime_get_coarse_real_ts64(&now);
+    tmp->h_commit_sec = cpu_to_be64(now.tv_sec);
+    tmp->h_commit_nsec = cpu_to_be32(now.tv_nsec);
+    ...
+    jbd2_commit_block_csum_set(journal, bh);
+    ---
+<font color="red">
+        csum = jbd2_chksum(j, j->j_csum_seed, bh->b_data, j->j_blocksize);
+        h->h_chksum[0] = cpu_to_be32(csum);
+</font>
+    ---
+
+    lock_buffer(bh);
+    clear_buffer_dirty(bh);
+    set_buffer_uptodate(bh);
+    bh->b_end_io = journal_end_buffer_io_sync;
+
+    if (journal->j_flags & JBD2_BARRIER &&
+        !jbd2_has_feature_async_commit(journal))
+        ret = submit_bh(REQ_OP_WRITE,
+            REQ_SYNC | REQ_PREFLUSH | REQ_FUA, bh);
+    else
+        ret = submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+
+
+---
+</pre>
+</ul>
+
+The biggest benefit of DAX-aware filesystem is to <U>allow application to access NVDIMM<br/>
+directly via load/store instructions by mapping the physical NVDIMM file data pages<br/>
+into the application's address space.</U><br/>
+<pre>
+ext4_dax_fault()
+  -> ext4_dax_huge_fault()
+    -> dax_iomap_fault()
+      -> dax_iomap_pte_fault()
+---
+    entry = grab_mapping_entry(&xas, mapping, 0);
+      -> get_unlocked_entry()
+        ---
+            for (;;) {
+                entry = xas_find_conflict(xas);
+                ...
+<font color="red">
+                if (!dax_is_locked(entry))
+</font>
+                    return entry;
+<font color="blue">
+                //a hash wait queue is used here
+</font>
+                wq = dax_entry_waitqueue(xas, entry, &ewait.key);
+                prepare_to_wait_exclusive(wq, &ewait.wait,
+                              TASK_UNINTERRUPTIBLE);
+                xas_unlock_irq(xas);
+                xas_reset(xas);
+                schedule();
+                finish_wait(wq, &ewait.wait);
+                xas_lock_irq(xas);
+            }
+        ---
+    ...
+<font color="blue">
+    //get the block offset associated with the file offset
+</font>
+    error = ops->iomap_begin(inode, pos, PAGE_SIZE, flags, &iomap, &srcmap);
+    ...
+    switch (iomap.type) {
+    case IOMAP_MAPPED:
+        ...
+<font color="blue">
+        // get the page frame number associated with the block offset of /dev/pmem
+</font>
+        error = dax_iomap_pfn(&iomap, pos, PAGE_SIZE, &pfn);
+        ...
+<font color="blue">
+        // insert the pfn into page cache xarray
+</font>
+        entry = dax_insert_entry(&xas, mapping, vmf, entry, pfn,
+                         0, write && !sync);
+        ---
+            void *new_entry = dax_make_entry(pfn, flags);
+
+<font color="blue">
+            // handle this inode to writeback subsystem
+</font>
+            if (dirty)
+                __mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+
+            ...
+            xas_reset(xas);
+            xas_lock_irq(xas);
+            if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
+                void *old;
+<font color="blue">
+                // there are two sizes here, pte 4K, pmd 2M
+                // update the involved pages' mapping and index field
+</font>
+                dax_disassociate_entry(entry, mapping, false);
+                dax_associate_entry(new_entry, mapping, vmf->vma, vmf->address);
+
+<font color="blue">
+                // update the new_entry in xarray
+</font>
+                old = dax_lock_entry(xas, new_entry);
+                entry = new_entry;
+            } else {
+                xas_load(xas);    /* Walk the xa_state */
+            }
+
+<font color="blue">
+            // mark dirty tag on the entry in xarray, writeback subsystem could
+            // use it.
+</font>
+            if (dirty)
+                xas_set_mark(xas, PAGECACHE_TAG_DIRTY);
+
+            xas_unlock_irq(xas);
+        ---
+        ...
+        if (write)
+            ret = vmf_insert_mixed_mkwrite(vma, vaddr, pfn);
+            ---
+              -> __vm_insert_mixed() //<font color="blue">mkwrite = true</font>
+                -> insert_pfn()
+                ---
+                    pte = get_locked_pte(mm, addr, &ptl);
+                    ...
+                    if (!pte_none(*pte)) {
+                        if (mkwrite) {
+                            ...
+                            entry = pte_mkyoung(*pte);
+<font color="red">
+                            entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+</font>
+                            if (ptep_set_access_flags(vma, addr, pte, entry, 1))
+                                update_mmu_cache(vma, addr, pte);
+                        }
+                        goto out_unlock;
+                    }
+
+                    /* Ok, finally just insert the thing.. */
+                    if (pfn_t_devmap(pfn))
+                        entry = pte_mkdevmap(pfn_t_pte(pfn, prot));
+                    else
+                        entry = pte_mkspecial(pfn_t_pte(pfn, prot));
+
+                    if (mkwrite) {
+                        entry = pte_mkyoung(entry);
+<font color="red">
+                        entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+</font>
+                    }
+
+                    set_pte_at(mm, addr, pte, entry);
+                    update_mmu_cache(vma, addr, pte); /* XXX: why not for insert_page? */
+
+                out_unlock:
+                    pte_unmap_unlock(pte, ptl);
+                ---
+            ---
+---
+</pre>
+
+In the ext4_dax_huge_fault(), we mainly do following things,
+<ul>
+<li> allocate fs block for it with ext4_iomap_begin -> ext4_iomap_alloc
+<li> get the pfn associated with file offset and insert it into page cache xarray,
+     and mark the entry with PAGECACHE_TAG_DIRTY
+<li> insert the pfn into application's address space
+     Note !!! write permission is set with pte_mkwrite
+<li> hand the inode to writeback subsystem
+</ul>
+ext4 has DAX-aware address_space_operations and provide ext4_dax_writepages<br/>
+<pre>
+ext4_dax_writepages()
+  -> tag_pages_for_writeback(mapping, xas.xa_index, end_index);
+  -> dax_writeback_mapping_range()
+  ---
+    xas_lock_irq(&xas);
+    xas_for_each_marked(&xas, entry, end_index, <font color="red">PAGECACHE_TAG_TOWRITE</font>) {
+        ret = dax_writeback_one(&xas, dax_dev, mapping, entry);
+        ...
+        if (++scanned % XA_CHECK_SCHED)
+            continue;
+
+        xas_pause(&xas);
+        xas_unlock_irq(&xas);
+        cond_resched();
+        xas_lock_irq(&xas);
+    }
+    xas_unlock_irq(&xas);
+  ---
+dax_writeback_one()
+---
+    /* Lock the entry to serialize with page faults */
+    dax_lock_entry(xas, entry);
+    xas_clear_mark(xas, PAGECACHE_TAG_TOWRITE);
+    xas_unlock_irq(xas);
+
+    pfn = dax_to_pfn(entry);
+    count = 1UL << dax_entry_order(entry);
+    index = xas->xa_index & ~(count - 1);
+
+    dax_entry_mkclean(mapping, index, pfn);
+    ---
+    i_mmap_lock_read(mapping);
+    vma_interval_tree_foreach(vma, &mapping->i_mmap, index, index) {
+        address = pgoff_address(index, vma);
+        if (follow_pte_pmd(vma->vm_mm, address, &range,
+                   &ptep, &pmdp, &ptl))
+            continue;
+
+        if (pmdp) {
+            ...
+        } else {
+            if (pfn != pte_pfn(*ptep))
+                goto unlock_pte;
+            if (!pte_dirty(*ptep) && !pte_write(*ptep))
+                goto unlock_pte;
+
+            flush_cache_page(vma, address, pfn);
+            pte = ptep_clear_flush(vma, address, ptep);
+<font color="red">
+            // This means page fault will happen again after this.
+</font>
+            pte = <font color="red">pte_wrprotect(pte)</font>;
+            pte = pte_mkclean(pte);
+            set_pte_at(vma->vm_mm, address, ptep, pte);
+unlock_pte:
+            pte_unmap_unlock(ptep, ptl);
+        }
+        ...
+    }
+    i_mmap_unlock_read(mapping);
+
+    ---
+    dax_flush(dax_dev, page_address(pfn_to_page(pfn)), count * PAGE_SIZE);
+    ---
+<font color="red">
+        arch_wb_cache_pmem(addr, size);
+</font>
+    ---
+    xas_reset(xas);
+    xas_lock_irq(xas);
+    xas_store(xas, entry);
+    xas_clear_mark(xas, <font color="red">PAGECACHE_TAG_DIRTY</font>);
+    dax_wake_entry(xas, entry, false);
+
+
+---
+</pre>
+</font>
+</p>
+
+</body>
+</html>
+
+
