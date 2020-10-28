@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HugePages</title>
+</head>
+<body>
+<div>
+    <h1>HugePages</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#hugetlb_fs">hugetlb fs</a><br/>
+<a href="#huge_page_and_dax">HugePage and DAX</a><br/>
+</font>
+</p>
+
+<h2><a name="hugetlb_fs">hugetlb fs</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+hugetlb fs is a pseudo filesystem in which a file represents a range <br/>
+of configuous memory, namely huge page, and application could map this <br/>
+file into its address space directly.
+<ul>
+<li> hugetlbfs_fs_type
+<pre>
+hugetlbfs_init_fs_context()
+  -> hugetlbfs_fs_context_ops
+    -> hugetlbfs_get_tree()
+      -> hugetlbfs_fill_super()
+        -> hugetlbfs_get_root()
+          -> hugetlbfs_dir_inode_operations
+            -> hugetlbfs_create()
+              -> hugetlbfs_mknode()
+                -> do_hugetlbfs_mknode()
+                  -> hugetlbfs_get_inode()
+                  ---
+        case S_IFREG:
+            inode->i_op = &hugetlbfs_inode_operations;
+            inode->i_fop = &hugetlbfs_file_operations;
+            break;
+                  ---
+hugetlbfs_file_mmap()
+---
+    vma->vm_flags |= VM_HUGETLB | VM_DONTEXPAND;
+    vma->vm_ops = &hugetlb_vm_ops;
+    ...
+<font color="blue">
+<U>    /* must be huge page aligned */</U>
+</font>
+    if (vma->vm_pgoff & (~huge_page_mask(h) >> PAGE_SHIFT))
+        return -EINVAL;
+
+---
+
+handle_mm_fault()
+  -> hugetlb_fault()
+    -> hugetlb_no_page()
+    ---
+    page = find_lock_page(mapping, idx);
+    if (!page) {
+        ...
+        page = alloc_huge_page(vma, haddr, 0);
+        ...
+    }
+    ptl = huge_pte_lock(h, mm, ptep);
+    ...
+    new_pte = make_huge_pte(vma, page, ((vma->vm_flags & VM_WRITE)
+                && (vma->vm_flags & VM_SHARED)));
+    set_huge_pte_at(mm, haddr, ptep, new_pte);
+
+    hugetlb_count_add(pages_per_huge_page(h), mm);
+    if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
+        /* Optimization, do the COW without a second fault */
+        ret = hugetlb_cow(mm, vma, address, ptep, page, ptl);
+    }
+
+    spin_unlock(ptl);
+
+    ---
+
+
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h2><a name="huge_page_and_dax">HugePage and DAX</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+DAX mappings would always use hugepage.
+<pre>
+__transparent_hugepage_enabled()
+---
+    /*
+     * For dax vmas, try to always use hugepage mappings. If the kernel does
+     * not support hugepages, fsdax mappings will fallback to PAGE_SIZE
+     * mappings, and device-dax namespaces, that try to guarantee a given
+     * mapping size, will fail to enable
+     */
+    if (vma_is_dax(vma))
+        return true;
+---
+</pre>
+And also
+<pre>
+ext4_file_mmap()
+---
+    file_accessed(file);
+    if (IS_DAX(file_inode(file))) {
+        vma->vm_ops = &ext4_dax_vm_ops;
+<font color="red">
+        vma->vm_flags |= VM_HUGEPAGE;
+</font>
+    } else {
+        vma->vm_ops = &ext4_file_vm_ops;
+    }
+---
+</pre>
+<br/>
+When page fault occurs,
+<pre>
+__handle_mm_fault()
+---
+    pgd = pgd_offset(mm, address);
+    p4d = p4d_alloc(mm, pgd, address);
+    ...
+    vmf.pud = pud_alloc(mm, p4d, address);
+    ...
+retry_pud:
+<font color="blue">
+    //fadax dax_iomap_fault only support PE_SIZE_PTE and PE_SIZE_PMD (2M on x86-64)
+</font>
+    if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
+        ret = create_huge_pud(&vmf);
+        if (!(ret & VM_FAULT_FALLBACK))
+            return ret;
+    }
+    ...
+    vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+    ...
+    if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
+        ret = create_huge_pmd(&vmf);
+        if (!(ret & VM_FAULT_FALLBACK))
+            return ret;
+    }
+    ...
+    return handle_pte_fault(&vmf);
+---
+
+ext4_dax_huge_fault()
+  -> dax_iomap_fault() //<font color="blue">ext4_iomap_ops</font>
+    -> dax_iomap_pmd_fault()
+---
+    entry = grab_mapping_entry(&xas, mapping, PMD_ORDER);
+    ...
+    pos = (loff_t)xas.xa_index << PAGE_SHIFT;
+    error = ops->iomap_begin(inode, pos, PMD_SIZE, iomap_flags, &iomap,
+            &srcmap);
+
+<B>
+<font color="blue">
+    // Note !!! iomap_begin would allocate fs blocks here, and the blocks
+    // maybe not contiguous after running some time. If that happens,
+    // we return VM_FAULT_FALLBACK and we would do pte fault next.
+</font>
+</B>
+    if (iomap.offset + iomap.length < pos + PMD_SIZE) //>
+        goto finish_iomap;
+
+    sync = dax_fault_is_synchronous(iomap_flags, vma, &iomap);
+
+    switch (iomap.type) {
+    case IOMAP_MAPPED:
+<font color="blue">
+        // For PMEM-DAX, we needn't to allocate pages, because we map
+        // the pages on nvdimm device directly.
+</font>
+        error = dax_iomap_pfn(&iomap, pos, PMD_SIZE, &pfn);
+
+        entry = dax_insert_entry(&xas, mapping, vmf, entry, pfn,
+                        DAX_PMD, write && !sync);
+        ...
+        result = vmf_insert_pfn_pmd(vmf, pfn, write);
+        break;
+        ...
+    }
+
+ finish_iomap:
+    if (ops->iomap_end) {
+        int copied = PMD_SIZE;
+        ...
+        ops->iomap_end(inode, pos, PMD_SIZE, copied, iomap_flags,
+                &iomap);
+    }
+ unlock_entry:
+    dax_unlock_entry(&xas, entry);
+---
+</pre>
+</font>
+</p>
+
+</body>
+</html>
+
+

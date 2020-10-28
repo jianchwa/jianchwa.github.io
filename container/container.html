@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Container</title>
+</head>
+<body>
+<div>
+    <h1>Container</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#cgroup">cgroup</a>
+<ul>
+<li> <a href="#cgroup_kernfs">cgroup kernfs</a>
+<ul>
+<li> <a href="#cgroup_kernfs_files">Files</a>
+<li> <a href="#cgroup_kernfs_hierarchy">Hierarchy</a>
+</ul>
+<li> <a href="#cgroup_tasks">cgroup tasks</a>
+<ul>
+<li><a href="#cgroup_tasks_data_structure">data structure</a>
+</ul>
+<ul>
+
+</ul>
+</font>
+</p>
+
+<h2><a name="cgroup">cgroup</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="cgroup_kernfs">cgroup kernfs</a></h2>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+In this section, we would like to know how does cgroup interact with<br/>
+users in userland through kernfs.<br/>
+Let's start from the root of cgroup fs which is initialized in cgroup_init<br/>
+<pre>
+cgroup_init()
+---
+    BUG_ON(cgroup_init_cftypes(NULL, cgroup_base_files));
+    BUG_ON(cgroup_init_cftypes(NULL, cgroup1_base_files));
+    ...
+    BUG_ON(cgroup_setup_root(&cgrp_dfl_root, 0));
+---
+</pre>>
+These are the key of the cgroup kernfs, files and hierarchy
+</font>
+</p>
+
+<h4><a name="cgroup_kernfs_files">Files</a></h4>
+<p>
+<font size="2">
+cgroup_base_files is an array of cftype which defines the <br/>
+control file in cgroup directorys, such as 'cgroup.type', 'cgroup.procs'.<br/>
+cgroup_init_cftypes mainly asigns a kernfs_ops for every cftype.<br/>
+<pre>
+static struct kernfs_ops cgroup_kf_ops = {
+    .atomic_write_len    = PAGE_SIZE,
+    .open            = cgroup_file_open,
+    .release        = cgroup_file_release,
+    .write            = cgroup_file_write,
+    .poll            = cgroup_file_poll,
+    .seq_start        = cgroup_seqfile_start,
+    .seq_next        = cgroup_seqfile_next,
+    .seq_stop        = cgroup_seqfile_stop,
+    .seq_show        = cgroup_seqfile_show,
+};
+
+This structure is used for kernfs, such as
+kernfs_fop_read()
+---
+<font color="blue">
+    //KERNFS_HAS_SEQ_SHOW is set if the kernfs_ops has seq_show
+</font>
+    if (of->kn->flags & KERNFS_HAS_SEQ_SHOW)
+        return seq_read(file, user_buf, count, ppos);
+---
+</pre>
+cgroup_kf_ops is a wrapper which translates the semantics from kernfs to cgroup.
+<pre>
+cgroup_file_write()
+---
+    struct cgroup *cgrp = of->kn->parent->priv;
+<font color="red">    struct cftype *cft = of->kn->priv; </font>
+    ...
+
+    if (cft->write)
+<font color="red">        return cft->write(of, buf, nbytes, off);</font>
+
+    rcu_read_lock();
+    css = cgroup_css(cgrp, cft->ss);
+    rcu_read_unlock();
+
+    if (cft->write_u64) {
+        unsigned long long v;
+        ret = kstrtoull(buf, 0, &v);
+        if (!ret)
+<font color="red">            ret = cft->write_u64(css, cft, v);</font>
+    } else if (cft->write_s64) {
+        long long v;
+        ret = kstrtoll(buf, 0, &v);
+        if (!ret)
+<font color="red">            ret = cft->write_s64(css, cft, v);</font>
+    }
+---
+</pre>
+The kernfs would provide two guarantees regarding to a file
+<ul>
+<li> read/write on the file is atomic
+<pre>
+For the read,
+kernfs_fop_open()
+  -> seq_open(file, &kernfs_seq_ops)
+
+kernfs_fop_read()
+  -> seq_read()
+    -> kernfs_seq_start()
+      -> <font color="red">mutex_lock(&of->mutex)</font>
+    -> kernfs_seq_stop()
+      -> <font color="red">mutex_unlock(&of->mutex)</font>
+
+kernfs_fop_write()
+---
+<font color="red">    mutex_lock(&of->mutex);</font>
+    if (!kernfs_get_active(of->kn)) {
+        mutex_unlock(&of->mutex);
+        len = -ENODEV;
+        goto out_free;
+    }
+
+    ops = kernfs_ops(of->kn);
+    if (ops->write)
+        len = ops->write(of, buf, len, *ppos);
+    else
+        len = -EINVAL;
+
+    kernfs_put_active(of->kn);
+<font color="red">    mutex_unlock(&of->mutex);</font>
+---
+</pre>
+<li> the file isn't deleted with operations in flight
+<pre>
+kernfs_get_active()
+---
+    if (!atomic_inc_unless_negative(&kn->active))
+        return NULL;
+---
+
+void kernfs_put_active(struct kernfs_node *kn)
+{
+    int v;
+
+    if (unlikely(!kn))
+        return;
+
+    if (kernfs_lockdep(kn))
+        rwsem_release(&kn->dep_map, _RET_IP_);
+    v = atomic_dec_return(&kn->active);
+    if (likely(v != KN_DEACTIVATED_BIAS))
+        return;
+
+    wake_up_all(&kernfs_root(kn)->deactivate_waitq);
+}
+
+__kernfs_remove()
+---
+    /*
+     * Kill all of its children
+     */
+    pos = NULL;
+    while ((pos = kernfs_next_descendant_post(pos, kn)))
+        if (kernfs_active(pos))
+<font color="red">            atomic_add(KN_DEACTIVATED_BIAS, &pos->active);</font>
+
+    /* deactivate and unlink the subtree node-by-node */
+    do {
+        pos = kernfs_leftmost_descendant(kn);
+        kernfs_get(pos);
+
+        if (kn->flags & KERNFS_ACTIVATED)
+            kernfs_drain(pos);
+<font color="blue">
+        ---
+            /* but everyone should wait for draining */
+            wait_event(root->deactivate_waitq,
+                   atomic_read(&kn->active) == KN_DEACTIVATED_BIAS);
+        ---
+</font>
+        else
+            WARN_ON_ONCE(atomic_read(&kn->active) != KN_DEACTIVATED_BIAS);
+
+        ...
+
+        kernfs_put(pos);
+    } while (pos != kn);
+
+---
+</pre>
+</ul>
+
+</font>
+</p>
+
+<h4><a name="cgroup_kernfs_hierarchy">Hierarchy</a></h4>
+<p>
+<font size="2">
+To setup the hierarchy of a filesystem, we need the root node.<br/>
+This is done by cgroup_setup_root()
+<pre>
+cgroup_setup_root()
+---
+    kf_sops = root == &cgrp_dfl_root ?
+        &cgroup_kf_syscall_ops : &cgroup1_kf_syscall_ops;
+
+    root->kf_root = kernfs_create_root(kf_sops,
+                       KERNFS_ROOT_CREATE_DEACTIVATED |
+                       KERNFS_ROOT_SUPPORT_EXPORTOP |
+                       KERNFS_ROOT_SUPPORT_USER_XATTR,
+                       root_cgrp);
+<font color="blue">
+    /*
+        kernfs_root is likely to the superblock of the normal
+        disk filesystem.
+     */
+</font>
+    ...
+<font color="blue">
+    /*
+       Add the cgroup_base_files into the kernfs_root
+       Refer to __kernfs_create_file, kernfs_new_node create a new kernfs_node,
+       and kernfs_add_one will add this new node into its parent's children
+       rb_tree which indexed by name hash.
+    */
+</font>
+    ret = css_populate_dir(&root_cgrp->self);
+---
+</pre>
+At this moment, the cgroup kernfs is not mounted, and the process above could be deemed to mkfs.<br/>
+During mount, kernfs_fill_super will be invoked,
+<pre>
+kernfs_fill_super
+---
+    /* get root inode, initialize and unlock it */
+    mutex_lock(&kernfs_mutex);
+    inode = kernfs_get_inode(sb, info->root->kn);
+    mutex_unlock(&kernfs_mutex);
+    ...
+    /* instantiate and link root dentry */
+    root = d_make_root(inode);
+    ...
+    sb->s_root = root;
+    sb->s_d_op = &kernfs_dops;
+---
+</pre>
+And look the inode operations of kernfs
+<pre>
+kernfs_get_inode()
+  -> kernfs_init_inode()
+
+const struct inode_operations kernfs_dir_iops = {
+    .lookup        = kernfs_iop_lookup,
+    .permission    = kernfs_iop_permission,
+    .setattr    = kernfs_iop_setattr,
+    .getattr    = kernfs_iop_getattr,
+    .listxattr    = kernfs_iop_listxattr,
+
+    .mkdir        = kernfs_iop_mkdir,
+    .rmdir        = kernfs_iop_rmdir,
+    .rename        = kernfs_iop_rename,
+};
+</pre>
+See it ?<br/>
+lookup, mkdir, rmdir is supported, but there is not create.<br/>
+This means you cannot create regular files in it.
+<pre>
+vfs_create()
+---
+<font color="red">
+    if (!dir->i_op->create)
+        return -EACCES;    /* shouldn't it be ENOSYS? */
+</font>
+---
+</pre>
+Look into the kernfs_iop_mkdir
+<pre>
+kernfs_iop_mkdir()
+---
+    struct kernfs_node *parent = dir->i_private;
+    struct kernfs_syscall_ops *scops = kernfs_root(parent)->syscall_ops;
+    int ret;
+
+    if (!scops || !scops->mkdir)
+        return -EPERM;
+
+    if (!kernfs_get_active(parent))
+        return -ENODEV;
+
+    ret = scops->mkdir(parent, dentry->d_name.name, mode);
+    kernfs_put_active(parent);
+    return ret;
+---
+
+</pre>
+kernfs_syscall_ops is provided by the backend of kernfs.<br/>
+<pre>
+static struct kernfs_syscall_ops cgroup_kf_syscall_ops = {
+    .show_options        = cgroup_show_options,
+    .mkdir            = cgroup_mkdir,
+    .rmdir            = cgroup_rmdir,
+    .show_path        = cgroup_show_path,
+};
+</pre>
+Let's look at cgroup_mkdir
+<pre>
+cgroup_mkdir()
+---
+    cgrp = cgroup_create(parent, name, mode);
+    if (IS_ERR(cgrp)) {
+        ret = PTR_ERR(cgrp);
+        goto out_unlock;
+    }
+
+    /*
+     * This extra ref will be put in cgroup_free_fn() and guarantees
+     * that @cgrp->kn is always accessible.
+     */
+    kernfs_get(cgrp->kn);
+
+    ret = cgroup_kn_set_ugid(cgrp->kn);
+    if (ret)
+        goto out_destroy;
+
+    ret = css_populate_dir(&cgrp->self);
+    if (ret)
+        goto out_destroy;
+
+    ret = cgroup_apply_control_enable(cgrp);
+    if (ret)
+        goto out_destroy;
+
+    TRACE_CGROUP_PATH(mkdir, cgrp);
+
+    /* let's create and online css's */
+    kernfs_activate(cgrp->kn);
+---
+</pre>
+As expected, it creates a cgroup
+</font>
+</p>
+
+<h3><a name="cgroup_tasks">cgroup tasks</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<h4><a name="cgroup_tasks_data_structure">data structure</a></h4>
+<p>
+<font size="2">
+There are 3 components in cgroup, tasks, subsystem and cgroup
+<pre>
+
+        root
+        /  \
+     cg0   cg1 (cpu, io, mem)
+            |
+            +----------+
+            |-css_cpu  |- task0
+            |-css_io   |- task1
+            |_css_mem  |- task2
+                       |- ...
+
+css : cgroup_subsys_state, per-subsystem/per-cgroup state
+css_set : a structure holding pointers to a set of css
+
+blkcg_css()
+---
+    return task_css(current, io_cgrp_id);
+      -> task->cgroups->subsys[]
+---
+</pre>
+Why we need css_set ?
+<pre>
+
+                  root (cpu, pid, io, mem)
+                /      \
+     cg0 (cpu, pid)   cg1 (io, mem)
+                      / \
+                     /   \
+                    t0 t1 cg2 (io)
+                          /\
+                         t2 t3
+
+How many css in the diagram above ?
+ - root-cpu, root-pid, root-io, root-mem
+ - cg0-cpu, cg0-pid
+ - cg1-io, cg1-mem
+ - cg2-io
+
+t0 and t1 are associated with css (root-cpu, root-pid, cg1-io, cg1-mem)
+t2 and t3 are associated with css (root-cpu, root-pid, cg1-mem, cg2-io)
+
+Because the cgroup2 and cgroup1 both exist in kernel, a task could be both
+of them.
+                 net-root
+                 /     \
+             ncg0     ncg1
+                       /\
+                     t3  t4
+
+Therefore the t3 has a css set:
+(root-cpu, root-pid, cg1-mem, cg2-io, ncg1-net)
+
+This is the css_set, and could be shared by all of the tasks that have the
+same cgroup assignment.
+
+Look into find_existing_css_set()
+---
+    for_each_subsys(ss, i) {
+		if (root->subsys_mask & (1UL << i)) { //>
+            /*
+             * @ss is in this hierarchy, so we want the
+             * effective css from @cgrp.
+             */
+            template[i] = cgroup_e_css_by_mask(cgrp, ss);
+        } else {
+            /*
+             * @ss is not in this hierarchy, so we don't want
+             * to change the css.
+             */
+            template[i] = old_cset->subsys[i];
+        }
+    }
+
+    key = css_set_hash(template);
+    hash_for_each_possible(css_set_table, cset, hlist, key) {
+        if (!compare_css_sets(cset, old_cset, cgrp, template))
+            continue;
+
+        /* This css_set matches what we need */
+        return cset;
+    }
+
+    /* No existing cgroup group matched */
+    return NULL;
+
+---
+</pre>
+
+</font>
+</p>
+
+
+</body>
+</html>
+
+

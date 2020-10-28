@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MM</title>
+</head>
+<body>
+<div>
+    <h1>MM</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#address_space">Address Space</a><br/>
+<ul>
+<li> <a href="#vm_area_struct">vm_area_struct</a><br/>
+</ul>
+<a href="#page_table">Page Table</a><br/>
+<ul>
+<li> <a href="#split_page_table_lock">split page table lock</a><br/>
+</ul>
+</font>
+</p>
+
+<h2><a name="address_space">Address Space</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="vm_area_struct">vm_area_struct</a></h3>
+<p>
+<font size="2">
+vm_area_struct describes
+<ul>
+<li> a virtual memory area
+<pre>
+<font color="blue">
+    unsigned long vm_start;        /* Our start address within vm_mm. */
+    unsigned long vm_end;        /* The first byte after our end address within vm_mm. */
+
+    /* linked list of VM areas per task, sorted by address */
+    struct vm_area_struct *vm_next, *vm_prev;
+
+    struct rb_node vm_rb;
+</font>
+vm_area_struct are linked in both a double-direction list and a rb tree
+rb tree is to accelerate the insert and lookup.
+double-direction list is more convenient for merging and iterating...
+Look at find_vma(), vma_merge()
+</pre>
+<li> a special rule for the page fault handler
+<pre>
+<font color="blue">
+    pgprot_t vm_page_prot;
+    unsigned long vm_flags;        /* Flags, see mm.h. */
+    ...
+    struct list_head anon_vma_chain; /* Serialized by mmap_lock &
+                      * page_table_lock */
+    struct anon_vma *anon_vma;    /* Serialized by page_table_lock */
+
+    /* Function pointers to deal with this struct. */
+    const struct vm_operations_struct *vm_ops;
+
+    /* Information about our backing store: */
+    unsigned long vm_pgoff;        /* Offset (within vm_file) in PAGE_SIZE
+                       units */
+    struct file * vm_file;        /* File we map to (can be NULL). */
+    void * vm_private_data;        /* was vm_pte (shared mem) */
+
+</font>
+a vm_area_struct could be stack, brk, a range of file or just a range of
+physical address w/o 'struct page' behind it(<font color="red">VM_PFNMAP</font>).
+
+In code, vm_area_struct describes <U>a special rule for page fault handler.</U>
+</pre>
+</ul>
+The page fault policy includes:
+<ul>
+<li> bad address
+<pre>
+arch/x86/mm/fault.c 
+do_user_addr_fault()
+---
+    tsk = current;
+    mm = tsk->mm;
+    ...
+    vma = find_vma(mm, address);
+<font color="blue">
+    // There is not a vm_area associated with the address, bad address !!!
+</font>
+    if (unlikely(!vma)) {
+        bad_area(regs, hw_error_code, address);
+        return;
+    }
+
+</pre>
+<li> bad permission
+<pre>
+arch/x86/mm/fault.c 
+do_user_addr_fault()
+---
+    tsk = current;
+    mm = tsk->mm;
+    ...
+    vma = find_vma(mm, address);
+    ...
+    if (likely(vma->vm_start <= address))
+        goto good_area;
+<font color="blue">
+    /*
+     * Ok, we have a good vm_area for this memory access, so
+     * we can handle it..
+     */
+</font>
+good_area:
+    if (unlikely(access_error(hw_error_code, vma))) {
+<font color="blue">
+        // Bad access permission !!!
+</font>
+        bad_area_access_error(regs, hw_error_code, address, vma);
+        return;
+    }
+
+</pre>
+<li> huge tlb
+<pre>
+
+handle_mm_fault()
+---
+<font color="blue">
+    // !!(vma->vm_flags & VM_HUGETLB);
+    // set in hugetlbfs_file_mmap()
+</font>
+    if (unlikely(is_vm_hugetlb_page(vma)))
+        ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+    else
+        ret = __handle_mm_fault(vma, address, flags);
+---
+</pre>
+<li> THP (Transparent Huge Page)
+<pre>
+__handle_mm_fault()
+---
+<font color="blue">
+    // vma_is_dax(vma) in __transparent_hugepage_enabled()
+</font>
+    if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
+        ret = create_huge_pmd(&vmf);
+<font color="blue">
+        // vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
+</font>
+        if (!(ret & VM_FAULT_FALLBACK))
+            return ret;
+    }
+    ...
+    return handle_pte_fault(&vmf);
+---
+</pre>
+<li> anonymous or file mapping ?
+<pre>
+handle_pte_fault()
+---
+    if (unlikely(pmd_none(*vmf->pmd))) {
+        vmf->pte = NULL;
+    } else {
+        ...
+<font color="blue">
+        // pte here is pointer, orig_pte is the content
+</font>
+        vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+        vmf->orig_pte = *vmf->pte;
+        ...
+    }
+
+    if (!vmf->pte) {
+<font color="blue">
+        // return !vma->vm_ops;
+</font>
+        if (vma_is_anonymous(vmf->vma))
+            return do_anonymous_page(vmf);
+        else
+            return do_fault(vmf);
+    }
+
+    if (!pte_present(vmf->orig_pte))
+        return do_swap_page(vmf);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="reverse_mapping">Reverse Mapping</a></h3>
+<p>
+<font size="2">
+<pre>
+page_add_new_anon_rmap()
+page_add_file_rmap()
+
+shrink_page_list()
+---
+        /*
+         * The page is mapped into the page tables of one or more
+         * processes. Try to unmap it here.
+         */
+        if (page_mapped(page)) {
+            enum ttu_flags flags = ttu_flags | TTU_BATCH_FLUSH;
+            bool was_swapbacked = PageSwapBacked(page);
+
+            if (unlikely(PageTransHuge(page)))
+                flags |= TTU_SPLIT_HUGE_PMD;
+
+            if (!try_to_unmap(page, flags)) {
+                stat->nr_unmap_fail += nr_pages;
+                if (!was_swapbacked && PageSwapBacked(page))
+                    stat->nr_lazyfree_fail += nr_pages;
+                goto activate_locked;
+---            
+
+
+// check if a page is mapped in vma at an address
+page_vma_mapped_walk()
+
+To be continued
+</pre>
+</font>
+</p>
+
+<h3><a name="address_space_summary">Summary</a></h3>
+<p>
+<font size="2">
+<pre>
+                     View of a Task
+
+    /---------------/     Hole  /-------------------/   Virtual Address what a task can see
+
+     pud/pmd/pte                    pud/pmd/pte         Page table which  translate virtual address to physical ones
+
+     vm_area_struct               vm_area_struct        Page fault policy behind the address
+
+     address_space      (what is it for anonymous mapping)
+                                                        Maintain pages and method to get data
+
+
+When a task access the virtual address
+(1) MMU lookup the TLB, if not hit, walk the page table
+    If corresponding page table entry is empty, raise hardware
+    exception and trigger software page fault.
+(2) page fault find and check the vm_area_struct maintained in task_strcut->mm
+    and decide what to do next based on the information in associated vm_area_struct.
+(3) If file mapping, invoke fault callback to get the page and data
+(4) install the page into page table
+</pre>
+invalidate_inode_pages2_range is a good example to understand this, it mainly do following things,
+<ul>
+<li> pagevec_lookup_entries
+<pre>
+look up the pages associated with the address range maintained in inode's address_space
+</pre>
+<li> unmap_mapping_pages() if page_mapped()
+<pre>
+unmap_mapping_pages()
+---
+    i_mmap_lock_write(mapping);
+    if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root)))
+        unmap_mapping_range_tree(&mapping->i_mmap, &details);
+    i_mmap_unlock_write(mapping);
+---
+unmap_mapping_range_tree()
+  -> unmap_mapping_range_vma()
+    -> zap_page_range_single()
+      -> unmap_single_vma()
+        -> unmap_page_range()
+        ---
+        pgd = pgd_offset(vma->vm_mm, addr);
+        do {
+            next = pgd_addr_end(addr, end);
+            if (pgd_none_or_clear_bad(pgd))
+                continue;
+            next = zap_p4d_range(tlb, vma, pgd, addr, next, details);
+        } while (pgd++, addr = next, addr != end);
+        ---
+<font color="red">
+        Only page table is modified here
+</font>
+</pre>
+<li> invalidate_complete_page2()
+<pre>
+---
+    xa_lock_irqsave(&mapping->i_pages, flags);
+    if (PageDirty(page))
+        goto failed;
+
+    BUG_ON(page_has_private(page));
+    __delete_from_page_cache(page, NULL);
+    xa_unlock_irqrestore(&mapping->i_pages, flags);
+---
+</pre>
+</ul>
+After this, page table entry is zapped and page is deleted from the <br/>
+page cache. When the task access the address again, page fault will <br/>
+rebuild the pages and page table entries based on the vm_area_struct
+</font>
+</p>
+
+
+<h2><a name="page_table">Page Table</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="split_page_table_lock">split page table lock</a></h3>
+<p>
+<font size="2">
+Comment from https://www.kernel.org/doc/html/v4.18/vm/split_page_table_lock.html
+<pre>
+    Originally, mm->page_table_lock spinlock protected all page tables of the
+    mm_struct. <U>But this approach leads to poor page fault scalability of
+    multi-threaded applications due high contention on the lock.</U> To improve
+    scalability, split page table lock was introduced.
+
+    With split page table lock we have separate per-table lock to serialize
+    access to the table. At the moment we use split lock for PTE and PMD tables.
+    Access to higher level tables protected by mm->page_table_lock.
+</pre>
+The lock helper interfaces in kernel
+<pre>
+static inline spinlock_t *pmd_lock(struct mm_struct *mm, pmd_t *pmd)
+{
+    spinlock_t *ptl = pmd_lockptr(mm, pmd);
+    ---
+        -> ptlock_ptr(pmd_to_page(pmd))
+          -> page->ptl
+    ---
+    spin_lock(ptl);
+    return ptl;
+}
+
+/*
+ * No scalability reason to split PUD locks yet, but follow the same pattern
+ * as the PMD locks to make it easier if we decide to.  The VM should not be
+ * considered ready to switch to split PUD locks yet; there may be places
+ * which need to be converted from page_table_lock.
+ */
+static inline spinlock_t *pud_lockptr(struct mm_struct *mm, pud_t *pud)
+{
+    return &mm->page_table_lock;
+}
+</pre>
+The handle_mm_fault works under <font color="red">mmap_read_lock()</font><br/>
+do_mmap_pgoff works under mmap_write_lock()
+</font>
+</p>
+
+</body>
+</html>
+
+
