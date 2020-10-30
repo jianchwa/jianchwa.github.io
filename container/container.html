@@ -20,6 +20,7 @@
 <li> <a href="#cgroup_tasks">cgroup tasks</a>
 <ul>
 <li><a href="#cgroup_tasks_data_structure">data structure</a>
+<li><a href="#cgroup_tasks_attach_task">attach a task</a>
 </ul>
 <ul>
 
@@ -411,11 +412,17 @@ Therefore the t3 has a css set:
 
 This is the css_set, and could be shared by all of the tasks that have the
 same cgroup assignment.
+<font color="red">
+Which cgroup css set (root-cpu, root-pid, cg1-mem, cg2-io, ncg1-net) belongs to ?
 
+The answer is <U>cg2 and ncg1</U> even though this css set shares the css of
+root cgroup.
+</font>
+(css_set and cgroup will be linked together in link_css_set())
 Look into find_existing_css_set()
 ---
     for_each_subsys(ss, i) {
-		if (root->subsys_mask & (1UL << i)) { //>
+        if (root->subsys_mask & (1UL << i)) { //>
             /*
              * @ss is in this hierarchy, so we want the
              * effective css from @cgrp.
@@ -443,11 +450,53 @@ Look into find_existing_css_set()
     return NULL;
 
 ---
+
 </pre>
+
+In summary, the relationship between cgroup, css, css-set and task is as following,
+<pre>
+         cgrp_dfl_root
+
+         cg-root (cpu, io, mem)     cg-root-pid (pid)
+         /     \                    /     \
+    t0 t1 t2   cg0 (io, mem)    t0 t1     cg1
+               / \                       /    \
+             t3  t4                     t2 t3 t4
+
+t3 and t4 belongs to a css-set [cg-root:(cpu), cg0:(io, mem), cg1:(pid)], called css-set-A
+                                \_____ _____/
+                                      v
+                               <font color="red">this is a css</font>
+t2 belongs to a css-set [cg-root:(cpu, io, mem), cg1:(pid)], called css-set-B
+
+And we could get following diagram,
+
+         css-set-A     .--- cg-root
+                   \  /
+                    \/
+         css-set-B-./\----- cg0
+                    \ \
+                     \ \
+                      '-'-- cg1
+
+Note : (1) css-set-A use css cg-root:(cpu) but it belongs to cg0
+       (2) multiple to multiple relationship between css-set and cgroup
+           is due to both cgroup v2 and v2 exists in kernel.
+       (2) cg-root is actually the cgrp_dfl_root, as well as the root of
+           cgroup v2
+</pre>
+
 
 </font>
 </p>
 
+
+<h4><a name="cgroup_tasks_attach_task">attach task</a></h4>
+<p>
+<font size="2">
+What need to be done to attach a task to a cgroup ?
+</font>
+</p>
 
 </body>
 </html>
