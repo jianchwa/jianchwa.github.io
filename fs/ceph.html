@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Ceph</title>
+</head>
+<body>
+<div>
+    <h1>Ceph</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#rbd">RBD</a>
+<ul>
+<li> <a href="#image_and_object">Image and Object</a>
+</ul>
+<ul>
+
+</ul>
+</font>
+</p>
+
+<h2><a name="rbd">RBD</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="image_and_object">Image and Object</a></h2>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+rbd is a utility for manipulating rados block device (RBD) images, <br/>
+used by the Linux rbd driver and the rbd storage driver for QEMU/KVM. <br/>
+<U>RBD images are simple block devices that are striped over objects and</U><br/>
+stored in a RADOS object store. The size of the objects the image is <br/>
+striped over must be a power of two.<br/>
+Let's look at the code of rbd to see how to split an IO over different objects.
+<pre>
+Based on the mainline 3.10.108
+
+rbd_request_fn()
+  -> rbd_img_request_fill()
+  ---
+	while (resid) {
+		...
+		object_name = rbd_segment_name(rbd_dev, img_offset);
+		...
+		offset = rbd_segment_offset(rbd_dev, img_offset);
+		length = rbd_segment_length(rbd_dev, img_offset, resid);
+		obj_request = rbd_obj_request_create(object_name,
+						offset, length, type);
+	    rbd_img_obj_request_add(img_request, obj_request);
+		...
+		osd_req = rbd_osd_req_create(rbd_dev, write_request,
+						obj_request);
+		...
+		obj_request->img_offset = img_offset;
+
+		img_offset += length;
+		resid -= length;
+	}
+
+  ---
+</pre>
+Well, the policy looks very easy, just split the img_req into obj_req<br/>
+on segment length. And also, to create a object, we need the object name.<br/>
+<pre>
+rbd_segment_name()
+---
+	segment = offset >> rbd_dev->header.obj_order;
+	name_format = "%s.%012llx";
+	if (rbd_dev->image_format == 2)
+		name_format = "%s.%016llx";
+	ret = snprintf(name, MAX_OBJ_NAME_SIZE + 1, name_format,
+			rbd_dev->header.object_prefix, segment);
+---
+See it ? The object name looks like <font color="red">[rbd image name].[segment id]</font>
+</pre>
+
+</font>
+</p>
+
+
+</body>
+</html>
+
+

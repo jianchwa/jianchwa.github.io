@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>XFS_V2</title>
+</head>
+<body>
+<div>
+    <h1>XFS_V2</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#inode">Inode</a>
+<ul>
+<li> <a href="#reference_of_inode">reference of inode</a>
+<li> <a href="#lazytime_mode">lazytime mode</a>
+<li> <a href="#inode_cache">inode cache</a>
+</ul>
+<a href="#xfs_log">Xfs Log</a>
+<ul>
+<li> <a href="#relog">Relog</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="inode">inode</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="reference_of_inode">reference of inode</a></h3>
+<p>
+<font size="2">
+The put of reference of inode is done in iput(),
+<pre>
+void iput(struct inode *inode)
+{
+    if (!inode)
+        return;
+    BUG_ON(inode->i_state & I_CLEAR);
+retry:
+    if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
+        if (inode->i_nlink && (inode->i_state & I_DIRTY_TIME)) {
+            atomic_inc(&inode->i_count);
+            spin_unlock(&inode->i_lock);
+            trace_writeback_lazytime_iput(inode);
+            mark_inode_dirty_sync(inode);
+            goto retry;
+        }
+<font color="red">        iput_final(inode);</font>
+    }
+}
+Regarding to the lazytime, refer to this section <a href="#lazytime_mode">lazytime mode</a>
+</pre>
+When the last reference of an inode is dropped, we may have two choices,
+<ul>
+<li> evict the inode
+<li> retain indoe in cache if fs is active
+</ul>
+Before talking deeply into how to determine evict or not, let's look into<br>
+When is the reference of inode get ?
+<pre>
+<font color="blue">
+/*
+ * inode->i_lock must be held
+ */
+</font>
+void __iget(struct inode *inode)
+{
+    atomic_inc(&inode->i_count);
+}
+
+__iget() <- iterate_bdevs()
+</pre>
+
+</font>
+</p>
+
+
+<h3><a name="lazytime_mode">lazytime mode</a></h3>
+<p>
+<font size="2">
+The commit is
+<pre>
+commit 0ae45f63d4ef8d8eeec49c7d8b44a1775fff13e8
+Author: Theodore Ts'o <tytso@mit.edu>
+Date:   Mon Feb 2 00:37:00 2015 -0500
+
+    vfs: add support for a lazytime mount option
+    
+    Add a new mount option which enables a new "lazytime" mode.  <U>This mode
+    causes atime, mtime, and ctime updates to only be made to the
+    in-memory version of the inode.</U>  The on-disk times will only get
+    updated when (a) if the inode needs to be updated for some non-time
+    related change, (b) if userspace calls fsync(), syncfs() or sync(), or
+    (c) just before an undeleted inode is evicted from memory.
+    
+    This is OK according to POSIX because there are no guarantees after a
+    crash unless userspace explicitly requests via a fsync(2) call.
+    
+    For workloads which feature a large number of random write to a
+    preallocated file, the lazytime mount option significantly reduces
+    writes to the inode table.  The repeated 4k writes to a single block
+    will result in undesirable stress on flash devices and SMR disk
+    drives.  Even on conventional HDD's, the repeated writes to the inode
+    table block will trigger Adjacent Track Interference (ATI) remediation
+    latencies, which very negatively impact long tail latencies --- which
+    is a very big deal for web serving tiers (for example).
+    
+    Google-Bug-Id: 18297052
+    
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+</pre>
+Firstly, let's look at the 3 time fields in POSIX,
+<ul>
+<li> ctime, create time
+<li> atime, access time
+<li> mtime, modify time
+</ul>
+And they will be modified in following code path,
+<ul>
+<li> atime
+<pre>
+file_accessed()
+  -> touch_atime()
+    -> update_time() //<font color="blue">S_ATIME</font>
+
+file_accessed() could be invoked by
+ - generic_file_read_iter() // in direct IO path
+ - generic_file_buffered_read()
+ - generic_file_mmap()
+ - ext4_dax_read_iter()
+ ...
+</pre>
+<li> ctime and mtime
+<pre>
+file_update_time()
+  -> update_time() // S_MTIME or S_CTIME
+
+filemap_page_mkwrite()
+  -> file_update_time()
+
+__generic_file_write_iter() //cover both buffer and direct IO path
+  -> file_update_time()
+</pre>
+</ul>
+The time of inode is updated in generic_update_time,
+<pre>
+generic_update_time()
+  -> __mark_inode_dirty()
+    -> sb->s_op->dirty_inode()
+       ext4_dirty_inode()
+     ---
+<font color="blue">
+        // If flags only contain I_DIRTY_TIME, just return and leave the
+        // modified times fields in memory
+</font>
+        if (flags == I_DIRTY_TIME)
+            return;
+        handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
+        ...
+        ext4_mark_inode_dirty(handle, inode);
+          -> __ext4_mark_inode_dirty()
+            -> ext4_mark_iloc_dirty()
+              -> ext4_do_update_inode() // <font color="blue">synchronize the inode in-memory to the one on-disk</font>
+
+        ext4_journal_stop(handle);
+     ---
+</pre>
+If we look into the __mark_inode_dirty,<br/>
+we could find out that I_DIRTY_TIME is set on inode->i_state, and the inode is inserted into the wb->b_dirty_time<br/>
+There is no modifications on the on-disk inode buffer in-memory, what does the wb flush ?<br/>
+<ul>
+<li> When will the inode on wb->b_dirty_time be flushed ?
+<pre>
+wb_writeback()
+  -> queue_io()
+  ---
+    if (!work->for_sync)
+        time_expire_jif = jiffies - dirtytime_expire_interval * HZ;
+    moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
+                     time_expire_jif);
+  ---
+
+unsigned int dirtytime_expire_interval = 12 * 60 * 60;
+<font color="blue">
+See it !?, <B>it is 12 hours</B>
+</font>
+</pre>
+<li> How to write out the dirty inode with I_DIRTY_TIME
+<pre>
+__writeback_single_inode()
+---
+    ret = do_writepages(mapping, wbc);
+<font color="blue">
+    /*
+     * Make sure to wait on the data before writing out the metadata.
+     * This is important for filesystems that modify metadata on data
+     * I/O completion. We don't do it for sync(2) writeback because it has a
+     * separate, external IO completion path and ->sync_fs for guaranteeing
+     * inode metadata is written back correctly.
+     */
+</font>
+    if (wbc->sync_mode == WB_SYNC_ALL && !wbc->for_sync) {
+        int err = filemap_fdatawait(mapping);
+        if (ret == 0)
+            ret = err;
+    }
+
+    spin_lock(&inode->i_lock);
+
+    dirty = inode->i_state & I_DIRTY;
+    if ((inode->i_state & I_DIRTY_TIME) &&
+        ((dirty & I_DIRTY_INODE) ||
+         wbc->sync_mode == WB_SYNC_ALL || wbc->for_sync ||
+         time_after(jiffies, inode->dirtied_time_when +
+            dirtytime_expire_interval * HZ))) {
+        dirty |= I_DIRTY_TIME;
+        trace_writeback_lazytime(inode);
+    }
+    inode->i_state &= ~dirty;
+    ...
+    smp_mb();
+
+    if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+        inode->i_state |= I_DIRTY_PAGES;
+
+    spin_unlock(&inode->i_lock);
+<font color="blue">
+<U>
+    //See it ? I_DIRTY_SYNC will be set here and ext4_dirty_inode() won't do
+    nothing anymore
+</U>
+</font>
+    if (dirty & I_DIRTY_TIME)
+        mark_inode_dirty_sync(inode);
+    /* Don't write the inode if only I_DIRTY_PAGES was set */
+    if (dirty & ~I_DIRTY_PAGES) {
+        int err = write_inode(inode, wbc);
+        if (ret == 0)
+            ret = err;
+    }
+---
+</pre>
+</ul>
+Well, a normal case that flush out the time fields of inode should be in iput()
+<pre>
+void iput(struct inode *inode)
+{
+    if (!inode)
+        return;
+    BUG_ON(inode->i_state & I_CLEAR);
+retry:
+    if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
+        if (inode->i_nlink && (inode->i_state & I_DIRTY_TIME)) {
+            atomic_inc(&inode->i_count);
+            spin_unlock(&inode->i_lock);
+            trace_writeback_lazytime_iput(inode);
+<font color="red">
+            mark_inode_dirty_sync(inode);
+</font>
+            goto retry;
+        }
+        iput_final(inode);
+    }
+}
+</pre>
+</font>
+</p>
+
+<h3><a name="inode_cache">inode cache</a></h3>
+<p>
+<font size="2">
+Where is the inode cache ?<br/>
+<pre>
+    inode_hashtable =
+        alloc_large_system_hash("Inode-cache",
+                    sizeof(struct hlist_head),
+                    ihash_entries,
+                    14,
+                    HASH_ZERO,
+                    &i_hash_shift,
+                    &i_hash_mask,
+                    0
+</pre>
+The inode would be inserted into this hash table to be looked up quickly.
+<ul>
+<li> INSERT
+<pre>
+insert_inode_locked() <- __ext4_new_inode()
+<font color="blue">
+// Look up in cache, create a new one if not exist(I_NEW).
+</font>
+iget_locked() <- __ext4_iget()
+
+<font color="blue">
+Search for the inode specified by @hashval and @data in the inode cache,
+and if present it is return it with an increased reference count. This is
+a generalized version of iget_locked() for file systems where the inode
+number is not sufficient for unique identification of an inode.
+</font>
+inode_insert5 <- iget5_locked()
+              <- insert_inode_locked4()
+
+__insert_inode_hash() <- insert_inode_hash()
+</pre>
+<li> LOOKUP
+<pre>
+A very common code path should be,
+ext4_lookup()
+---
+<font color="blue">
+    //Try to lookup the file in directory entry
+</font>
+    bh = ext4_lookup_entry(dir, dentry, &de);
+    if (bh) {
+        __u32 ino = le32_to_cpu(de->inode);
+        brelse(bh);
+        ...
+<font color="blue">
+        // Get a valid inode id, try to get the inode for it
+</font>
+        inode = ext4_iget(dir->i_sb, ino, EXT4_IGET_NORMAL);
+          -> __ext4_iget()
+          ---
+            inode = iget_locked(sb, ino);
+            ...
+<font color="blue">
+            // It is cached in inode cache
+</font>
+            if (!(inode->i_state & I_NEW))
+                return inode;
+
+            ei = EXT4_I(inode);
+            iloc.bh = NULL;
+<font color="blue">
+            // Get the inode on disk
+</font>
+            ret = __ext4_get_inode_loc_noinmem(inode, &iloc);
+            ...
+            raw_inode = ext4_raw_inode(&iloc);
+          ---
+---
+</pre>
+</ul>
+Some filesystems, such as xfs, maintain a inode cache itself.
+<pre>
+xfs_lookup()
+  -> xfs_dir_lookup()
+  -> xfs_iget()
+  ---
+<font color="blue">
+    // See it ? this is a fs private inode cache and it is more scalable
+</font>
+    pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ino));
+    agino = XFS_INO_TO_AGINO(mp, ino);
+
+again:
+    error = 0;
+    rcu_read_lock();
+    ip = radix_tree_lookup(&pag->pag_ici_root, agino);
+
+    if (ip) {
+        error = xfs_iget_cache_hit(pag, ip, ino, flags, lock_flags);
+        ...
+    } else {
+        rcu_read_unlock();
+        ...
+
+        error = xfs_iget_cache_miss(mp, pag, tp, ino, &ip,
+                            flags, lock_flags);
+                            
+        ...
+        ---
+<font color="blue">
+        // Allocate xfs_inode where a vfs inode is embedded in
+</font>
+        ip = xfs_inode_alloc(mp, ino);
+        ...
+        } else {
+<font color="blue">
+            // get the xfs_buf for this inode
+</font>
+            error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &bp, 0);
+<font color="blue">
+            // fill the inode with data on disk
+</font>
+            error = xfs_inode_from_disk(ip, dip);
+            xfs_trans_brelse(tp, bp);
+        }
+        ...
+<font color="red">
+        iflags = XFS_INEW;
+</font>
+        if (flags & XFS_IGET_DONTCACHE)
+            d_mark_dontcache(VFS_I(ip));
+        xfs_iflags_set(ip, iflags);
+
+        /* insert the new inode */
+        spin_lock(&pag->pag_ici_lock);
+        error = radix_tree_insert(&pag->pag_ici_root, agino, ip);
+        spin_unlock(&pag->pag_ici_lock);
+        ---
+    }
+    xfs_perag_put(pag);
+  ---
+</pre>
+Another thing need to be talked is the way to reclaim indoe cache
+<ul>
+<li> Which one could be reclaimed
+<pre>
+
+<B>For xfs</B>
+
+iput()
+  -> iput_final()
+  ---
+    if (op->drop_inode)
+        drop = op->drop_inode(inode);
+    else
+        drop = generic_drop_inode(inode);
+<font color="blue">
+    // In generic_drop_inode, there are 3 conditions,
+    //  - !inode->i_nlink, means the file or hardlink have been cut off
+    //  - inode_unhashed(), means this inode is not in inode hash table
+          <font color="red">for xfs, this true,</font> because it use inode cache of its own
+    //  - I_DONTCACHE
+</font>
+    if (!drop && (sb->s_flags & SB_ACTIVE)) {
+        inode_add_lru(inode);
+        spin_unlock(&inode->i_lock);
+        return;
+    }
+    ...
+    WRITE_ONCE(inode->i_state, state | I_FREEING);
+    if (!list_empty(&inode->i_lru))
+        inode_lru_list_del(inode);
+    spin_unlock(&inode->i_lock);
+
+    evict(inode);
+  ---
+evict()
+  -> destroy_inode()
+    -> sb ops->destroy_inode()
+       xfs_fs_destroy_inode()
+         -> xfs_inactive() //<font color="blue">Won't do more because i_nlink is not zero</font>>
+         -> xfs_inode_set_reclaim_tag()
+         --
+             xfs_perag_set_reclaim_tag(pag);
+<font color="red">            __xfs_iflags_set(ip, XFS_IRECLAIMABLE);</font>
+         --
+
+This XFS_IRECLAIMABLE will be handled by
+xfs_iget_cache_hit()
+---
+<font color="blue">
+    /*
+     * If IRECLAIMABLE is set, we've torn down the VFS inode already.
+     * Need to carefully get it back into useable state.
+     */
+</font>
+    if (ip->i_flags & XFS_IRECLAIMABLE) {
+        ...
+    }
+---
+<B>For normal</B>
+prune_icache_sb()
+  -> inode_lru_isolate()
+  ---
+<font color="blue">
+    /*
+     * Referenced or dirty inodes are still in use. Give them another pass
+     * through the LRU as we canot reclaim them now.
+     */
+</font>
+    if (atomic_read(&inode->i_count) ||
+        (inode->i_state & ~I_REFERENCED)) {
+        list_lru_isolate(lru, &inode->i_lru);
+        spin_unlock(&inode->i_lock);
+        this_cpu_dec(nr_unused);
+        return LRU_REMOVED;
+    }
+  ---
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="xfs_log">Xfs Log</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="relog">Relog</a></h3>
+<p>
+<font size="2">
+Quote from https://www.infradead.org/~mchehab/kernel_docs/filesystems/xfs-delayed-logging-design.html
+<pre>
+XFS allows multiple separate modifications to a single object to be carried in the log at any given time.
+<U>This allows the log to avoid needing to flush each change to disk before recording a new change to the object.</U>
+XFS does this via a method called “re-logging”. Conceptually, this is quite simple - all it requires is
+that any new change to the object is recorded with a new copy of all the existing changes in the new
+transaction that is written to the log.
+</pre>
+Regarding to the comment with underline, we could refer to the implementation of jbd2,
+<pre>
+jbd2 could be deemed as a WAL in blocks, namely, before flush the dirty blocks to real
+position on disk, jbd2 would record them on journal first. In common case, jbd2 would
+shadow the original buffer_head to do the journal IO.
+
+jbd2_journal_write_metadata_buffer()
+---
+    spin_lock(&jh_in->b_state_lock);
+repeat:
+    if (jh_in->b_frozen_data) {
+        ...
+    } else {
+        new_page = jh2bh(jh_in)->b_page;
+        new_offset = offset_in_page(jh2bh(jh_in)->b_data);
+    }
+    ...
+    set_bh_page(new_bh, new_page, new_offset);
+    new_bh->b_size = bh_in->b_size;
+    new_bh->b_bdev = journal->j_dev;
+    new_bh->b_blocknr = blocknr;
+    new_bh->b_private = bh_in;
+    set_buffer_mapped(new_bh);
+    set_buffer_dirty(new_bh);
+
+    *bh_out = new_bh;
+
+    spin_lock(&journal->j_list_lock);
+    __jbd2_journal_file_buffer(jh_in, transaction, BJ_Shadow);
+    spin_unlock(&journal->j_list_lock);
+<font color="red">
+    set_buffer_shadow(bh_in);
+</font>
+    spin_unlock(&jh_in->b_state_lock); //<font color="blue">Protect this journal buffer head</font>
+---
+
+do_get_write_access()
+---
+    spin_lock(&jh->b_state_lock);
+    ...
+    if (buffer_shadow(bh)) {
+        spin_unlock(&jh->b_state_lock);
+        wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+        goto repeat;
+    }
+    ...
+---
+<font color="red">
+A very important thing need to be noted is that the modification has been made in
+buffer_head which is the cache of the disk.
+</font>
+</pre>
+<br/>
+How does xfs implement its relog mechanisms ?<br/>
+We have to anwser follwing questions,
+<ul>
+<li> full or increament log between different version ?
+<pre>
+inode update log is <B>full</B>
+xfs_inode_item_ops.xfs_inode_item_format()
+  -> xfs_inode_item_format_core()
+    -> xfs_inode_to_log_dinode_ts()
+      -> copy the in-memory inode to <font color="red">xfs_log_dinode</font>
+     
+  -> xfs_inode_item_data_fork_size()
+
+</pre>
+<li> before checkpoint, is the modifications could be seen ?
+     in the other words, where the modifications is made
+     during different phase of log
+</ul>
+</font>
+</p>
+
+</body>
+</html>
+
+
