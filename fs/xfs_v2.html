@@ -10,21 +10,680 @@
 </div>
 <p>
 <font size="2">
+<a href="#concepts">Concepts</a>
+<ul>
+<li> <a href="#link_count">link count</a>
+<li> <a href="#posix_unlink">posix unlink</a>
+<li> <a href="#asynchronous_journal">asynchronous journal</a>
+</ul>
+
+<a href="#infrastructure">infrastructure</a>
+<ul>
+<li> <a href="#iov_iter">iov_iter</a>
+<li> <a href="#inode_lock_and_fault">inode lock and page fault</font>
+</ul>
+
 <a href="#inode">Inode</a>
 <ul>
 <li> <a href="#reference_of_inode">reference of inode</a>
 <li> <a href="#lazytime_mode">lazytime mode</a>
 <li> <a href="#inode_cache">inode cache</a>
 </ul>
+
+<a href="#dcache">Dcache</a>
+<ul>
+<li> <a href="#shrink_of_dcache">shrink of dcache</a>
+<li> <a href="#lookup">lookup</a>
+<li> <a href="#dcache_and_metadata">dcache and metadata</a>
+</ul>
+
+<a href="#tmpfs">Tmpfs</a><br/>
 <a href="#xfs_log">Xfs Log</a>
 <ul>
+<li> <a href="#xlog_framework">xlog framework</a>
 <li> <a href="#relog">Relog</a>
+<li> <a href="#deferred_operations">Deferred operations</a>
+<li> <a href="#log_space">log space</a>
+</ul>
+<a href="#xfs_inode">Xfs Inode</a>
+<ul>
+<li> <a href="#xfs_inode_mgnt">inode management</a>
+</ul>
+<a href="#xfs_buf">xfs buf</a>
+</font>
+</p>
+
+
+
+<h2><a name="concepts">Concepts</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="link_count">link count</a></h3>
+<p>
+<font size="2">
+The link count of a file tells the total number of links a file has
+which is nothing but the number of hard-links a file has. This count,
+however, does not include the soft-link count.
+
+Note: The soft-link is not part of the link count since the soft-link's
+inode number is different from the original file. 
+
+When a directory is created, an extra link count is increased because for
+every directory created, a link gets created in the parent directory to
+point to this new directory.
+
+Means, when create sub-directory b in directory a, b's link count is 2.
+</font>
+</p>
+
+<h3><a name="posix_unlink">unlink</a></h3>
+<p>
+<font size="2">
+Quote from https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html#tag_16_635
+<pre>
+When the file's link count becomes 0 and no process has the file open, the space occupied by
+the file shall be freed and the file shall no longer be accessible. If one or more processes
+have the file open when the last link is removed, the link shall be removed before unlink()
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+returns, but the removal of the file contents shall be postponed until all references to the
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+file are closed.
+^^^^^^^^^^^^^^
+</pre>
+How does xfs implement this ?
+
+<ul>
+<li> When nlink of inode reaches zero
+<pre>
+xfs_droplink()
+---
+    xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+<font color="blue">
+    // drop the link in the indoe on disk
+</font>
+    drop_nlink(VFS_I(ip));
+    xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+
+    if (VFS_I(ip)->i_nlink)
+        return 0;
+
+    return xfs_iunlink(tp, ip);
+---
+<font color="blue">
+// link this inode on the list on agi->agi_unlinked[]
+</font>
+xfs_iunlink()
+  -> xfs_iunlink_update_bucket()
+  ---
+    agi->agi_unlinked[bucket_index] = cpu_to_be32(new_agino);
+    offset = offsetof(struct xfs_agi, agi_unlinked) +
+            (sizeof(xfs_agino_t) * bucket_index);
+<font color="red">    xfs_trans_log_buf(tp, agibp, offset, offset + sizeof(xfs_agino_t) - 1);</font>
+---
+</pre>
+<li> when reference of inode reaches zero
+<pre>
+xfs_fs_destroy_inode()
+  -> xfs_inactive()
+  ---
+    if (VFS_I(ip)->i_nlink != 0) {
+        ...
+        return;
+    }
+
+    if (S_ISREG(VFS_I(ip)->i_mode) &&
+        (ip->i_d.di_size != 0 || XFS_ISIZE(ip) != 0 ||
+         ip->i_df.if_nextents > 0 || ip->i_delayed_blks > 0))
+        truncate = 1;
+    ...
+    if (S_ISLNK(VFS_I(ip)->i_mode))
+        error = xfs_inactive_symlink(ip);
+    else if (truncate)
+<font color="red">        error = xfs_inactive_truncate(ip);</font>
+    if (error)
+        return;
+    ...
+    /*
+     * Free the inode.
+     */
+    error = xfs_inactive_ifree(ip);
+      -> xfs_ifree()
+<font color="red">        -> xfs_iunlink_remove()</font>
+  ---
+</pre>
+<li> Recover AGI unlinked lists
+<pre>
+This is called during recovery to <U>process any inodes which we unlinked but
+not freed when the system crashed.</U>  These inodes will be on the lists in the
+AGI blocks. What we do here is scan all the AGIs and fully truncate and free
+any inodes found on the lists. Each inode is removed from the lists when it
+has been fully truncated and is freed. The freeing of the inode and its
+removal from the list must be atomic.
+
+xlog_recover_process_iunlinks()
+  -> xlog_recover_process_one_iunlink()
+  ---
+    ino = XFS_AGINO_TO_INO(mp, agno, agino);
+    error = xfs_iget(mp, NULL, ino, 0, 0, &ip);
+    ...
+    error = xfs_imap_to_bp(mp, NULL, &ip->i_imap, &dip, &ibp, 0);
+    ...
+    <font color="red">agino = be32_to_cpu(dip->di_next_unlinked);</font>
+    xfs_buf_relse(ibp);
+
+    xfs_irele(ip);
+      -> iput(VFS_I(ip));
+<font color="blue">
+      //The reference would be zero and triger xfs_fs_destroy_inode()
+</font>
+
+  ---
+</pre>
 </ul>
 </font>
 </p>
 
+
+<h3><a name="asynchronous_journal">asynchronous journal</h3>
+<p>
+<font size="2">
+Actually, both xfs and ext4-jbd2 employ asynchronous journal which<br/>
+could batch IOs to journal to promote performance. Asynchronous journal<br/>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+may lead to lose data (inode could also be lost) but still keep metadata consistent.<br/>
+Let's look at how does xfs and ext4-jbd2 implement the asynchronous journal
+<ul>
+<li> XFS
+<pre>
+__xfs_trans_commit()
+  -> xfs_log_commit_cil()
+    -> xlog_cil_push_background()
+---
+<font color="blue">
+    // min_t(int, (log)->l_logsize >> 3, BBTOB(XLOG_TOTAL_REC_SHIFT(log)) << 4)
+    //                                         ^^^^^^^^^^^^^^^^^^^^^^^^
+    //                                         Max of the xlog buffer
+</font>
+    if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log)) {
+        up_read(&cil->xc_ctx_lock);
+        return;
+    }
+
+    spin_lock(&cil->xc_push_lock);
+    if (cil->xc_push_seq < cil->xc_current_sequence) {
+        cil->xc_push_seq = cil->xc_current_sequence;
+        queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+    }
+
+    up_read(&cil->xc_ctx_lock);
+
+<font color="blue">
+    /*
+     * If we are well over the space limit, throttle the work that is being
+     * done until the push work on this context has begun.
+     */
+</font>
+    if (cil->xc_ctx->space_used >= XLOG_CIL_BLOCKING_SPACE_LIMIT(log)) {
+        xlog_wait(&cil->xc_push_wait, &cil->xc_push_lock);
+        return;
+    }
+    spin_unlock(&cil->xc_push_lock);
+---
+</pre>
+<li> EXT4-JBD2
+<pre>
+When to start commit jdb2?
+(1) log space is not enough
+start_this_handle()
+  -> add_transaction_credits()
+  ---
+    needed = atomic_add_return(total, &t->t_outstanding_credits);
+    if (needed > journal->j_max_transaction_buffers) {
+<font color="blue">
+        /*
+         * If the current transaction is already too large,
+         * then start to commit it: we can then go back and
+         * attach this handle to a new transaction.
+         */
+</font>
+        atomic_sub(total, &t->t_outstanding_credits);
+        ...
+        wait_transaction_locked(journal);
+        return 1;
+    }
+  ---
+(2) transaction is too old
+jbd2_journal_stop()
+---
+<font color="blue">
+    /*
+     * If the handle is marked SYNC, we need to set another commit
+     * going!  We also want to force a commit if the transaction is too
+     * old now.
+     */
+</font>
+    if (handle->h_sync ||
+        time_after_eq(jiffies, transaction->t_expires)) {
+        /* This is non-blocking */
+        jbd2_log_start_commit(journal, tid);
+    }
+---
+(3) commit timeouts
+jbd2_get_transaction()
+---
+    /* Set up the commit timer for the new transaction. */
+    journal->j_commit_timer.expires = round_jiffies_up(transaction->t_expires);
+    add_timer(&journal->j_commit_timer);
+---
+
+commit_timeout()
+---
+    journal_t *journal = from_timer(journal, t, j_commit_timer);
+
+    wake_up_process(journal->j_task);
+---
+</pre>
+</ul>
+In constrast with asynchronous journal, synchronous journal could guarantee<br/>
+the metadata has been on disk after the syscall returns, but this could hurts<br/>
+the performance. Batch synchronous journal IO is to promote this which has been<br/>
+supported by jbd2.
+<pre>
+jbd2_journal_stop()
+---
+<font color="blue">
+    /*
+     * Implement synchronous transaction batching.<font color="red">If the handle
+     * was synchronous, don't force a commit immediately.  Let's
+     * yield and let another thread piggyback onto this
+     * transaction.</font>  Keep doing that while new threads continue to
+     * arrive.  It doesn't cost much - we're about to run a committed
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * and sleep on IO anyway.  Speeds up many-threaded, many-dir
+       ^^^^^^^^^^^^^^^^^^^^^^
+                The io here means the journal IO if we commit immediately.
+     * operations by 30x or more...
+     *
+     * We try and optimize the sleep time against what the
+     * underlying disk can do, instead of having a static sleep
+     * time.  This is useful for the case where our storage is so
+     * fast that it is more optimal to go ahead and force a flush
+     * and wait for the transaction to be committed than it is to
+     * wait for an arbitrary amount of time for new writers to
+     * join the transaction.  We achieve this by measuring how
+     * long it takes to commit a transaction, and compare it with
+     * how long this transaction has been running, and if run time
+     * < commit time then we sleep for the delta and commit.  This
+     * greatly helps super fast disks that would see slowdowns as
+     * more threads started doing fsyncs.
+     *
+     * But don't do this if this process was the most recent one '
+     * to perform a synchronous write.  We do this to detect the
+     * case where a single process is doing a stream of sync
+     * writes.  No point in waiting for joiners in that case.
+     *
+     * Setting max_batch_time to 0 disables this completely.
+     */
+</font>
+    pid = current->pid;
+    if (handle->h_sync && journal->j_last_sync_writer != pid &&
+        journal->j_max_batch_time) {
+        u64 commit_time, trans_time;
+
+        journal->j_last_sync_writer = pid;
+
+        read_lock(&journal->j_state_lock);
+        commit_time = journal->j_average_commit_time;
+        read_unlock(&journal->j_state_lock);
+
+        trans_time = ktime_to_ns(ktime_sub(ktime_get(),
+                           transaction->t_start_time));
+
+        commit_time = max_t(u64, commit_time,
+                    1000*journal->j_min_batch_time);
+        commit_time = min_t(u64, commit_time,
+                    1000*journal->j_max_batch_time);
+
+        if (trans_time < commit_time) {
+            ktime_t expires = ktime_add_ns(ktime_get(),
+                               commit_time);
+            set_current_state(TASK_UNINTERRUPTIBLE);
+            schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
+        }
+    }
+
+    if (handle->h_sync)
+        transaction->t_synchronous_commit = 1;
+
+    if (handle->h_sync ||
+        time_after_eq(jiffies, transaction->t_expires)) {
+        jbd2_log_start_commit(journal, tid);
+        /*
+         * Special case: JBD2_SYNC synchronous updates require us
+         * to wait for the commit to complete.
+         */
+        if (handle->h_sync && !(current->flags & PF_MEMALLOC))
+            wait_for_commit = 1;
+    }
+
+    stop_this_handle(handle);
+
+    if (wait_for_commit)
+        err = jbd2_log_wait_commit(journal, tid);
+---
+</pre>
+</font>
+</p>
+
+
+<h2><a name="infrastructure">infrastructure</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="iov_iter">iov_iter</a></h3>
+<p>
+<font size="2">
+What's iov_iter ?<br/>
+<pre>
+struct iov_iter {
+    unsigned int type;   <font color="blue">Type, IOVEC/KVEC/BVEC</font>
+    size_t iov_offset;   <font color="blue">current offset, like bio.bi_iter.bi_sector</font>
+    size_t count;        <font color="blue">residual count like bio.bi_iter.bi_size</font>
+    union {
+        const struct iovec *iov;   
+        const struct kvec *kvec;
+        const struct bio_vec *bvec;
+        ...
+    };
+<font color="blue">
+    See the bio_vec, basically, iov and kvec have similar functions.
+    The bio.bi_io_vec always points the head of the bvec array.
+    iov/kvec/bvec always points the current vector, like bio.bi_io_vec[bio->bi_iter.bi_idx]
+</font>
+    ...
+};
+
+Just refer to iterate_and_advance() to know how does the iov_iter work
+
+Even though we try to compare the bio with iov_iter, but they are not different.
+bio has a map between the block device and buffer in memory,
+however, iov_iter only describes the buffer, which is more similar with sglist.
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</pre>
+Next, we will figure out what does the IOVEC/KVEC/BVEC mean and who dose use them.
+<ul>
+<li> IOVEC, address from userland
+<pre>
+
+struct iovec
+{
+    void __user *iov_base;
+    __kernel_size_t iov_len;
+};
+
+There are two cases here,
+(1) construct iov_iter in kernel, and address from userland
+vfs_read()
+  -> new_sync_read() <font color="blue">//read_iter</font>
+  ---
+    struct iovec iov = { .iov_base = buf, .iov_len = len };
+    struct kiocb kiocb;
+    struct iov_iter iter;
+    ssize_t ret;
+
+    init_sync_kiocb(&kiocb, filp);
+<font color="blue">
+    // We have said that iov_iter is just buffer, the io is described 
+    // by kiocb.ki_filp and kiocb.ki_pos
+</font>
+    kiocb.ki_pos = (ppos ? *ppos : 0);
+    iov_iter_init(&iter, READ, &iov, 1, len);
+
+    ret = call_read_iter(filp, &kiocb, &iter);
+  ---
+(2) iov array is from userland
+
+static ssize_t vfs_readv(
+    struct file *file,
+<font color="red">    const struct iovec __user *vec,</font>
+    unsigned long vlen,
+    loff_t *pos,
+    rwf_t flags)
+{
+    struct iovec iovstack[UIO_FASTIOV];
+    struct iovec *iov = iovstack;
+    struct iov_iter iter;
+    ssize_t ret;
+
+    ret = import_iovec(READ, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
+<font color="blue">
+    // __import_iovec()->iovec_from_user() would copy the iovec array from userland
+</font>
+    if (ret >= 0) {
+        ret = do_iter_read(file, &iter, pos, flags);
+        kfree(iov);
+    }
+
+    return ret;
+}
+
+</pre>
+<li> KVEC, address from kernel, BVEC, a page in it
+<pre>
+struct kvec {
+    void *iov_base;
+    size_t iov_len;
+};
+
+struct bio_vec {
+    struct page    *bv_page;
+    unsigned int    bv_len;
+    unsigned int    bv_offset;
+};
+
+nbd_send_cmd() use both of them,
+
+nbd_send_cmd()
+---
+    struct nbd_request request = {.magic = htonl(NBD_REQUEST_MAGIC)};
+    struct kvec iov = {.iov_base = &request, .iov_len = sizeof(request)};
+    struct iov_iter from;
+<font color="blue">
+    //1st kvec is used to send nbd command
+</font>
+    iov_iter_kvec(&from, WRITE, &iov, 1, sizeof(request));
+    ...
+    cmd->index = index;
+    cmd->cookie = nsock->cookie;
+    cmd->retries = 0;
+    request.type = htonl(type | nbd_cmd_flags);
+    if (type != NBD_CMD_FLUSH) {
+        request.from = cpu_to_be64((u64)blk_rq_pos(req) << 9);
+        request.len = htonl(size);
+    }
+    handle = nbd_cmd_handle(cmd);
+    memcpy(request.handle, &handle, sizeof(handle));
+<font color="blue">
+    //the iov_iter 'from' carry the nbd command
+</font>
+    result = sock_xmit(nbd, index, 1, &from,
+            (type == NBD_CMD_WRITE) ? MSG_MORE : 0, &sent);
+
+send_pages:
+    if (type != NBD_CMD_WRITE)
+        goto out;
+<font color="blue">
+    //Then let's send out the request with bvec iov_iter_bvec
+</font>
+    bio = req->bio;
+    while (bio) {
+        struct bio *next = bio->bi_next;
+        struct bvec_iter iter;
+        struct bio_vec bvec;
+
+        bio_for_each_segment(bvec, bio, iter) {
+            bool is_last = !next && bio_iter_last(bvec, iter);
+            int flags = is_last ? 0 : MSG_MORE;
+
+<font color="blue">
+            //Setup a iov_iter for every bvec
+</font>
+            iov_iter_bvec(&from, WRITE, &bvec, 1, bvec.bv_len);
+            ...
+            result = sock_xmit(nbd, index, 1, &from, flags, &sent);
+            ...
+            if (is_last)
+                break;
+        }
+        bio = next;
+    }
+---
+</pre>
+</ul>
+The other modules that receive iov_iter could use following interfaces to handle it
+<pre>
+
+size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
+             struct iov_iter *i)
+{
+    if (unlikely(!page_copy_sane(page, offset, bytes)))
+        return 0;
+<font color="red">
+    if (i->type & (ITER_BVEC|ITER_KVEC)) {
+</font>
+        void *kaddr = kmap_atomic(page);
+        size_t wanted = copy_to_iter(kaddr + offset, bytes, i);
+        kunmap_atomic(kaddr);
+        return wanted;
+    } else if (unlikely(iov_iter_is_discard(i)))
+        return bytes;
+    else if (likely(!iov_iter_is_pipe(i)))
+        return copy_page_to_iter_iovec(page, offset, bytes, i);
+    else
+        return copy_page_to_iter_pipe(page, offset, bytes, i);
+}
+
+
+size_t _copy_to_iter(const void *addr, size_t bytes, struct iov_iter *i)
+{
+    const char *from = addr;
+    if (unlikely(iov_iter_is_pipe(i)))
+        return copy_pipe_to_iter(addr, bytes, i);
+    if (iter_is_iovec(i))
+        might_fault();
+    iterate_and_advance(i, bytes, v,
+<font color="blue">
+        //IOVEC, userland buffers, the 'I' in iterate_and_advance
+</font>
+        copyout(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len),
+<font color="blue">
+        //BVEC, pages, the 'B' in iterate_and_advance
+</font>
+        memcpy_to_page(v.bv_page, v.bv_offset,
+                   (from += v.bv_len) - v.bv_len, v.bv_len),
+<font color="blue">
+        //KVEC, kernel buffers, the 'K' in iterate_and_advance
+</font>
+        memcpy(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len)
+    )
+
+    return bytes;
+}
+</pre>
+</font>
+</p>
+
+<h3><a name="inode_lock_and_fault">inode lock and page fault</font></h3>
+
 <h2><a name="inode">inode</a></h2>
 <hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+We cannot take the inode lock (inode.i_rwsem) in page fault path.<br/>
+For example,
+<pre>
+ext4_dax_vm_ops.ext4_dax_huge_fault()
+---
+    if (write) {
+        ...
+    } else {
+<font color="red">        down_read(&EXT4_I(inode)->i_mmap_sem);</font>
+    }
+    result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
+    if (write) {
+        ...
+    } else {
+<font color="red">        up_read(&EXT4_I(inode)->i_mmap_sem);</font>
+    }
+---
+
+xfs_file_vm_ops.xfs_filemap_fault()
+---
+<font color="blue">
+    // XFS_MMAPLOCK_SHARED -> xfs_inode_t.i_mmaplock
+</font>
+    xfs_ilock(XFS_I(inode), <font color="red">XFS_MMAPLOCK_SHARED</font>);
+    if (IS_DAX(inode)) {
+        pfn_t pfn;
+
+        ret = dax_iomap_fault(vmf, pe_size, &pfn, NULL,
+                (write_fault && !vmf->cow_page) ?
+                 &xfs_direct_write_iomap_ops :
+                 &xfs_read_iomap_ops);
+        if (ret & VM_FAULT_NEEDDSYNC)
+            ret = dax_finish_sync_fault(vmf, pe_size, pfn);
+    } else {
+        if (write_fault)
+            ret = iomap_page_mkwrite(vmf,
+                    &xfs_buffered_write_iomap_ops);
+        else
+            ret = filemap_fault(vmf);
+    }
+    xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+---
+</pre>
+<B>Why ?</B>
+Refer to link, https://lwn.net/Articles/548098 <br/>
+<pre>
+The problem has to do with the order in which locks are acquired.
+For normal filesystem operations, the filesystem code will obtain any locks it requires;
+the memory management subsystem will then grab mmap_sem should that be required — to bring a read or write buffer into RAM, for example. 
+When a page fault happens, though, the lock ordering is reversed:
+first mmap_sem is taken, then the filesystem code is invoked to bring the needed page into RAM.
+</pre>
+Let's look at the code that could show us the lock ordering,
+<ul>
+<li> fs lock -> mmap lock
+<pre>
+ext4_dax_read_iter()
+  -> <font color="red">inode_lock_shared()</font>
+  -> dax_iomap_rw()
+    -> iomap_apply()
+      -> dax_iomap_actor()
+        -> dax_copy_to_iter()
+          -> _copy_mc_to_iter()
+          <font color="blue">
+          // when we write to userland buffer, page fault would happen, and then
+          // do_user_addr_fault() would come
+          </font>
+</pre>
+<li> mmap lock -> fs lock
+<pre>
+do_user_addr_fault()
+<font color="red">  -> mmap_read_lock(mm)</font>
+  -> handle_mm_fault()
+    -> __handle_mm_fault()
+      -> handle_pte_fault()
+        -> do_fault()
+          -> do_read_fault()
+            -> __do_fault()
+              -> vma->vm_ops->fault(vmf);
+                 ext4_dax_fault()
+                 xfs_filemap_fault()
+</pre>
+</ul>
+</font>
+</p>
+
 
 <h3><a name="reference_of_inode">reference of inode</a></h3>
 <p>
@@ -486,8 +1145,671 @@ prune_icache_sb()
 </font>
 </p>
 
+<a name="dcache">Dcache</a>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<a name="shrink_of_dcache">shrink of dcache</a>
+<p>
+<font size="2">
+<ul>
+<li> shrinker
+<pre>
+prune_dcache_sb()
+---
+    freed = list_lru_shrink_walk(&sb->s_dentry_lru, sc,
+                     <font color="red">dentry_lru_isolate</font>, &dispose);
+<font color="red">    shrink_dentry_list(&dispose);</font>
+---
+dentry_lru_isolate()
+---
+    if (!spin_trylock(&dentry->d_lock))
+        return LRU_SKIP;
+<font color="blue">
+    /*
+     * Referenced dentries are still in use. If they have active
+     * counts, just remove them from the LRU. Otherwise give them
+     * another pass through the LRU.
+     */
+</font>
+    if (dentry->d_lockref.count) {
+        d_lru_isolate(lru, dentry);
+        spin_unlock(&dentry->d_lock);
+        return LRU_REMOVED;
+    }
+
+    if (dentry->d_flags & DCACHE_REFERENCED) {
+        dentry->d_flags &= ~DCACHE_REFERENCED;
+        spin_unlock(&dentry->d_lock);
+        return LRU_ROTATE;
+    }
+
+    d_lru_shrink_move(lru, dentry, freeable);
+    spin_unlock(&dentry->d_lock);
+
+    return LRU_REMOVED;
+---
+
+shrink_dentry_list()
+  -> __dentry_kill()
+    -> __d_drop()
+      -> ___d_drop() //<font color="blue">remove the dentry from the hashtable</font>
+    -> dentry_free()
+      -> call_rcu(&dentry->d_u.d_rcu, __d_free);<font color="blue">Nothing will be freed under rcu_read_lock</font>
+</pre>
+<li> get and put
+<pre>
+dget()
+---
+    if (dentry)
+        lockref_get(&dentry->d_lockref);
+    return dentry;
+---
+
+dput()
+---
+    rcu_read_lock();
+        if (likely(fast_dput(dentry))) {
+            rcu_read_unlock();
+            return;
+        }
+<font color="blue">
+        /* Slow case: now with the dentry lock held */
+</font>
+        rcu_read_unlock();
+
+        if (likely(retain_dentry(dentry))) {
+            spin_unlock(&dentry->d_lock);
+            return;
+        }
+
+        dentry = dentry_kill(dentry);
+---
+retain_dentry()
+---
+<font color="blue">
+    //vfs_unlink() -> __d_drop() could cause this.
+</font>
+    if (unlikely(d_unhashed(dentry)))
+        return false;
+    ...
+<font color="blue">
+    // Two rounds in lru
+</font>
+    dentry->d_lockref.count--;
+    if (unlikely(!(dentry->d_flags & DCACHE_LRU_LIST)))
+        d_lru_add(dentry);
+    else if (unlikely(!(dentry->d_flags & DCACHE_REFERENCED)))
+        dentry->d_flags |= DCACHE_REFERENCED;
+    return true;
+---
+
+To prevent dentry from being reclaimed,
+(1) hold a reference with dget() (d_lru_isolate() will remove it from lru list in dentry_lru_isolate)
+(2) use it and then DCACHE_REFERENCED will always be set
+</pre>
+</ul>
+</font>
+</p>
+
+<a name="lookup">lookup</a>
+<p>
+<font size="2">
+<ul>
+<li> overview
+<pre>
+do_filp_open()
+---
+<font color="blue">
+    // Try to use LOOKUP_RCU first, if failed with ECHILD,
+    // try again w/o LOOKUP_RCU
+</font>
+    filp = path_openat(&nd, op, flags | LOOKUP_RCU);
+    if (unlikely(filp == ERR_PTR(-ECHILD)))
+        filp = path_openat(&nd, op, flags)
+---
+
+path_openat()
+---
+        const char *s = path_init(nd, flags); //<font color="blue">rcu_read_lock is get here</font>
+<font color="blue">
+        /home/jianchwa/linux-stable/fs/dcache.c 
+        \____________ _______________/ \__ __/
+                     v                    v
+              link_path_walk()     open_last_lookups()
+</font>
+        while (!(error = link_path_walk(s, nd)) &&
+               (s = open_last_lookups(nd, file, op)) != NULL)
+            ;
+        if (!error)
+            error = do_open(nd, file, op); <font color="blue">// do the finally open</font>
+        terminate_walk(nd);
+
+---
+</pre>
+<li> fast lookup under rcu_read_lock
+<pre>
+There are 3 points here regarding to fast lookup
+(1) it is only to accelerate the dentry cache hit cases
+    if not hit, lookup would fallback to non-rcu mode
+(2) dentry won't be freed during this but maybe killed
+(3) <U>sequence count is used to protect the lookup against rename</U>
+
+Regarding to the point 3,
+vfs_rename()
+  -> d_move()
+    -> __d_move()
+    ---
+    spin_lock_nested(&dentry->d_lock, 2);
+    spin_lock_nested(&target->d_lock, 3);
+    ...
+    write_seqcount_begin(&dentry->d_seq);
+    write_seqcount_begin_nested(&target->d_seq, DENTRY_D_LOCK_NESTED);
+
+    /* unhash both */
+    if (!d_unhashed(dentry))
+        ___d_drop(dentry);
+    if (!d_unhashed(target))
+        ___d_drop(target);
+
+    /* ... and switch them in the tree */
+    dentry->d_parent = target->d_parent;
+    if (!exchange) {
+        copy_name(dentry, target);
+        target->d_hash.pprev = NULL;
+        dentry->d_parent->d_lockref.count++;
+        if (dentry != old_parent) /* wasn't IS_ROOT */
+            WARN_ON(!--old_parent->d_lockref.count);
+    }
+    ...
+    list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+    __d_rehash(dentry);
+    ...
+    write_seqcount_end(&target->d_seq);
+    write_seqcount_end(&dentry->d_seq);
+    ---
+
+__d_lookup_rcu()
+---
+    hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
+        unsigned seq;
+
+seqretry:
+<font color="blue">
+        /*
+         * The dentry sequence count protects us from concurrent
+         * renames, and thus protects parent and name fields.
+         * Otherwise, we may get a wrong entry, for example,
+         * during rename /home/will/aaaa to /home/will/bbbb,
+         * we could get baaa, bbaa, bbba, and if these files
+         * do exist, look up is screwed up.
+         */
+</font>
+        seq = raw_seqcount_begin(&dentry->d_seq);
+        if (dentry->d_parent != parent)
+            continue;
+        if (d_unhashed(dentry))
+            continue;
+
+        if (unlikely(parent->d_flags & DCACHE_OP_COMPARE)) {
+            ...
+        } else {
+            if (dentry->d_name.hash_len != hashlen)
+                continue;
+            if (dentry_cmp(dentry, str, hashlen_len(hashlen)) != 0)
+                continue;
+        }
+        *seqp = seq;
+        return dentry;
+    }
+---
+
+lookup_fast()
+---
+    if (nd->flags & LOOKUP_RCU) {
+        unsigned seq;
+        dentry = __d_lookup_rcu(parent, &nd->last, &seq);
+        ...
+        *inode = d_backing_inode(dentry);
+        if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
+            return ERR_PTR(-ECHILD);
+<font color="blue">
+        /*
+         * This sequence count validates that the parent had no
+         * changes while we did the lookup of the dentry above.
+         */
+
+         Why do we need to care about the parent ?
+         renaming of the parent won't influence the childrens, right ?
+</font>
+        if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
+            return ERR_PTR(-ECHILD);
+
+        *seqp = seq;
+        status = d_revalidate(dentry, nd->flags);
+        if (likely(status > 0))
+            return dentry;
+    }
+---
+
+Before the finally open, we would recheck the sequence count,
+do_open()
+  -> complete_walk()
+    -> unlazy_walk()
+      -> legitimize_path()
+           ---
+            if (unlikely(!lockref_get_not_dead(&path->dentry->d_lockref))) {
+                path->dentry = NULL;
+                return false;
+            }
+            return !read_seqcount_retry(&path->dentry->d_seq, seq);
+          ---
+</pre>
+</ul>
+</font>
+</p>
+
+<a name="dcache_and_metadata">dcache and metadata</a>
+<p>
+<font size="2">
+The main points that dcache interacts with filesystem
+<pre>
+link_path_walk()
+  -> walk_component()
+    -> lookup_slow()
+      -> inode_lock_shared()
+      -> __lookup_slow()
+        -> d_alloc_parallel() //<font color="blue">allocate a dentry structure</font>
+<font color="red">        -> inode->i_op->lookup()</font>
+<font color="blue">
+          look up dentry in metadata,
+          do d_add() if found which would add dentry into dcache hashtable             
+</font>
+open_last_lookups()
+  -> lookup_open()
+    -> d_lookup() //<font color="blue">do look up under rename raed seqlock</font>
+    -> dir_inode->i_op->create() //<font color="blue">do create if needed</font>
+
+</pre>
+</font>
+</p>
+
+<h2><a name="tmpfs">Tmpfs</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> Tmpfs
+<pre>
+Everything in tmpfs is temporary in the sense that no files will be
+created on your hard drive. The files live in memory and swap
+space. If you unmount a tmpfs instance, everything stored therein is
+lost.
+</pre>
+
+<li> File
+<pre>
+An in-core inode with specific operations.
+See shmem_get_inode()
+
+An important thing is the dentry of this inode will be pined in memory
+shmem_mknod()
+---
+    inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE);
+    if (inode) {
+        ...
+        dir->i_size += BOGO_DIRENT_SIZE;
+        dir->i_ctime = dir->i_mtime = current_time(dir);
+        d_instantiate(dentry, inode);
+        dget(dentry); /* Extra count - pin the dentry in core */
+    }
+---
+<font color="red">
+The dentry for the inode will be perserved in dcache until it is deleted
+</font>
+</pre>
+<li> hard link
+<pre>
+An in-core dentry points to the linked inode
+
+shmem_link()
+---
+    dir->i_size += BOGO_DIRENT_SIZE;
+    inode->i_ctime = dir->i_ctime = dir->i_mtime = current_time(inode);
+    inc_nlink(inode);
+    ihold(inode);    /* New dentry reference */
+    dget(dentry);<font color="blue">        /* Extra pinning count for the created dentry */</font>
+    d_instantiate(dentry, inode);
+---
+</pre>
+</font>
+</p>
+
 <h2><a name="xfs_log">Xfs Log</a></h2>
 <hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+Let's take some relatively simple examples,
+<ul>
+<li> inode update log
+<pre>
+<li><B>log format (record)</B>
+xfs_inode_item_ops.xfs_inode_item_format()
+  -> xfs_inode_item_format_core()
+    -> xfs_inode_to_log_dinode_ts()
+      -> copy the in-memory inode to <font color="red">xfs_log_dinode</font>
+
+Note ! <font color="red">the modifications are not applied on the inode cluster xfs buffer.</font>
+<li><B>log push (checkpoint)</B>
+xfs_inode_item_push()
+---
+    if (xfs_ipincount(ip) > 0 || xfs_buf_ispinned(bp) ||
+        (ip->i_flags & XFS_ISTALE))
+        return XFS_ITEM_PINNED;
+
+    if (xfs_iflags_test(ip, XFS_IFLUSHING))
+        return XFS_ITEM_FLUSHING;
+<font color="blue">
+    // cluster buffer need to be locked during IO
+</font>
+    if (!xfs_buf_trylock(bp))
+        return XFS_ITEM_LOCKED;
+
+    spin_unlock(&lip->li_ailp->ail_lock);
+
+    xfs_buf_hold(bp);
+<font color="blue">
+    // flush the dirty inodes into cluster buffer
+</font>
+    error = xfs_iflush_cluster(bp);
+    if (!error) {
+<font color="blue">
+    // queue the cluster buffer to delayed write queue
+</font>
+        if (!xfs_buf_delwri_queue(bp, buffer_list))
+            rval = XFS_ITEM_FLUSHING;
+        xfs_buf_relse(bp);
+    }
+
+---
+</pre>
+<li> xfs buf log
+<pre>
+<li><B>log format (record)</B>
+xfs_item_ops.xfs_buf_item_format()
+  -> xfs_buf_item_format_segment()
+  ---
+    for (;;) {
+<font color="blue">
+        //The bitmap here describes which 128 bytes chunks of the buffer have
+        // been dirtied. This is done by
+        // xfs_trans_log_buf()
+        //   -> xfs_buf_item_log()
+        //     -> xfs_buf_item_log_segment()_
+</font>
+        next_bit = xfs_next_bit(blfp->blf_data_map, blfp->blf_map_size,
+                    (uint)last_bit + 1);
+        if (next_bit == -1) {
+            xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
+                        first_bit, nbits);
+            blfp->blf_size++;
+            break;
+        } else if (next_bit != last_bit + 1 ||
+                   xfs_buf_item_straddle(bp, offset, next_bit, last_bit)) {
+            xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
+                        first_bit, nbits);
+            blfp->blf_size++;
+            first_bit = next_bit;
+            last_bit = next_bit;
+            nbits = 1;
+        } else {
+            last_bit++;
+            nbits++;
+        }
+    }
+<font color="red">
+See it !? modifications are made into xfs buffer directly.
+And we will see that the push just add the xfs buffer into the del write queue.
+</font>
+  ---
+<li><B>log push(checkpoint)</B>
+xfsaild_push()
+  -> xfsaild_push_item()
+    -> lip->li_ops->iop_push()
+       xfs_buf_item_push()
+       ---
+        if (xfs_buf_ispinned(bp))
+            return XFS_ITEM_PINNED;
+        if (!xfs_buf_trylock(bp)) {
+            if (xfs_buf_ispinned(bp))
+                return XFS_ITEM_PINNED;
+            return XFS_ITEM_LOCKED;
+        }
+<font color="red">
+        if (!xfs_buf_delwri_queue(bp, buffer_list))
+</font>
+            rval = XFS_ITEM_FLUSHING;
+        xfs_buf_unlock(bp);
+       ---
+  -> xfs_buf_delwri_submit_nowait()
+    -> xfs_buf_delwri_submit_buffers()
+    ---
+    list_sort(NULL, buffer_list, xfs_buf_cmp);
+
+    blk_start_plug(&plug);
+    list_for_each_entry_safe(bp, n, buffer_list, b_list) {
+<font color="blue">
+    // The buf could be pinned and locked by new writing
+    // During the whole IO, the xfs buf is locked.
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+        if (!wait_list) {
+            if (xfs_buf_ispinned(bp)) {
+                pinned++;
+                continue;
+            }
+            if (!xfs_buf_trylock(bp))
+                continue;
+        }
+        ...
+        bp->b_flags &= ~_XBF_DELWRI_Q;
+        bp->b_flags |= XBF_WRITE;
+        if (wait_list) {
+            ...
+        } else {
+            bp->b_flags |= XBF_ASYNC;
+            list_del_init(&bp->b_list);
+        }
+        __xfs_buf_submit(bp, false);
+<font color="blue">
+        // bio->bi_end_io = xfs_buf_bio_end_io
+</font>
+    }
+    blk_finish_plug(&plug);
+    ---
+
+xfs_buf_bio_end_io()
+  -> xfs_buf_ioend_async()
+    -> queue_work xfs_buf_ioend_work()
+      -> xfs_buf_ioend()
+        -> xfs_buf_item_done() //<font color="blue">log item is freed here under xfs buf lock</font>
+        -> xfs_buf_relse()
+          -> xfs_buf_unlock()
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="xlog_framework">Framework</a></h3>
+<p>
+<font size="2">
+iclog ring and state machine
+<pre>
+      .-->                                       
+     /   ---
+       /     \
+      | iclog |
+       \     /
+         ---  /
+          <--''                      -->
+|------------------------------------------------|
+           physical log space
+
+The iclog has two parameters,
+l_iclog_bufs      8
+l_iclog_size      32K (max 256K)
+
+iclog is allocated in xlog_alloc_log()
+---
+    for (i = 0; i < log->l_iclog_bufs; i++) {
+        int align_mask = xfs_buftarg_dma_alignment(mp->m_logdev_targp);
+        size_t bvec_size = howmany(log->l_iclog_size, PAGE_SIZE) *
+                sizeof(struct bio_vec);
+
+        iclog = kmem_zalloc(sizeof(*iclog) + bvec_size, KM_MAYFAIL);
+        ...    
+        iclog->ic_data = kmem_alloc_io(log->l_iclog_size, align_mask,
+                        KM_MAYFAIL | KM_ZERO);
+        ...
+        iclog->ic_size = log->l_iclog_size - log->l_iclog_hsize;
+        iclog->ic_state = XLOG_STATE_ACTIVE;
+        ...
+<font color="red">
+        // link all of the iclog in a ring
+</font>
+        iclogp = &iclog->ic_next;
+    }
+---
+
+The iclog in the ring will be employed one by one.
+And every iclog has a state machine works as following,
+
+XLOG_STATE_ACTIVE <font color="blue">Be able to receive log</font>
+  - xlog_alloc_log()
+  - xlog_state_do_callback()
+      -> xlog_state_clean_iclog()
+        -> xlog_state_activate_iclogs()
+          -> xlog_state_activate_iclog()
+
+XLOG_STATE_WANT_SYNC
+  - xlog_state_switch_iclogs()
+  
+XLOG_STATE_SYNCING
+  - xlog_state_release_iclog()
+      -> __xlog_state_release_iclog()
+      -> xlog_sync()
+
+XLOG_STATE_DONE_SYNC
+  - xlog_ioend_work()
+    -> xlog_state_done_syncing()
+
+XLOG_STATE_CALLBACK
+  - xlog_state_done_syncing()
+    -> xlog_state_do_callback()
+
+</pre>
+
+
+<ul>
+<li> Transaction Format
+<pre>
+                 XLOG_REG_TYPE_TRANSHDR          XLOG_REG_TYPE_COMMIT
+                  |                                |
+< oph >< oph >< reg0 >< oph >< reg1 >< oph >...< regn >
+   |                            |
+  XLOG_START_TRANS             XLOG_REG_TYPE_ICORE
+
+</pre>
+<li> IO Format
+<pre>
+The transaction above is carried by iclog when sent out to disk.
+
+Note !!! iclog is just used when issue IO. The log item is carried in anther place.
+xlog_write()
+---
+            if (copy_len > 0) {
+<font color="blue">
+                // The reg here is a xfs_log_iovec
+                // It will copy the data from xfs_log_iovec to iclog buffer
+</font>
+                memcpy(ptr, reg->i_addr + copy_off, copy_len);
+                xlog_write_adv_cnt(&ptr, &len, &log_offset,
+                           copy_len);
+            }
+---
+
+The buffer carries log is allocated here,
+Refer to xlog_cil_alloc_shadow_bufs() / xlog_cil_iovec_space()
+
+The buffer for iclog contains header and payload, the header's layout is
+xlog_rec_header_t.
+
+Every iclog contains a crc num.
+xlog_sync()
+---
+    /* calculcate the checksum */
+    iclog->ic_header.h_crc = xlog_cksum(log, &iclog->ic_header,
+                        iclog->ic_datap, size)
+---
+</pre>
+<li> Transaction Durability
+<pre>
+In theory, when the commit record IO is completed, xlog guarantee that the whole
+transaction has been on disk. How to implement this ?
+There are two points here:
+<ul>
+<li> commit callback
+The ctx is installed on the iclog->ic_callbacks where the commit record is written
+xlog_cil_push_work()
+---
+    list_add_tail(&ctx->iclog_entry, &commit_iclog->ic_callbacks);
+---
+xlog_state_do_callback() would ensure the commit callback is invoked by the order of iclog.
+<font color="red">
+This indicates that even if the commit record is not on the same iclog with its
+records (must be the one behind),  when the callback of commit record is invoked,
+its records's IO have been completed.
+</font>
+
+xlog_state_do_callback()
+---
+        do {
+<font color="blue">
+                           ------------------->
+                                                  Loop start here
+                                                     ACTIVE
+                                                  Current Head   ACTIVE    ACTIVE   ACTIVE
+                                                        |
+                                                        v
+            // iclog0 -> iclog1 -> iclog2 -> iclog3 -> iclog4 -> iclog5 -> iclog6 -> iclog7
+                  ^        ^         ^         ^
+                  |        |         |         |
+               SYNCING   SYNC_DONE  SYNC_DONE SYNCING
+               [record]    [commit]
+</font>
+            if (xlog_state_iodone_process_iclog(log, iclog,
+                            &ioerror))
+                break;
+            ...
+            xlog_state_do_iclog_callbacks(log, iclog);
+            if (XLOG_FORCED_SHUTDOWN(log))
+                wake_up_all(&iclog->ic_force_wait);
+            else
+                xlog_state_clean_iclog(log, iclog);
+            iclog = iclog->ic_next;
+        } while (first_iclog != iclog);
+---
+<li> REQ_FUA
+xlog_write_iclog()
+---
+    iclog->ic_bio.bi_opf = REQ_OP_WRITE | REQ_META | REQ_SYNC |
+                REQ_IDLE | REQ_FUA;
+---
+</ul>
+
+
+</pre>
+</ul>
+</font>
+</p>
 
 <h3><a name="relog">Relog</a></h3>
 <p>
@@ -552,24 +1874,623 @@ A very important thing need to be noted is that the modification has been made i
 buffer_head which is the cache of the disk.
 </font>
 </pre>
-<br/>
-How does xfs implement its relog mechanisms ?<br/>
-We have to anwser follwing questions,
-<ul>
-<li> full or increament log between different version ?
-<pre>
-inode update log is <B>full</B>
-xfs_inode_item_ops.xfs_inode_item_format()
-  -> xfs_inode_item_format_core()
-    -> xfs_inode_to_log_dinode_ts()
-      -> copy the in-memory inode to <font color="red">xfs_log_dinode</font>
-     
-  -> xfs_inode_item_data_fork_size()
 
+</font>
+</p>
+
+<h3><a name="deferred_operations">Deferred operations</a></h3>
+<p>
+<font size="2">
+Deferred Operations is a very bad name and could mislead the readers. <br/>
+IMO, it should be called Big Transaction. The deferred operations,<br/>
+cooperating with intent log, could split a complicated transaction into <br/>
+multiple small transactions and still keep the atomicity of the original<br/>
+transaction. Look at the following example,
+<pre>
+To complete T, we need following multiple operations,
+T_A, T_B, T_C, T_D. And each of them need 3 sub-operations.
+
+Deferred Operations would complete this work as following,
+
+Intent log for T_A \
+Intent log for T_B  \ t0
+Intent log for T_C  /
+Intent log for T_D /
+-------------------
+Done log for T_A  \
+Real log for T_A0  \ t1
+Real log for T_A1  /
+Real log for T_A2 /
+-------------------
+Done log for T_B  \
+Real log for T_B0  \ t2
+Real log for T_B1  /
+Real log for T_B2 /
+-------------------
+Done log for T_C  \
+Real log for T_C0  \ t4
+Real log for T_C1  /
+Real log for T_C2 /
+-------------------
+Done log for T_D  \
+Real log for T_D0  \ t5
+Real log for T_D1  /
+Real log for T_D2 /
+-------------------
+
+The Intent log could guarantee the whole big transaction's atomicity.
 </pre>
-<li> before checkpoint, is the modifications could be seen ?
-     in the other words, where the modifications is made
-     during different phase of log
+xfs_defer_finish_noroll() is to carry out the work,
+<pre>
+xfs_defer_finish_noroll()
+---
+    /* Until we run out of pending work to finish... */
+    while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+<font color="blue">
+        //Create intent log for every deferred_operations
+</font>
+        xfs_defer_create_intents(*tp);
+        list_splice_init(&(*tp)->t_dfops, &dop_pending);
+<font color="blue">
+        //Roll the transaction
+</font>
+        error = xfs_defer_trans_roll(tp);
+        ...
+        dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
+                       dfp_list);
+<font color="blue">
+        //Pick a defered operation and finish it
+        // - create done
+        // - finish_item <font color="red">do the real work</font>
+</font>
+        error = xfs_defer_finish_one(*tp, dfp);
+    }
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="log_space">log space</a></h3>
+<p>
+<font size="2">
+<pre>
+
+      tail         head
+   cycle=100     cycle=100 
+        |           |
+        v           v
+|-------xxxxxxxxxxxx------------|
+
+
+
+      head              tail
+   cycle=101         cycle=100 
+        |                |
+        v                v
+|xxxxxxx-----------------xxxxxxx|
+</pre>
+<ul>
+<li> Why xfs need two log head ?
+<pre>
+It is related to XFS_TRANS_PERM_LOG_RES,
+This kind of transaction could be rolled by multiple times.
+Such as
+
+#define    XFS_SYMLINK_LOG_COUNT        3
+#define    XFS_REMOVE_LOG_COUNT        2
+#define    XFS_LINK_LOG_COUNT        2
+#define    XFS_RENAME_LOG_COUNT        2
+#define    XFS_WRITE_LOG_COUNT        2
+#define    XFS_WRITE_LOG_COUNT_REFLINK    8
+
+A reflink transaction could be split into 8 sub-transactions.
+If one sub-transaction need T bytes log space, we need
+(1) reserve 8 * T log space on l_reserve_head,
+(2) reserve T log space when transaction is rolled.
+
+Refer to the code in xfs_trans_reserve()
+---
+<font color="blue">
+    // rolled transaction
+</font>
+    if (tp->t_ticket != NULL) {
+            ASSERT(resp->tr_logflags & XFS_TRANS_PERM_LOG_RES);
+            error = xfs_log_regrant(mp, tp->t_ticket);
+        } else {
+            error = xfs_log_reserve(mp,
+                        resp->tr_logres,
+                        resp->tr_logcount,
+                        &tp->t_ticket, XFS_TRANSACTION,
+                        permanent);
+        }
+
+---
+</pre>
+The log space reserved here is always surplus.<br/>
+There are two value in ticket, t_curr_res and t_unit_res.<br/>
+<pre>
+xlog_cil_alloc_shadow_bufs() will adapt the t_curr_res
+based on the real situation and then give the left back in 
+xfs_log_commit_cil()
+  -> xfs_log_ticket_regrant/ungrant()
+
+
+The log space will given back after AIL commit with push the lsn tail.
+</pre>
+<li> lsn of a transaction
+<pre>
+In software,
+xfs_cil_ctx represents a transaction.
+xfs_log_vec represents a log item and its space in memory. (li_lv and li_lv_shadow)
+lsn         represents cycle << 32 | log block number //>>
+
+There are two lsn for a Transaction
+<B>(1) start lsn</B>
+xlog_cil_push_work()
+  -> xlog_write(log, &lvhdr, tic, <font color="red">&ctx->start_lsn,</font> NULL, 0, true)
+  ---
+        /* start_lsn is the first lsn written to. That's all we need. */
+        if (!*start_lsn)
+            *start_lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+  ---
+
+<B>(2) commit lsn</B>
+xlog_cil_push_work()
+  -> xlog_commit_record(log, tic, &commit_iclog, <font color="red">&commit_lsn</font>);
+
+The io completion callback of log block (iclog) is invoked <U>in the order of lsn</U>.
+And the sign of successful committing of a transaction is the commit lsn (the log block) has been on disk
+</pre>
+<li> release of log space
+<pre>
+The releasing of log space is through pushing the <font color="red">tail lsn</font> forward.
+The tail lsn is actually the minimum of <font color="red">start lsn</font> of non-applied log.
+
+The tail lsn could be modified in two ways,
+<B>(1) relog</B>
+xfs_trans_committed()
+<font color="blue">
+    // See it ? ctx>start_lsn is used here !!!
+</font>
+  -> xfs_trans_committed_bulk(ctx->cil->xc_log->l_ailp, ctx->lv_chain, <font color="red">ctx->start_lsn</font>, abort)
+    -> xfs_log_item_batch_insert()
+      -> xfs_trans_ail_update_bulk()
+      ---
+    for (i = 0; i < nr_items; i++) {
+        struct xfs_log_item *lip = log_items[i];
+<font color="blue">
+        // Has been on AIL list, relog case !!!
+        // It also inicates that the previous log has been on disk !!!
+</font>
+        if (test_and_set_bit(XFS_LI_IN_AIL, &lip->li_flags)) {
+            /* check if we really need to move the item */
+            if (XFS_LSN_CMP(lsn, lip->li_lsn) <= 0)
+                continue;
+
+<font color="blue">
+            // relog would release its previous log space !!!
+</font>
+            if (mlip == lip && !tail_lsn)
+                tail_lsn = lip->li_lsn;
+
+<font color="blue">
+            // remove from the ail list and re-insert it later
+</font>
+            xfs_ail_delete(ailp, lip);
+        } else {
+            trace_xfs_ail_insert(lip, 0, lsn);
+        }
+        lip->li_lsn = lsn;
+        list_add(&lip->li_ail, &tmp);
+    }
+
+<font color="blue">
+    // all the log items uses the same lsn, namely, the start lsn of the transaction
+</font>
+    if (!list_empty(&tmp))
+        xfs_ail_splice(ailp, cur, &tmp, lsn);
+
+    xfs_ail_update_finish(ailp, tail_lsn);
+      ---
+
+<B>(2) checkpoint</B>
+xfs_buf_ioend()
+  -> xfs_buf_item_done()
+    -> xfs_trans_ail_delete()
+      -> xfs_ail_delete_one()
+      ---
+<font color="blue">
+        // The minimum one is the head of the ailp->ail_head
+</font>
+        struct xfs_log_item    *mlip = xfs_ail_min(ailp);
+        xfs_lsn_t        lsn = lip->li_lsn;
+
+        xfs_ail_delete(ailp, lip);
+        clear_bit(XFS_LI_IN_AIL, &lip->li_flags);
+        lip->li_lsn = 0;
+
+        if (mlip == lip)
+            return lsn;
+        return 0;
+      ---
+      -> xfs_ail_update_finish()
+
+Why there is only one xfs_buf_ioend() here ?
+Look at the definition of iop_push, only inode, dquot and buf define it.
+This indicates that most of the transactions are made of xfs buf updating.
+
+And inode updating would be applied on xfs buf finally.
+Refer to
+xfs_inode_item_push()
+  -> xfs_iflush_cluster()
+  -> xfs_buf_delwri_queue()
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="xfs_inode">Xfs Inode</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="xfs_inode_mgnt">Inode management</a></h3>
+<p>
+<font size="2">
+The inode number if xfs is composed with 3 parts,
+<pre>
+       AG number        Bn in AG       In in B
+  |----------------|---------------|-------------|
+
+Bn : block number in an AG
+In : inode number in a block (a block could carry multiple inodes)
+</pre>
+This inode number has telled us the position of the inode on disk.<br/>
+xfs's inodes are dynamically allocated instead of preallocating in static<br/>
+position like ext4.<br/>
+How to allocate in dynamical way ?<br/>
+Allocate a block in that AG !<br/>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Then create a xfs_inobt_rec as following,
+<pre>
+struct xfs_inobt_rec {
+    __be32   ir_startino;  //<font color="blue">start ino num of this chunk</font>
+    __be32   ir_freecount; //<font color="blue">number of free inodes</font>
+    __be64   ir_free; //<font color="blue">bitmap</font>
+
+}
+</pre>
+and insert it into the AG inode b+tree
+</font>
+</p>
+
+
+<h2><a name="xfs_buf">xfs buf</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<p>
+<font size="2">
+xfs uses xfs_buf to manage its metadata instead of using vfs pagecache.
+<ul>
+<li> allocate
+<pre>
+xfs_buf_get_map()
+---
+    error = xfs_buf_find(target, map, nmaps, flags, NULL, &bp);
+    if (!error)
+        goto found;
+    if (error != -ENOENT)
+        return error;
+
+    error = _xfs_buf_alloc(target, map, nmaps, flags, &new_bp);
+<font color="blue">
+    // sema_init(&bp->b_sema, 0); /* held, no waiters */
+</font>
+
+    error = xfs_buf_allocate_memory(new_bp, flags);
+    ---
+<font color="blue">
+    /*
+     * for buffers that are contained within a single page, just allocate
+     * the memory from the heap - there's no need for the complexity of
+     * page arrays to keep allocation down to order 0.
+     */
+</font>
+    size = BBTOB(bp->b_length);
+    if (size < PAGE_SIZE) {
+        int align_mask = xfs_buftarg_dma_alignment(bp->b_target);
+        bp->b_addr = kmem_alloc_io(size, align_mask,
+                       KM_NOFS | kmflag_mask);
+        ...
+        bp->b_offset = offset_in_page(bp->b_addr);
+        bp->b_pages = bp->b_page_array;
+        bp->b_pages[0] = kmem_to_page(bp->b_addr);
+        bp->b_page_count = 1;
+        bp->b_flags |= _XBF_KMEM;
+        return 0;
+    }
+
+use_alloc_page:
+    ...
+    for (i = 0; i < bp->b_page_count; i++) {
+        struct page    *page;
+        uint        retries = 0;
+retry:
+        page = alloc_page(gfp_mask);
+        ...
+        nbytes = min_t(size_t, size, PAGE_SIZE - offset);
+        size -= nbytes;
+        bp->b_pages[i] = page;
+        offset = 0;
+    }
+
+    ---
+<font color="blue">
+    // Do insert if new_bp is not NULL
+</font>
+    error = xfs_buf_find(target, map, nmaps, flags, new_bp, &bp);
+    ...
+found:
+    if (!bp->b_addr) {
+        error = _xfs_buf_map_pages(bp, flags);
+        ...
+    }
+---
+</pre>
+<li> lookup
+<pre>
+xfs_buf_find()
+---
+    pag = xfs_perag_get(btp->bt_mount,
+                xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
+
+    spin_lock(&pag->pag_buf_lock);
+    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                    xfs_buf_hash_params);
+    if (bp) {
+        atomic_inc(&bp->b_hold);
+        goto found;
+    }
+    ...
+found:
+    spin_unlock(&pag->pag_buf_lock);
+    xfs_perag_put(pag);
+<font color="blue">
+    // We need to return a locked xfs_buf here !!!
+</font>
+    if (!xfs_buf_trylock(bp)) {
+        xfs_buf_lock(bp);
+        XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+    }
+
+---
+</pre>
+<li> read from disk
+<pre>
+xfs_buf_read_map()
+---
+    error = xfs_buf_get_map(target, map, nmaps, flags, &bp);
+    ...
+    if (!(bp->b_flags & XBF_DONE)) {
+<font color="blue">        /* Initiate the buffer read and wait. */</font>
+        bp->b_ops = ops;
+        error = _xfs_buf_read(bp, flags);
+          -> xfs_buf_submit()
+            -> __xfs_buf_submit() <font color="blue">// wait = !(bp->b_flags & XBF_ASYNC)</font>
+            ---
+<font color="blue">
+            /*
+              * Grab a reference so the buffer does not go away underneath us. For
+              * async buffers, I/O completion drops the callers reference, which
+              * could occur before submission returns.
+              */
+</font>
+            xfs_buf_hold(bp);
+            ...
+            _xfs_buf_ioapply(bp);
+            ...
+            if (wait)
+                error = xfs_buf_iowait(bp);
+
+            xfs_buf_rele(bp);
+            ---
+
+        /* Readahead iodone already dropped the buffer, so exit. */
+        if (flags & XBF_ASYNC)
+            return 0;
+    }
+---
+
+<font color="red" size = "2">
+In non-readahead case, we have to wait the buffer to be read in.
+</font>
+
+When read completes, xfs would verify it.
+xfs_buf_ioend()
+---
+    if (bp->b_flags & XBF_READ) {
+        if (!bp->b_error && bp->b_ops)
+<font color="red">            bp->b_ops->verify_read(bp);</font>
+    }
+---
+</pre>
+<li> log
+<a href="#xfs_log">xfs log__xfs buf log</a>
+<li> write to disk
+<pre>
+The xfs buf being written to disk must have been checkpointed.
+During the IO, the xfs_buf is locked. Nobody can touch it.
+xfs_buf_delwri_submit_buffers()
+  -> xfs_buf_lock()
+  -> __xfs_buf_submit() //<font color="blue"> wait is false</font>
+     ---
+<font color="blue">
+    // buf has been locked, after unpin, nobody can pin it any more.
+    // the modifications in buf should have been in log.
+</font>
+    if (bp->b_flags & XBF_WRITE)
+        xfs_buf_wait_unpin(bp);
+        ---
+        if (atomic_read(&bp->b_pin_count) == 0)
+            return;
+
+        add_wait_queue(&bp->b_waiters, &wait);
+        for (;;) {
+            set_current_state(TASK_UNINTERRUPTIBLE);
+            if (atomic_read(&bp->b_pin_count) == 0)
+                break;
+            io_schedule();
+        }
+        remove_wait_queue(&bp->b_waiters, &wait);
+        set_current_state(TASK_RUNNING);
+        ---
+     ---
+
+How to ensure the metadata to be on disk instead of disk caching, after release
+the log space ?
+
+xlog_sync()
+---
+<font color="blue">
+    /*
+     * Flush the data device before flushing the log to make sure all meta
+     * data written back from the AIL actually made it to disk before
+     * stamping the new log tail LSN into the log buffer.  For an external
+     * log we need to issue the flush explicitly, and unfortunately
+     * synchronously here; for an internal log we can simply use the block
+     * layer state machine for preflushes.
+     */
+</font>
+    if (log->l_targ != log->l_mp->m_ddev_targp || split) {
+        xfs_blkdev_issue_flush(log->l_mp->m_ddev_targp);
+        need_flush = false;
+    }
+
+    xlog_verify_iclog(log, iclog, count);
+    xlog_write_iclog(log, iclog, bno, count, need_flush);
+---
+</pre>
+<li> reclaim
+<pre>
+xfs_buf_rele()
+---
+    spin_lock(&bp->b_lock);
+    release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
+    if (!release) {
+        if ((atomic_read(&bp->b_hold) == 1) && !list_empty(&bp->b_lru))
+            __xfs_buf_ioacct_dec(bp);
+        goto out_unlock;
+    }
+    ...
+<font color="blue">
+    // insert into the lru list
+</font>
+    if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
+        if (list_lru_add(&bp->b_target->bt_lru, &bp->b_lru)) {
+            bp->b_state &= ~XFS_BSTATE_DISPOSE;
+            atomic_inc(&bp->b_hold);
+        }
+        spin_unlock(&pag->pag_buf_lock);
+    } 
+---
+
+xfs_buftarg_shrink_scan()
+---
+    freed = list_lru_shrink_walk(&btp->bt_lru, sc,
+                     xfs_buftarg_isolate, &dispose);
+
+    while (!list_empty(&dispose)) {
+        struct xfs_buf *bp;
+        bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+        list_del_init(&bp->b_lru);
+        xfs_buf_rele(bp);
+    }
+    freed = list_lru_shrink_walk(&btp->bt_lru, sc,
+                     xfs_buftarg_isolate, &dispose);
+
+    while (!list_empty(&dispose)) {
+        struct xfs_buf *bp;
+        bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+        list_del_init(&bp->b_lru);
+        xfs_buf_rele(bp);
+    }
+---
+</pre>
+<li> story of b_hold
+<pre>
+The story of b_hold
+[0] initial value is 1
+    _xfs_buf_alloc()
+    ---
+        atomic_set(&bp->b_hold, 1);
+    ---
+[1] xfs_buf_find() get and lock
+    ---
+    spin_lock(&pag->pag_buf_lock);
+    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                    xfs_buf_hash_params);
+    if (bp) {
+        atomic_inc(&bp->b_hold);
+        goto found;
+    }
+    ...
+found:
+    spin_unlock(&pag->pag_buf_lock);
+    xfs_perag_put(pag);
+
+    if (!xfs_buf_trylock(bp)) {
+        if (flags & XBF_TRYLOCK) {
+            xfs_buf_rele(bp);
+            XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
+            return -EAGAIN;
+        }
+        xfs_buf_lock(bp);
+        XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+    }
+
+    ---
+
+There are mainly two ways to release this reference
+a. xfs_log_commit_cil()
+     -> xfs_trans_free_items()
+       -> iop_unlock()
+          xfs_buf_item_unlock()
+            -> xfs_buf_relse()
+
+b. xfs_trans_brelse()
+     -> xfs_trans_del_item()
+     -> xfs_buf_relse()
+
+   release a buf if didn't dirty it
+
+[2] buf log item
+
+The buf log item holds a reference of the xfs_buf
+xfs_buf_item_init()
+  -> xfs_buf_hold()
+
+This reference will be released in xfs_buf_iodone()
+xfs_buf_iodone()
+---
+    xfs_buf_rele(bp);
+    spin_lock(&ailp->ail_lock);
+    xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
+    xfs_buf_item_free(BUF_ITEM(lip));
+---
+
+[3] delwri_queue
+xfs_buf_delwri_queue()
+---
+    bp->b_flags |= _XBF_DELWRI_Q;
+    if (list_empty(&bp->b_list)) {
+        atomic_inc(&bp->b_hold);
+        list_add_tail(&bp->b_list, list);
+    }
+---
+
+get lock in xfs_buf_delwri_submit_buffers()
+xfs_buf_iodone_callbacks()
+  -> xfs_buf_ioend()
+    -> xfs_buf_relse()
+       unlock and release ref
+</pre>
 </ul>
 </font>
 </p>
