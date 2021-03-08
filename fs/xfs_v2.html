@@ -20,7 +20,11 @@
 <a href="#infrastructure">infrastructure</a>
 <ul>
 <li> <a href="#iov_iter">iov_iter</a>
-<li> <a href="#inode_lock_and_fault">inode lock and page fault</font>
+<li> <a href="#inode_lock_and_fault">inode lock and page fault</a>
+<li> <a href="#sendfile">sendfile</a>
+<li> <a href="#open_and_close">open and close</a>
+<li> <a href="#mount">mount</a>
+<li> <a href="#writenotify">writenotify</a>
 </ul>
 
 <a href="#inode">Inode</a>
@@ -35,6 +39,7 @@
 <li> <a href="#shrink_of_dcache">shrink of dcache</a>
 <li> <a href="#lookup">lookup</a>
 <li> <a href="#dcache_and_metadata">dcache and metadata</a>
+<li> <a href="#add_to_dcache_hash">add to dcache hash</a>
 </ul>
 
 <a href="#tmpfs">Tmpfs</a><br/>
@@ -61,6 +66,7 @@
 <h3><a name="link_count">link count</a></h3>
 <p>
 <font size="2">
+<pre>
 The link count of a file tells the total number of links a file has
 which is nothing but the number of hard-links a file has. This count,
 however, does not include the soft-link count.
@@ -68,11 +74,11 @@ however, does not include the soft-link count.
 Note: The soft-link is not part of the link count since the soft-link's
 inode number is different from the original file. 
 
-When a directory is created, an extra link count is increased because for
-every directory created, a link gets created in the parent directory to
-point to this new directory.
-
-Means, when create sub-directory b in directory a, b's link count is 2.
+When a directory is created, except for the link count for the dentry in
+parent directory, two extra link count is increased,
+(1) one on the parent directory for ".." dentry in child directory
+(2) one on the child directory for "." dentry ion child directory
+</pre>
 </font>
 </p>
 
@@ -593,9 +599,6 @@ size_t _copy_to_iter(const void *addr, size_t bytes, struct iov_iter *i)
 </p>
 
 <h3><a name="inode_lock_and_fault">inode lock and page fault</font></h3>
-
-<h2><a name="inode">inode</a></h2>
-<hr style="height:3px;border:none;border-top:3px solid black;" />
 <p>
 <font size="2">
 We cannot take the inode lock (inode.i_rwsem) in page fault path.<br/>
@@ -684,7 +687,452 @@ do_user_addr_fault()
 </font>
 </p>
 
+<h3><a name="sendfile">sendfile</font></h3>
+<p>
+<font size="2">
+sendfile is one of the feature to implement zero-copy<br/>
+<pre>
 
+    read       write              sendfile
+        |uuuuuu|        ---\
+        ^      \        ---/
+-------/--------\--------------------------------------
+      /          v
+  |ssssss|   |dddddd|           |ssssss|  -> |dddddd|
+
+do_sendfile()
+  -> splice_direct_to_actor()
+    -> do_splice_to() //<font color="blue">read from src into pipe</font>
+      -> f_op->splice_read()
+    -> do_splice_from() //<font color="blue">write from pipe into dest</font>
+      -> f_op->splice_write()
+</pre>
+Let's how does the pipe dance here ?
+<ul>
+<li> splice_read
+<pre>
+
+generic_file_splice_read()
+  -> ext4_file_read_iter()
+    -> generic_file_read_iter()
+      -> generic_file_read_iter()
+        -> copy_page_to_iter()
+          -> copy_page_to_iter_pipe()
+---
+    off = i->iov_offset;
+<font color="red">    buf = &pipe->bufs[i_head & p_mask];</font>
+    if (off) {
+        if (offset == off && buf->page == page) {
+            /* merge with the last one */
+            buf->len += bytes;
+            i->iov_offset += bytes;
+            goto out;
+        }
+        i_head++;
+        buf = &pipe->bufs[i_head & p_mask];
+    }
+    if (pipe_full(i_head, p_tail, pipe->max_usage))
+        return 0;
+
+    buf->ops = &page_cache_pipe_buf_ops;
+    get_page(page);
+<font color="red">
+    buf->page = page;
+    buf->offset = offset;
+    buf->len = bytes;
+</font>
+    pipe->head = i_head + 1;
+    i->iov_offset = offset + bytes;
+    i->head = i_head;
+out:
+    i->count -= bytes;
+---
+
+The pipe here looks like the another kind of bvec arrays.
+</pre>
+<li> splice_write
+<pre>
+iter_file_splice_write()
+---
+    pipe_lock(pipe);
+
+    splice_from_pipe_begin(&sd);
+    while (sd.total_len) {
+        struct iov_iter from;
+        unsigned int head, tail, mask;
+        size_t left;
+        int n;
+
+        ret = splice_from_pipe_next(pipe, &sd);
+        if (ret <= 0)
+            break;
+
+        ...
+        head = pipe->head;
+        tail = pipe->tail;
+        mask = pipe->ring_size - 1;
+
+        /* build the vector */
+        left = sd.total_len;
+        for (n = 0; !pipe_empty(head, tail) && left && n < nbufs; tail++, n++) {
+            struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+            size_t this_len = buf->len;
+
+            if (this_len > left)
+                this_len = left;
+            ...
+            array[n].bv_page = buf->page;
+            array[n].bv_len = this_len;
+            array[n].bv_offset = buf->offset;
+            left -= this_len;
+        }
+<font color="blue">
+        // construct a bvec iov_iter from the pipe
+</font>
+        iov_iter_bvec(&from, WRITE, array, n, sd.total_len - left);
+        ret = vfs_iter_write(out, &from, &sd.pos, 0);
+        if (ret <= 0)
+            break;
+
+        sd.num_spliced += ret;
+        sd.total_len -= ret;
+        *ppos = sd.pos;
+<font color="blue">
+        /* dismiss the fully eaten buffers, adjust the partial one */
+</font>
+        tail = pipe->tail;
+        while (ret) {
+            struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+            if (ret >= buf->len) {
+                ret -= buf->len;
+                buf->len = 0;
+                pipe_buf_release(pipe, buf);
+                tail++;
+                pipe->tail = tail;
+                if (pipe->files)
+                    sd.need_wakeup = true;
+            } else {
+                buf->offset += ret;
+                buf->len -= ret;
+                ret = 0;
+            }
+        }
+    }
+done:
+    kfree(array);
+    splice_from_pipe_end(pipe, &sd);
+
+    pipe_unlock(pipe);
+
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="open_and_close">open_and_close</font></h3>
+<p>
+<font size="2">
+When you open or close a file, you could get or put many instances' reference.<br/>
+Please refer to following comment from link https://lwn.net/Articles/494158/
+<pre>
+The management of file structure reference counts is done with calls to fget() and fput().
+A file structure, which represents an open file, can depend on a lot of resources:
+as long as a file is open, the kernel must maintain its underlying storage device,
+filesystem, network protocol information, security-related information, user-space
+notification requests, and more. An fget() call will ensure that all of those resources
+stay around as long as they are needed. A call to fput(), instead, might result in the
+destruction of any of those resources. For example, closing the last file on an unmounted
+filesystem will cause that filesystem to truly go away.
+</pre>
+Next, let's try to figure out what they are.<br/>
+We could get some hint in the __fput()
+<pre>
+__fput is deferred to the task work context which will be invoked before the
+task returns to userland. Refer to the following comment to get the point
+
+----
+What all this means is that a call to fput() can do a lot of work, and that
+work may require the acquisition of a number of locks. The problem is that
+fput() can also be called from any number of contexts; there are a few hundred
+fput() and fput_light() calls in the kernel. Each of those call sites has its
+own locking environment and, usually, no knowledge of what code in other
+subsystems may be called from fput(). So the potential for problems like
+locking-order violations is real.
+----
+
+void fput_many(struct file *file, unsigned int refs)
+{
+    if (atomic_long_sub_and_test(refs, &file->f_count)) {
+        struct task_struct *task = current;
+
+        if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+            init_task_work(&file->f_u.fu_rcuhead, ____fput);
+            if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_RESUME))
+                return;
+        }
+
+        if (llist_add(&file->f_u.fu_llist, &delayed_fput_list))
+            schedule_delayed_work(&delayed_fput_work, 1);
+    }
+}
+
+exit_to_user_mode_loop()
+  -> tracehook_notify_resume()
+    -> task_work_run()
+</pre>
+<br/>
+Let's focus on the dput() and mntput() in __fput().
+<ul>
+<li> mntput()
+<pre>
+mntput()
+  -> mntput_no_expire()
+---
+    ...
+    lock_mount_hash();
+    smp_mb();
+    mnt_add_count(mnt, -1);
+    count = mnt_get_count(mnt);
+    if (count != 0) {
+        WARN_ON(count < 0);
+        rcu_read_unlock();
+        unlock_mount_hash();
+        return;
+    }
+    ...
+    if (likely(!(mnt->mnt.mnt_flags & MNT_INTERNAL))) {
+        struct task_struct *task = current;
+        if (likely(!(task->flags & PF_KTHREAD))) {
+            init_task_work(&mnt->mnt_rcu, __cleanup_mnt);
+            if (!task_work_add(task, &mnt->mnt_rcu, TWA_RESUME))
+                return;
+        }
+        if (llist_add(&mnt->mnt_llist, &delayed_mntput_list))
+            schedule_delayed_work(&delayed_mntput_work, 1);
+        return;
+    }
+    cleanup_mnt(mnt);
+---
+
+If the reference of the mnt is exhausted, cleanup_mnt() will be invoked.
+cleanup_mnt()
+---
+    ...
+<font color="blue">
+    //put the dentry of the mount point
+</font>
+    dput(mnt->mnt.mnt_root);
+<font color="blue">
+    //This is the most important part, the real work of umount would be done
+    //here
+</font>
+    deactivate_super(mnt->mnt.mnt_sb);
+    mnt_free_id(mnt);
+    call_rcu(&mnt->mnt_rcu, delayed_free_vfsmnt);
+---
+
+deactivate_super()
+  -> deactivate_locked_super()
+    -> fs->kill_sb()
+       kill_block_super()
+       ---
+        generic_shutdown_super(sb);
+        sync_blockdev(bdev);
+        WARN_ON_ONCE(!(mode & FMODE_EXCL));
+        blkdev_put(bdev, mode | FMODE_EXCL);
+       ---
+
+generic_shutdown_super()
+---
+<font color="blue">
+    // shrink the dcache to release all of the reference to inode cache
+</font>
+    shrink_dcache_for_umount(sb);
+    sync_filesystem(sb);
+    sb->s_flags &= ~SB_ACTIVE;
+
+<font color="blue">
+    /* evict all inodes with zero refcount */
+    // Can we ensure all of the inode to be evicted ?
+    // It should be YES, because every opened file holds a reference of mount.
+    // When we reach here, all of them should be closed.
+</font>
+    evict_inodes(sb);
+    ...
+    if (!list_empty(&sb->s_inodes)) {
+        printk("VFS: Busy inodes after unmount of %s. "
+           "Self-destruct in 5 seconds.  Have a nice day...\n",
+           sb->s_id);
+    }
+---
+</pre>
+<li> dput()
+<pre>
+Every opened file holds a reference to the dentry and every dentry holds a
+reference to inode.
+</pre>
+</ul>
+
+The mnt and dentry associated with the file is assigned in vfs_open()
+<pre>
+path_openat()
+  -> link_path_walk()
+  -> open_last_lookups()
+  -> do_open()
+    -> vfs_open()
+int vfs_open(const struct path *path, struct file *file)
+{
+<font color="red">
+    file->f_path = *path;
+</font>
+    return do_dentry_open(file, d_backing_inode(path->dentry), NULL);
+}
+
+</pre>
+</font>
+</p>
+
+<h3><a name="mount">mount</font></h3>
+<p>
+<font size="2">
+Let's first look at what will be done during a mount
+<ul>
+<li> prepare filesystem context
+<pre>
+do_new_mount()
+  -> fs_context_for_mount()
+    -> alloc_fs_context()
+      -> fc->fs_type->init_fs_context()
+         legacy_init_fs_context()
+<font color="red">
+         fc->ops = &legacy_fs_context_ops
+</font>
+</pre>
+<li> get_tree
+<pre>
+vfs_get_tree()
+  -> fc->ops->get_tree()
+     legacy_get_tree()
+     -> fc->fs_type->mount()
+        ext4_mount()
+          -> mount_bdev() with <font color="red">ext4_fill_super()</font>
+mount_bdev()
+---
+    bdev = blkdev_get_by_path(dev_name, mode, fs_type);
+    ...
+    mutex_lock(&bdev->bd_fsfreeze_mutex);
+    ...
+    s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
+         bdev);
+    mutex_unlock(&bdev->bd_fsfreeze_mutex);
+    if (s->s_root) {
+        ...
+    } else {
+        s->s_mode = mode;
+        snprintf(s->s_id, sizeof(s->s_id), "%pg", bdev);
+        sb_set_blocksize(s, block_size(bdev));
+        error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
+        ---
+            root = ext4_iget(sb, EXT4_ROOT_INO, EXT4_IGET_SPECIAL);
+            ...
+<font color="red">
+            sb->s_root = d_make_root(root);
+</font>
+        ---
+        ...
+        s->s_flags |= SB_ACTIVE;
+        bdev->bd_super = s;
+    }
+
+    return dget(s->s_root);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="writenotify">writenotify</font></h3>
+<p>
+<font size="2">
+When a file is mapped, how does the kernel know the file is written ? <br/>
+The answer is writenotify<br/>
+<ul>
+<li> vma access permissions
+<pre>
+do_mmap()
+  -> mmap_region()
+    -> vma_set_page_prot()
+    ---
+    unsigned long vm_flags = vma->vm_flags;
+    pgprot_t vm_page_prot;
+
+    vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
+    if (vma_wants_writenotify(vma, vm_page_prot)) {
+<font color="red">
+        vm_flags &= ~VM_SHARED;
+</font>
+        vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
+    }
+<font color="blue">
+    // Note, vma->vm_flags is not modified
+</font>
+    /* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
+    WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
+    ---
+vma_wants_writenotify()
+---
+    /* If it was private or non-writable, the write bit is already clear */
+    if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
+        return 0;
+<font color="blue">
+    /* The backer wishes to know when pages are first written to? */
+</font>
+    if (vm_ops && (vm_ops->page_mkwrite || vm_ops->pfn_mkwrite))
+                           ^^^^^^^^^^^^            ^^^^^^^^^^^
+        return 1;
+---
+The vma->wm_page_prot will be used when vmf_insert_mixed_mkwrite()
+
+Finally, the mapped page doesn't have write permission
+</pre>
+<li> page fault due to no write permission
+<pre>
+handle_pte_fault()
+---
+    if (vmf->flags & FAULT_FLAG_WRITE) {
+<font color="red">
+        if (!pte_write(entry))
+</font>
+            return do_wp_page(vmf);
+        entry = pte_mkdirty(entry);
+    }
+<font color="blue">
+    // Set the pte access flags
+</font>
+    entry = pte_mkyoung(entry);
+    if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
+                vmf->flags & FAULT_FLAG_WRITE)) {
+        update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
+    }
+---
+
+do_wp_page()
+  -> wp_page_shared()
+    -> do_page_mkwrite()
+
+The page will be marked dirty during this.
+</pre>
+<li> clear the write permission again
+<pre>
+clear_page_dirty_for_io() is invoked during page writeback
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="inode">inode</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
 <h3><a name="reference_of_inode">reference of inode</a></h3>
 <p>
 <font size="2">
@@ -1407,7 +1855,7 @@ do_open()
 </font>
 </p>
 
-<a name="dcache_and_metadata">dcache and metadata</a>
+<h3><a name="dcache_and_metadata">dcache and metadata</a></h3>
 <p>
 <font size="2">
 The main points that dcache interacts with filesystem
@@ -1429,6 +1877,45 @@ open_last_lookups()
     -> dir_inode->i_op->create() //<font color="blue">do create if needed</font>
 
 </pre>
+</font>
+</p>
+
+<h3><a name="add_to_dcache_hash">add to dcache hash</a></h3>
+<p>
+<font size="2">
+When a dentry is in the dcache hash table, namely, dentry_hashtable<br/>
+__d_lookup could find it and d_unhashed() returns false.<br/>
+When is the dentry inserted to the dentry_hashtable ?<br/>
+<ul>
+<li> lookup_open
+<pre>
+When the file does not exist,
+lookup_open()
+<font color="blue">
+  // allocate dentry structure with d_alloc()
+</font>
+  -> d_alloc_parallel()
+  -> dir_inode->i_op->lookup()
+     ext2_lookup()
+       -> ext2_inode_by_name() <font color="blue">//not found at this moment</font>
+       -> d_splice_alias() <font color="blue">//inode is NULL at this moment</font>
+  -> dir_inode->i_op->create()
+     ext2_create()
+       -> ext2_add_nondir()
+         -> d_instantiate_new()
+           -> d_instantiate() //fill inode information for a dentry
+</pre>
+<li> lookup
+<pre>
+When the file exists,
+lookup_slow()
+  -> ext2_lookup()
+    -> d_splice_alias()
+      -> __d_add()
+        -> __d_set_inode_and_type() // install the inode into the dentry
+          -> __d_rehash()
+</pre>
+</ul>
 </font>
 </p>
 
