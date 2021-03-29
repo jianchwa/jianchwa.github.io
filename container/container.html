@@ -12,6 +12,11 @@
 <font size="2">
 <a href="#cgroup">cgroup</a>
 <ul>
+<li> <a href="#cgroup_ds">data structure</a>
+<ul>
+<li> <a href="#cgroup_ds_basis">basis</a>
+<li> <a href="#cgroup_ds_lifecyle">life cycle</a>
+</ul>
 <li> <a href="#cgroup_kernfs">cgroup kernfs</a>
 <ul>
 <li> <a href="#cgroup_kernfs_files">Files</a>
@@ -22,20 +27,461 @@
 <li><a href="#cgroup_tasks_data_structure">data structure</a>
 <li><a href="#cgroup_tasks_attach_task">attach a task</a>
 </ul>
-<ul>
-
 </ul>
 </font>
 </p>
 
 <h2><a name="cgroup">cgroup</a></h2>
 <hr style="height:3px;border:none;border-top:3px solid black;" />
-<h3><a name="cgroup_kernfs">cgroup kernfs</a></h2>
+
+<h3><a name="cgroup_ds">data structure</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<h4><a name="cgroup_ds_basis">basis</a></h4>
+<p>
+<font size="2">
+<ul>
+<li> cgroup
+<pre>
+cgroup carries tasks and controller information, constructs a hierarchy and
+act as the interface that interacts with users through kernfs.
+</pre>
+<li> css, cgroup_subsys_state
+<pre>
+As the name, css is a data structure for a cgroup-subsystem pair.
+Take blkio subsystem as example,
+blkcg_css_alloc()
+---
+    mutex_lock(&blkcg_pol_mutex);
+
+    if (!parent_css) {
+        blkcg = &blkcg_root;
+    } else {
+        blkcg = kzalloc(sizeof(*blkcg), GFP_KERNEL);
+    }
+
+    for (i = 0; i < BLKCG_MAX_POLS ; i++) {
+        struct blkcg_policy *pol = blkcg_policy[i];
+        struct blkcg_policy_data *cpd;
+
+        cpd = pol->cpd_alloc_fn(GFP_KERNEL);
+        blkcg->cpd[i] = cpd;
+        cpd->blkcg = blkcg;
+        cpd->plid = i;
+        if (pol->cpd_init_fn)
+            pol->cpd_init_fn(cpd);
+    }
+
+    list_add_tail(&blkcg->all_blkcgs_node, &all_blkcgs);
+    mutex_unlock(&blkcg_pol_mutex);
+<font color="red">
+    return &blkcg->css;
+</font>
+---
+
+css looks like the vfs inode in filesystem. Most of time, the filesystem
+would embed vfs inode into their own inode structure.
+
+css/blkcg contains the information to control the io of one cgroup
+</pre>
+<li> css_set, set of css's and tasks that controlled by them
+<pre>
+<B>In the other word, css_set is a collection of cgroups from different hierarchy</B>
+Look at the task_struct, one task is linked into the css_set and also get
+the information of css through css_set
+task_struct
+---
+#ifdef CONFIG_CGROUPS
+    /* Control Group info protected by css_set_lock: */
+    struct css_set __rcu        *cgroups;
+    /* cg_list protected by css_set_lock and tsk->alloc_lock: */
+    struct list_head        cg_list;
+#endif
+---
+
+blkcg_css()
+  -> task_css(current, io_cgrp_id);
+    -> task_css_check(task, subsys_id, false)
+      -> task_css_set_check((task), (__c))->subsys[(subsys_id)]
+        -> rcu_dereference_check((task)->cgroups,                \
+
+css_set_move_task()
+---
+        cgroup_move_task(task, to_cset);
+        list_add_tail(<font color="red">&task->cg_list</font>, use_mg_tasks ? &to_cset->mg_tasks :
+                                 &to_cset->tasks);
+---
+</pre>
+</ul>
+
+And here are some critial questions about the data structures
+<ul>
+<li> Why do we need the css_set ?
+<pre>
+The answer is cgroup V1 and its special hierarchy.
+
+    cpu-cg-root        '    mem-cg-root          '   blkio-cg-root
+     /      \          '       /      \          '        /      \
+cpu-cg-0  cpu-cg-1     ' mem-cg-0  mem-cg-1      ' blkio-cg-0 blkio-cg-1
+            /  \       '              /  \       '               /  \
+     cpu-cg-2  cpu-cg-3'       mem-cg-2  mem-cg-3'      blkio-cg-2  blkio-cg-3
+                       '                         '
+In cgroup V1, different subsystem has different hierarchy, and 
+ - every cgroup can only have one subsystem
+ - every task can be attached to different hierarchy
+
+Due to this, css_set is created to bind these tasks and css's together.
+
+When cgroup V2 is introduced, to be compatible with V1, css_set is still needed.
+</pre>
+<li> Is css really per-cgroup-subsystem ?
+<pre>
+The answer is NO !
+In cgroup V2, a cgroup would share its parent's css if the subsystem is not enabled.
+
+                  root (cpu, pid, io, mem)
+                /      \
+     cg0 (cpu, pid)   cg1 (io, mem)
+                      / \
+                     /   \
+                    t0 t1 cg2 (io)
+                          /\
+                         t2 t3
+
+t0&t1 -> cpu: cg.root pid: cg.root, io: cg1, mem: cg1
+t2&t3 -> cpu: cg.root pid: cg.root, io: cg2, mem: cg1
+</pre>
+<li> Is cgroup and css-set one to one ?
+<pre>
+The answer is NO !
+
+In cgroup V1, there could be multiple hierarchy, and then
+a cgroup can contains tasks from different css_set.
+Look at following example,
+
+      cpu-root            mem-root         blkio-root
+      /     \             /     \          /      \
+    cg0    cg1          cg2     cg3      cg4     cg5
+           (t0, t1)    (t0)     (t1)    (t0)     (t1)
+
+t0 is in css-set (cpu-cg1, mem-cg2, blkio-cg4)
+t1 is in css-set (cpu-cg1, mem-cg3, blkio-cg5)
+
+In this case, cg1 are associated with two css-sets.
+
+In fact, the case above is the 'flexibility' provided by
+cgroup V1. However, do we really need this ? Most of time,
+t0 and t1 are in same shape in different hierarchy as following
+
+      cpu-root       mem-root         blkio-root
+      /     \        /     \          /      \
+    cg0    cg1     cg2     cg3      cg4     cg5
+    (t0)   (t1)    (t0)     (t1)    (t0)     (t1)
+
+There is no such issue in cgroup V2 which has a uinified hierarchy.
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="cgroup_ds_relationship">relationship</a></h4>
 <hr style="height:3px;border:none;border-top:1px solid black;" />
 <p>
 <font size="2">
-In this section, we would like to know how does cgroup interact with<br/>
-users in userland through kernfs.<br/>
+To make clear the life cycle of components in cgroup, we must know the <br/>
+reference relationship between them.<br/>
+<pre>
+                     task
+                   /
+            css_set ----- css
+                   \      /
+                    cgroup
+</pre>
+<ul>
+<li> task and css_set
+<pre>
+(1) task.cgroups points css_set
+(2) task.cg_list is linked into css_set.tasks
+
+This relationships between then are setup in
+css_set_move_task()
+---
+        cgroup_move_task(task, to_cset);
+        list_add_tail(&task->cg_list, use_mg_tasks ? &to_cset->mg_tasks :
+                                 &to_cset->tasks);
+---
+</pre>
+<li> cgroup and css
+<pre>
+(1) css->cgroup
+(2) cgroup->subsys[] -> css
+
+css_create()
+---
+    css = ss->css_alloc(parent_css);
+    ...
+    init_and_link_css(css, ss, cgrp);
+    ...
+    online_css()
+---
+</pre>
+<li> css_set and cgroup,css
+<pre>
+(1) cgroup->cset_links <--> cgrp_cset_link <--> cgrp_links<-css_set
+(2) cgroup->e_csets[] -> css_set->e_cset_node[]
+(3) css_set->subsys[] -> css
+
+Both of the relationships above are built in find_css_set()
+<font>
+find_css_set is to setup a new css_set based on old_cset with one cgroup updated.
+The first step is to setup a css template based on the old cset and new cgroup.
+</font>
+find_css_set()
+  -> find_existing_css_set()
+---
+    for_each_subsys(ss, i) {
+        if (root->subsys_mask & (1UL << i)) {
+<font color="blue">            /*
+             * @ss is in this hierarchy, so we want the
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+             * effective css from @cgrp. If one css is not enabled in the cgroup,
+             * use it's ancestor's
+             */</font>
+            template[i] = cgroup_e_css_by_mask(cgrp, ss)
+        } else {
+<font color="blue">            /*
+             * @ss is not in this hierarchy, so we don't want
+             * to change the css.
+             */</font>
+            template[i] = old_cset->subsys[i];
+        }
+    }
+---
+
+find_css_set()
+---
+<font color="red">
+    memcpy(cset->subsys, template, sizeof(cset->subsys))  <B>(3)</B>
+</font>
+    ...
+    spin_lock_irq(&css_set_lock);
+    /* Add reference counts and links from the new css_set. */
+    list_for_each_entry(link, &old_cset->cgrp_links, cgrp_link) {
+        struct cgroup *c = link->cgrp;
+
+        if (c->root == cgrp->root)
+            c = cgrp;
+<font color="red">
+        link_css_set(&tmp_links, cset, c); <B>(1)</B>
+</font>
+    }
+    ...
+    for_each_subsys(ss, ssid) {
+        struct cgroup_subsys_state *css = cset->subsys[ssid];
+<font color="red">
+        list_add_tail(&cset->e_cset_node[ssid],
+                  &css->cgroup->e_csets[ssid]); <B>(2)</B>
+</font>
+        css_get(css);
+    }
+---
+</pre>
+
+</ul>
+</font>
+</p>
+
+<h4><a name="cgroup_ds_lifecyle">life cycle</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> css_set
+<ul>
+<li> create
+<pre>
+find_css_set()
+---
+    refcount_set(&cset->refcount, 1);
+---
+</pre>
+<li> get
+<pre>
+When move a task into the cgroup,
+cgroup_migrate_execute()
+---
+    spin_lock_irq(&css_set_lock);
+    list_for_each_entry(cset, &tset->src_csets, mg_node) {
+        list_for_each_entry_safe(task, tmp_task, &cset->mg_tasks, cg_list) {
+            get_css_set(to_cset);
+            to_cset->nr_tasks++;
+            css_set_move_task(task, from_cset, to_cset, true);
+            from_cset->nr_tasks--;
+<font color="red">            put_css_set_locked(from_cset);</font>
+        }
+    }
+    spin_unlock_irq(&css_set_lock);
+---
+</pre>
+<li> put
+<pre>
+When move task out of the cgroup,
+See cgroup_migrate_execute()
+When task exits,
+release_task()
+  -> cgroup_release()
+     ---
+        spin_lock_irq(&css_set_lock);
+        css_set_skip_task_iters(task_css_set(task), task);
+        list_del_init(&task->cg_list);
+        spin_unlock_irq(&css_set_lock);
+     ---
+
+__put_task_struct()
+  -> cgroup_free()
+    -> put_css_set()
+</pre>
+</ul>
+<pre>
+When move task from one cgroup to another, or in the other word,
+move task from one css_set to another, due to there could be multiple
+tasks to be moved when echo pid to cgroup.proc, to guarantee 'all or nothing',
+the whole process is split into 4 steps,
+(1) prepare the source css_set, get_css_set is invoked there
+(2) prepare the destination css_set with find_css_set,
+    get_css_set is invoked or initial css_set is created,
+(3) do the real migration, get the reference of destination css_set
+    and put reference of source css_set
+(4) finish the migration, put_css_set_locked all of the source and destination
+    css_set. See cgroup_migrate_finish()
+</pre>
+<li> cgroup
+<pre>
+cgroup's reference is based on cgroup.self which is a css
+</pre>
+<ul>
+<li> create
+<li> get
+<pre>
+When a new cgroup is create
+cgroup_create()
+---
+    cgroup_get_live(parent);
+---
+
+When cgroup is linked with css
+init_and_link_css()
+  -> cgroup_get_live(cgrp)
+ 
+When cgroup is linked with css_set
+link_css_set()
+---
+    if (cgroup_parent(cgrp)) <font color="blue">//non-root cgroup</font>
+        cgroup_get_live(cgrp);
+---
+</pre>
+<li> put
+<pre>
+Base reference,
+cgroup_rmdir()
+  -> cgroup_destroy_locked()
+    -> percpu_ref_kill(&cgrp->self.refcnt)
+
+When css_set is freed,
+put_css_set_locked()
+---
+    list_for_each_entry_safe(link, tmp_link, &cset->cgrp_links, cgrp_link) {
+        list_del(&link->cset_link);
+        list_del(&link->cgrp_link);
+        if (cgroup_parent(link->cgrp))
+<font color="red">            cgroup_put(link->cgrp);</font>
+        kfree(link);
+    }
+---
+
+When css is freed,
+css_free_rwork_fn()
+---
+    if (ss) {
+        /* css free path */
+        struct cgroup_subsys_state *parent = css->parent;
+        int id = css->id;
+
+        ss->css_free(css);
+        cgroup_idr_remove(&ss->css_idr, id);
+<font color="red">                cgroup_put(cgrp);</font>
+
+        if (parent)
+            css_put(parent);
+    }
+---
+</pre>
+</ul>
+<li> css
+<pre>
+There are two reference count working for css
+(1) css.refcnt a percpu_ref
+(2) css.online_cnt
+</pre>
+<ul>
+<li> create
+<li> get
+<pre>
+online_cnt
+online_css()
+---
+        atomic_inc(&css->online_cnt);
+        if (css->parent)
+            atomic_inc(&css->parent->online_cnt);
+---
+</pre>
+<li> put
+<pre>
+cgroup_destroy_locked()
+---
+    for_each_css(css, ssid, cgrp)
+        kill_css(css);
+        ---
+        css_get(css);
+        percpu_ref_kill_and_confirm(&css->refcnt, css_killed_ref_fn);
+        ---
+---
+
+css_killed_ref_fn()
+---
+    if (atomic_dec_and_test(&css->online_cnt)) {
+        INIT_WORK(&css->destroy_work, css_killed_work_fn);
+        queue_work(cgroup_destroy_wq, &css->destroy_work);
+    }
+---
+</pre>
+</ul>
+</ul>
+In summary
+<pre>
+
+     task -> css_set <-> cgroup <-> css
+                                [1]
+-> : hold reference
+[1]: cgroup holds the css.online_css, and they are bound together.
+
+Think of following cases,
+(1) Task A in cg0 issues IO
+    At the moment, the task hold reference of css_set, and css_set holds
+    reference of cgroup, cgroup hold reference to css, so the blkcg(css)
+    will not be gone during this.
+(2) cgroup writeback control
+    At the moment, the css info is carried by writeback kworker, so it
+    need to hold reference to the css to keep it alive.
+    refer to cgwb_create() which hold reference of memcg_css and blkcg_css
+</pre>
+</font>
+<p>
+
+<h3><a name="cgroup_kernfs">cgroup kernfs</a></h3>
+<hr style="height:3px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2">
+In this section, we would like to know how does cgroup interact with users in userland through kernfs.<br/>
 Let's start from the root of cgroup fs which is initialized in cgroup_init<br/>
 <pre>
 cgroup_init()
@@ -45,17 +491,17 @@ cgroup_init()
     ...
     BUG_ON(cgroup_setup_root(&cgrp_dfl_root, 0));
 ---
-</pre>>
+</pre>
 These are the key of the cgroup kernfs, files and hierarchy
 </font>
 </p>
 
 <h4><a name="cgroup_kernfs_files">Files</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
 <p>
 <font size="2">
-cgroup_base_files is an array of cftype which defines the <br/>
-control file in cgroup directorys, such as 'cgroup.type', 'cgroup.procs'.<br/>
-cgroup_init_cftypes mainly asigns a kernfs_ops for every cftype.<br/>
+cgroup_base_files is an array of cftype which defines the control file in cgroup directorys,<br/>
+such as 'cgroup.type', 'cgroup.procs'. cgroup_init_cftypes mainly asigns a kernfs_ops for every cftype.<br/>
 <pre>
 static struct kernfs_ops cgroup_kf_ops = {
     .atomic_write_len    = PAGE_SIZE,
@@ -68,25 +514,18 @@ static struct kernfs_ops cgroup_kf_ops = {
     .seq_stop        = cgroup_seqfile_stop,
     .seq_show        = cgroup_seqfile_show,
 };
-
-This structure is used for kernfs, such as
-kernfs_fop_read()
----
-<font color="blue">
-    //KERNFS_HAS_SEQ_SHOW is set if the kernfs_ops has seq_show
-</font>
-    if (of->kn->flags & KERNFS_HAS_SEQ_SHOW)
-        return seq_read(file, user_buf, count, ppos);
----
 </pre>
 cgroup_kf_ops is a wrapper which translates the semantics from kernfs to cgroup.
 <pre>
 cgroup_file_write()
 ---
     struct cgroup *cgrp = of->kn->parent->priv;
-<font color="red">    struct cftype *cft = of->kn->priv; </font>
+    struct cftype *cft = of->kn->priv;
+<font color="blue">
+    //parent, namely the directory, stands for the cgroup
+    //file is the attibutes in the cgroup directory
+</font>
     ...
-
     if (cft->write)
 <font color="red">        return cft->write(of, buf, nbytes, off);</font>
 
@@ -107,7 +546,7 @@ cgroup_file_write()
     }
 ---
 </pre>
-The kernfs would provide two guarantees regarding to a file
+<B>The kernfs would provide two guarantees regarding to a file</B>
 <ul>
 <li> read/write on the file is atomic
 <pre>
@@ -205,12 +644,42 @@ __kernfs_remove()
 </p>
 
 <h4><a name="cgroup_kernfs_hierarchy">Hierarchy</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
 <p>
 <font size="2">
-To setup the hierarchy of a filesystem, we need the root node.<br/>
-This is done by cgroup_setup_root()
+Currently, there are two different kinds of cgroup hierarchy in kernel,<br/>
+<ul>
+<li> cgroup V1
 <pre>
-cgroup_setup_root()
+    cpu-cg-root        '    mem-cg-root          '   blkio-cg-root
+     /      \          '       /      \          '        /      \
+cpu-cg-0  cpu-cg-1     ' mem-cg-0  mem-cg-1      ' blkio-cg-0 blkio-cg-1
+            /  \       '              /  \       '               /  \
+     cpu-cg-2  cpu-cg-3'       mem-cg-2  mem-cg-3'      blkio-cg-2  blkio-cg-3
+                       '                         '
+</pre>                 
+<li> cgroup V2
+<pre>
+                     cg-dfl-root (cpu, mem, blkio)
+                          /               \
+                    cg-0(cpu, mem)     cg-1 (cpu, mem, blkio)
+                                         /          \            
+                                    cg-2 (blkio)   cg-3(blkio)
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h5><a name="cgroup_kernfs_hierarchy_cgroupfs">cgroupfs</a></h5>
+<p>
+<font size="2">
+To understand a filesystem, we must to know how to mkfs, mount, and use it.<br/>
+<ul>
+<li> mkfs
+<pre>
+cgroup_init()
+  -> cgroup_setup_root(&cgrp_dfl_root)
 ---
     kf_sops = root == &cgrp_dfl_root ?
         &cgroup_kf_syscall_ops : &cgroup1_kf_syscall_ops;
@@ -220,12 +689,7 @@ cgroup_setup_root()
                        KERNFS_ROOT_SUPPORT_EXPORTOP |
                        KERNFS_ROOT_SUPPORT_USER_XATTR,
                        root_cgrp);
-<font color="blue">
-    /*
-        kernfs_root is likely to the superblock of the normal
-        disk filesystem.
-     */
-</font>
+    root_cgrp->kn = root->kf_root->kn;
     ...
 <font color="blue">
     /*
@@ -235,15 +699,23 @@ cgroup_setup_root()
        rb_tree which indexed by name hash.
     */
 </font>
+
     ret = css_populate_dir(&root_cgrp->self);
----
+<font color="blue">
+    kernfs_root is likely to the superblock of the normal disk filesystem.
+    There are two important fields in it,
+     - kernfs_node, it could be deemed as the root inode on disk
+     - kernfs_syscall_ops, vfs op -> kernfs op -> syscall op
+                                                  ^^^^^^^^^^
+</font>
 </pre>
-At this moment, the cgroup kernfs is not mounted, and the process above could be deemed to mkfs.<br/>
-During mount, kernfs_fill_super will be invoked,
+<li> mount
 <pre>
 kernfs_fill_super
 ---
-    /* get root inode, initialize and unlock it */
+<font color="blue">
+    // This could be deemed as loading root inode
+</font>
     mutex_lock(&kernfs_mutex);
     inode = kernfs_get_inode(sb, info->root->kn);
     mutex_unlock(&kernfs_mutex);
@@ -252,13 +724,11 @@ kernfs_fill_super
     root = d_make_root(inode);
     ...
     sb->s_root = root;
-    sb->s_d_op = &kernfs_dops;
 ---
 </pre>
-And look the inode operations of kernfs
+<li> use it
 <pre>
-kernfs_get_inode()
-  -> kernfs_init_inode()
+Let's look at the inode operations of kernfs
 
 const struct inode_operations kernfs_dir_iops = {
     .lookup        = kernfs_iop_lookup,
@@ -271,21 +741,11 @@ const struct inode_operations kernfs_dir_iops = {
     .rmdir        = kernfs_iop_rmdir,
     .rename        = kernfs_iop_rename,
 };
-</pre>
-See it ?<br/>
-lookup, mkdir, rmdir is supported, but there is not create.<br/>
-This means you cannot create regular files in it.
-<pre>
-vfs_create()
----
-<font color="red">
-    if (!dir->i_op->create)
-        return -EACCES;    /* shouldn't it be ENOSYS? */
-</font>
----
-</pre>
+
+There is no .create and .unlink, this means that you cannot create/remove
+regular files.
+
 Look into the kernfs_iop_mkdir
-<pre>
 kernfs_iop_mkdir()
 ---
     struct kernfs_node *parent = dir->i_private;
@@ -302,19 +762,15 @@ kernfs_iop_mkdir()
     kernfs_put_active(parent);
     return ret;
 ---
+kernfs_syscall_ops is provided by the backend of kernfs.
 
-</pre>
-kernfs_syscall_ops is provided by the backend of kernfs.<br/>
-<pre>
 static struct kernfs_syscall_ops cgroup_kf_syscall_ops = {
     .show_options        = cgroup_show_options,
     .mkdir            = cgroup_mkdir,
     .rmdir            = cgroup_rmdir,
     .show_path        = cgroup_show_path,
 };
-</pre>
-Let's look at cgroup_mkdir
-<pre>
+
 cgroup_mkdir()
 ---
     cgrp = cgroup_create(parent, name, mode);
@@ -328,26 +784,80 @@ cgroup_mkdir()
      * that @cgrp->kn is always accessible.
      */
     kernfs_get(cgrp->kn);
-
-    ret = cgroup_kn_set_ugid(cgrp->kn);
-    if (ret)
-        goto out_destroy;
-
+    ...
     ret = css_populate_dir(&cgrp->self);
-    if (ret)
-        goto out_destroy;
-
-    ret = cgroup_apply_control_enable(cgrp);
-    if (ret)
-        goto out_destroy;
-
-    TRACE_CGROUP_PATH(mkdir, cgrp);
-
+    ...
     /* let's create and online css's */
     kernfs_activate(cgrp->kn);
 ---
-</pre>
 As expected, it creates a cgroup
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h5><a name="cgroup_kernfs_hierarchy_V1V2">V1 and V2</a></h5>
+<p>
+<font size="2">
+Let's look at the difference between V1 and V2
+<ul>
+<li> mkfs
+<pre>
+<B>V2:</B>
+cgroup_init()
+  -> cgroup_setup_root(&cgrp_dfl_root, <font color="red">0</font>);
+  ---
+    kf_sops = root == &cgrp_dfl_root ?
+        &cgroup_kf_syscall_ops : &cgroup1_kf_syscall_ops;
+    ...
+    ret = rebind_subsystems(root, ss_mask);
+  ---
+<B>V1</B>
+cgroup1_get_tree()
+  -> cgroup1_root_to_use()
+  ---
+    root = kzalloc(sizeof(*root), GFP_KERNEL);
+    ctx->root = root;
+    init_cgroup_root(ctx);
+    ret = cgroup_setup_root(root, <font color="red">ctx->subsys_mask</font>);
+  ---
+
+The difference:
+(1) root of cgroup1 is dynamically allocated
+(2) all of the subsystem are bound to default root, namely V2, by default,
+    when the mount cgroup1, the required subsystems are rebound to new root.
+    cgroup_init_subsys
+    ---
+        ss->root = &cgrp_dfl_root;
+    ---
+    When root of cgroup1 is created, the corresponding subsystem to hierarchy
+    is rebound to that root.
+(3) V1 and V2 have different syscall ops,
+    Look into cgroup_kf_syscall_ops and cgroup1_kf_syscall_ops, the only
+    difference is cgroup1 has .rename callback.
+</pre>
+<li> mount
+<pre>
+The biggest difference is, during mount cgroup V1, a new root is allocated and subsystem is rebound.
+</pre>
+<li> use it
+<pre>
+cgroup_mkdir()
+  -> cgroup_create()
+  ---
+<font color="blue">
+    /*
+     * On the default hierarchy, a child doesn't automatically inherit
+     * subtree_control from the parent.  Each is configured manually.
+     */
+</font>
+    if (!cgroup_on_dfl(cgrp))
+        cgrp->subtree_control = cgroup_control(cgrp);
+  ---
+
+</pre>
+</ul>
 </font>
 </p>
 

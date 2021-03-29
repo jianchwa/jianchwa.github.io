@@ -15,16 +15,26 @@
 <li> <a href="#link_count">link count</a>
 <li> <a href="#posix_unlink">posix unlink</a>
 <li> <a href="#asynchronous_journal">asynchronous journal</a>
+<li> <a href="#file_permissions">file permissions</a>
+<ul>
+<li> <a href="#unix_style_permission">unix style permission</a>
+</ul>
 </ul>
 
 <a href="#infrastructure">infrastructure</a>
 <ul>
+<li> <a href="#fs_stat">filesystem statistics</a>
+<ul>
+<li> <a href="#proc_pid_io">/proc/PID/io</a>
+</ul>
 <li> <a href="#iov_iter">iov_iter</a>
 <li> <a href="#inode_lock_and_fault">inode lock and page fault</a>
 <li> <a href="#sendfile">sendfile</a>
 <li> <a href="#open_and_close">open and close</a>
 <li> <a href="#mount">mount</a>
 <li> <a href="#writenotify">writenotify</a>
+<li> <a href="#synchronous_fault">synchronous page fault</a>
+<li> <a href="#writeback_and_cgroup_blkio">writeback and cgroup blkio</a>
 </ul>
 
 <a href="#inode">Inode</a>
@@ -381,9 +391,228 @@ jbd2_journal_stop()
 </font>
 </p>
 
+<h3><a name="file_permissions">file permissions</a></h3>
+<p>
+<font size="2">
+When a process performs an operation to a file, the Linux kernel performs<br/>
+the check in the following order:
+<ul>
+<li>
+<li> Discretionary Access Control (DAC)
+<pre>
+Or __user__ dictated access control
+
+This includes both classic UNIX style permission checks and POSIX Access Control Lists (ACL).
+
+Classical UNIX checks compare the current process UID and GID versus the UID and GID of the
+file being accessed with regards to which modes have been set (Read/Write/eXecute).
+
+Access Control List extends classic UNIX checks to allow more options regarding permission control.
+</pre>
+<li> Mandatory Access Control (MAC)
+<pre>    
+Or policy based access control.
+This is implemented using Linux Security Modules (LSM) which are not real modules anymore (they
+used to be but it was dropped). They enable additionnal checks based on other models than the
+classical UNIX style security checks. All of those models are based on a policy describing what
+kind of opeartions are allowed for which process in which context.
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="unix_style_permission">unix style permissions</a></h4>
+<p>
+<font size="2">
+The classical unix style permissions is based on two points:
+<ul>
+<li> inode uid/gid and read/write/exec permissions of user/group/other
+<pre>
+# ll test.c
+-rw-r--r-- 1 will will 71 Mar 25 09:37 test.c
+</pre>
+<li> access process's gid/uid
+<pre>
+# id will
+uid=1000(will) gid=1000(will) groups=1000(will)
+</pre>
+</ul>
+Through following two steps:
+<ul>
+<li> Step 1 
+<pre>
+Based on the accessing process' gid/uid to know who you are, user ? members
+of same group ? other ?
+</pre>
+<li> Step 2
+<pre>
+Based on the role decided by step one, get your permission, which is composed
+by following compoments
+
+#define S_IRUSR <font color="red">0</font>0400
+#define S_IWUSR <font color="red">0</font>0200
+#define S_IXUSR <font color="red">0</font>0100
+
+#define S_IRGRP <font color="red">0</font>0040
+#define S_IWGRP <font color="red">0</font>0020
+#define S_IXGRP <font color="red">0</font>0010
+
+#define S_IROTH <font color="red">0</font>0004
+#define S_IWOTH <font color="red">0</font>0002
+#define S_IXOTH <font color="red">0</font>0001
+
+<B><font color="red">Note !!! They are Octal !!!</font></B>
+</pre>
+</ul>
+The code of permission check is as following,
+<pre>
+do_last()
+  -> may_open()
+    -> inode_permission()
+      -> sb_permission()
+         ---
+<font color="blue">
+            /* Nobody gets write access to a read-only fs. */
+</font>
+            if (sb_rdonly(sb) && (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
+                return -EROFS;
+         ---
+      -> do_inode_permission()
+        -> generic_permission()
+          -> acl_permission_check()
+
+
+acl_permission_check()
+---
+    if (likely(uid_eq(current_fsuid(), inode->i_uid)))
+        mode >>= 6;
+    else {
+        if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
+            int error = check_acl(inode, mask);
+            if (error != -EAGAIN)
+                return error;
+        }
+
+        if (in_group_p(inode->i_gid))
+            mode >>= 3;
+    }
+<font color="red">
+    if ((mask & ~mode & (MAY_READ | MAY_WRITE | MAY_EXEC)) == 0)
+        return 0;
+</font>
+    return -EACCES;
+---
+</pre>
+</font>
+</p>
+
 
 <h2><a name="infrastructure">infrastructure</a></h2>
 <hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="fs_stat">filesystem statistics</a></h3>
+
+<h4><a name="proc_pid_io">/proc/PID/io</a></h4>
+<p>
+<font size="2">
+When we read the /proc/PID/io, we would get following things,
+<pre>
+rchar: 2814484553
+wchar: 2326047
+syscr: 689899
+syscw: 7616
+read_bytes: 507052032
+write_bytes: 1105920
+cancelled_write_bytes: 393216
+</pre>
+What do these fields stand for ? Let's look at the code.
+<pre>
+proc_tid_io_accounting/proc_tgid_io_accounting()
+  -> do_io_accounting()
+  ---
+    struct task_io_accounting acct = task->ioac;
+    ...
+    if (whole && lock_task_sighand(task, &flags)) {
+        struct task_struct *t = task;
+
+        task_io_accounting_add(&acct, &task->signal->ioac);
+        while_each_thread(task, t)
+            task_io_accounting_add(&acct, &t->ioac);
+
+        unlock_task_sighand(task, &flags);
+    }
+    seq_printf(m,
+           "rchar: %llu\n"
+           "wchar: %llu\n"
+           "syscr: %llu\n"
+           "syscw: %llu\n"
+           "read_bytes: %llu\n"
+           "write_bytes: %llu\n"
+           "cancelled_write_bytes: %llu\n",
+           (unsigned long long)acct.rchar,
+           (unsigned long long)acct.wchar,
+           (unsigned long long)acct.syscr,
+           (unsigned long long)acct.syscw,
+           (unsigned long long)acct.read_bytes,
+           (unsigned long long)acct.write_bytes,
+           (unsigned long long)acct.cancelled_write_bytes);
+  ---
+</pre>
+Let's look into the fields only by one
+<ul>
+<li> rchar, bytes read through synchronous read
+<pre>
+add_rchar() <- vfs_read()
+            <- do_readv()
+            <- do_preadv()
+            <- compat_readv()
+            <- do_sendfile()
+            <- vfs_copy_file_range() >
+
+rchar records the bytes read through read/readv/preadv...
+the data can be from not only a regular file but also a socket
+</pre>
+<li> wchar, bytes write through synchronous write
+<pre>
+add_wchar() <- vfs_write()
+            <- do_writev()
+            <- do_pwritev()
+            <- compat_writev()
+            <- do_sendfile()
+            <- vfs_copy_file_range() >
+
+wchar is almost same with rchar
+</pre>
+<li> syscr & syscw, count of read/write syscall
+<pre>
+inc_syscr/syscw() are hooked along with add_rchar/wchar()
+</pre>
+<li> read_bytes, the number of bytes which this task has caused to be <font color="red">read from storage</font>
+<pre>
+task_io_account_read() <- submit_bio()
+                       <- nfs_file_direct_read()
+                       <- read_cache_pages()     <-nfs_readpages()
+                                                 <-fuse_readpages() >
+
+read is always __synchronous__ no mater buffer read nor direct IO, so submit_bio is always necessary, except for special filesystem,
+such as networking filesystem.
+</pre>
+<li> write_bytes, the number of bytes which this task has caused, or shall cause to be <font color="red"> written to disk</font>
+<pre>
+task_io_account_write() <- __blkdev_direct_IO_simple()
+                        <- __blkdev_direct_IO()
+                        <- submit_page_section()        <- dio_zero_block()
+                                                        <- do_direct_IO()
+                        <- iomap_dio_bio_actor()
+                        <- nfs_file_direct_write()
+                        <- account_page_dirtied()       <- __set_page_dirty()
+                                                        <- __set_page_dirty_nobuffers() >
+buffer write is asynchronous, the final writeback is done by writeback workers, so we cannot
+account it in submit_bio.
+</pre>
+</ul>
+</font>
+</p>
 
 <h3><a name="iov_iter">iov_iter</a></h3>
 <p>
@@ -1128,6 +1357,247 @@ The page will be marked dirty during this.
 clear_page_dirty_for_io() is invoked during page writeback
 </pre>
 </ul>
+</font>
+</p>
+
+<h3><a name="synchronous_fault">synchronous page fault</font></h3>
+<p>
+<font size="2">
+<B>What's synchronous page fault for ?</B>
+<pre>
+https://lwn.net/Articles/731706/
+Normally, filesystems are in control of all I/O to the underlying storage
+                                        ^^^^^^^
+media; they use that control to ensure that the filesystem structure is
+consistent at all times. Even when a file on a traditional storage device
+is mapped into a process's virtual address space, the filesystem manages
+the writeback of modified pages from the page cache to persistent storage.
+Directly mapped persistent memory bypasses the filesystem, though, leading
+to a number of potential problems including inconsistent metadata or data
+corruption and loss if the filesystem relocates the file being modified.
+
+For example, in ext4,
+ext4_dax_huge_fault()
+  -> dax_iomap_fault()
+    -> dax_iomap_pte_fault()
+      -> ext4_iomap_begin()
+        -> ext4_iomap_alloc()
+          -> ext4_journal_start()
+          -> ext4_map_blocks()
+          -> ext4_journal_stop()
+<font color="blue">
+          At this moment, the metadata has not been on persistent storage.
+</font>
+      -> vmf_insert_mixed_mkwrite() <font color="blue">//insert page fault</font>
+   
+After the page fault returns, the metadata may have not been on the page fault
+due to the asynchronous journal employed by both xfs and ext4. The userland process
+           ^^^^^^^^^^^^^^^^^^^^
+(usually a storage engine) can write data on the mapping. But if the system crashes
+before the fs metadata get flushed the persistent storage medium, the written data
+could be lost.
+
+MAP_SYNC is such as flags that tells kernel do the fsync after before the page fault
+returns.
+
+ext4_dax_huge_fault()
+  -> dax_iomap_fault()
+    -> dax_iomap_pte_fault()
+      -> ext4_iomap_begin()
+---
+<font color="blue">
+        /*
+         * If we are doing synchronous page fault and inode needs fsync,
+         * we can insert PTE into page tables only after that happens.
+         * Skip insertion for now and return the pfn so that caller can
+         * insert it after fsync is done.
+         */
+</font>
+        if (sync) {
+            *pfnp = pfn;
+            ret = VM_FAULT_NEEDDSYNC | major;
+            goto finish_iomap;
+        }
+---
+
+ext4_dax_huge_fault()
+--
+    result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
+    if (write) {
+        ext4_journal_stop(handle);
+
+        /* Handling synchronous page fault? */
+        if (result & VM_FAULT_NEEDDSYNC)
+            result = dax_finish_sync_fault(vmf, pe_size, pfn);
+<font color="blue">
+              //guarantee the metadat get flushed to the persistent storage medium
+</font>
+              -> vfs_fsync_range()
+                -> file_write_and_wait_range()
+                -> ext4_fsync_journal()
+                -> blkdev_issue_flush()
+<font color="blue">
+                // insert page table
+</font>
+              -> dax_insert_pfn_mkwrite()
+        up_read(&EXT4_I(inode)->i_mmap_sem);
+        sb_end_pagefault(sb);
+    } 
+--
+</pre>
+</font>
+</p>
+
+<h3><a name="writeback_and_cgroup_blkio">writeback and cgroup blkio</a></h3>
+<p>
+<font size="2">
+In the past, only direct IO and buffered read IO can be controlled by cgroup<br/>
+blkio. The reason is as following diragram.
+<pre>
+
+   a cgroup      VFS LAYER      root cgroup
+    Task A                     writeback kworker
+      |                             |
+      | dirtying pages              | flush dirty inodes
+      v                             v
+[D] [D] [D] [D]      ------->   writepages
+[D] [D] [D] [D]                     |
+------------------------------------^--------------------
+                  BLOCK LAYER       |
+                                    v
+                                 submit_bio
+                                    | blkio qos/scheduler
+                                    v
+                               [R] [R] [R] [R]
+---------------------------------------------------------
+                 SCSI/NVME/....
+</pre>
+writeback kworker does the real IO but it belongs to the root cgroup.<br/>
+More details, refer to <a href="https://lwn.net/Articles/648292/">Writeback and control groups</a><br/>
+Let's look into the code,
+<ul>
+<li> bdi_writeback per backing_dev_info & memcg_css pair
+<pre>
+bdi_writeback is in charge of dirty page writeabck activity to the block device
+behind the backing_dev_info. Look into it, we can find b_dirty/b_dirty_time
+which are used to hang dirty inodes.
+The role of backing_dev_info is weakened and become the brigde between bdi_writeback
+and block device.
+</pre>
+<li> associate bdi_writeback and inode
+<pre>
+This is done by __mark_inode_dirty -> inode_attach_wb()
+It is in the context of the task that's dirtying pages
+</pre>
+<li> associate blkcg and bio
+<pre>
+This is done by wbc_init_bio in .writepages
+wbc_init_bio()
+---
+<font color="blue">
+    /*
+     * pageout() path doesn't attach @wbc to the inode being written
+     * out.  This is intentional as we don't want the function to block
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * behind a slow cgroup.  Ultimately, we want pageout() to kick off
+       ^^^^^^^^^^^^^^^^^^^^
+     * regular writeback instead of writing things out itself.
+     */
+</font>
+    if (wbc->wb)
+        bio_associate_blkg_from_css(bio, wbc->wb->blkcg_css);
+---
+
+Take ext4 as example,
+io_submit_init_bio()
+---
+    bio = bio_alloc(GFP_NOIO, BIO_MAX_VECS);
+    fscrypt_set_bio_crypt_ctx_bh(bio, bh, GFP_NOIO);
+    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+    bio_set_dev(bio, bh->b_bdev);
+    bio->bi_end_io = ext4_end_bio;
+    bio->bi_private = ext4_get_io_end(io->io_end);
+    io->io_bio = bio;
+    io->io_next_block = bh->b_blocknr;
+    wbc_init_bio(io->io_wbc, bio);
+---
+</pre>
+</ul>
+Now, we know that the bios queued by writeback kworker have owned the<br/>
+information of cgroup that dirtied the pages.<br/>
+And we still need to throttle the task that's dirtying the pages to match<br/>
+the speed of dirtying and cleaning. And this has been done in balance_dirty_pages()<br/>
+<pre>
+balance_dirty_pages()
+---
+    struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
+    struct dirty_throttle_control * const mdtc = mdtc_valid(&mdtc_stor) ? &mdtc_stor : NULL;
+<font color="blue">
+    //mdtc is for memcg dirty throttle control
+</font>
+        if (mdtc) {
+            unsigned long filepages, headroom, writeback;
+
+            /*
+             * If @wb belongs to !root memcg, repeat the same
+             * basic calculations for the memcg domain.
+             */
+            mem_cgroup_wb_stats(wb, &filepages, &headroom,
+                        &mdtc->dirty, &writeback);
+            mdtc->dirty += writeback;
+            mdtc_calc_avail(mdtc, filepages, headroom);
+
+            domain_dirty_limits(mdtc);
+        }
+        ...
+        if (mdtc) {
+            ...
+            dirty_exceeded |= (mdtc->wb_dirty > mdtc->wb_thresh) &&
+                ((mdtc->dirty > mdtc->thresh) || strictlimit);
+
+            wb_position_ratio(mdtc);
+            if (mdtc->pos_ratio < gdtc->pos_ratio)
+                sdtc = mdtc;
+        }
+---
+
+domain_dirty_limits() is for calculating the limit of per-memcg
+---
+    /* gdtc is !NULL iff @dtc is for memcg domain */
+    if (gdtc) {
+        unsigned long global_avail = gdtc->avail;
+<font color="blue">
+        /*
+         * The byte settings can't be applied directly to memcg
+         * domains.  Convert them to ratios by scaling against
+         * globally available memory.  As the ratios are in
+         * per-PAGE_SIZE, they can be obtained by dividing bytes by
+         * number of pages.
+         */
+</font>
+        if (bytes)
+            ratio = min(DIV_ROUND_UP(bytes, global_avail),
+                    PAGE_SIZE);
+        if (bg_bytes)
+            bg_ratio = min(DIV_ROUND_UP(bg_bytes, global_avail),
+                       PAGE_SIZE);
+        bytes = bg_bytes = 0;
+    }
+---
+
+Whether enable this feature is controlled by wb->memcg_css->parent,
+namely, whether this bdi_writeback belongs to a non-root memcg.
+Refer to MDTC_INIT() and mdtc_valid();
+
+And the belonging of the bdi_writeback is decided when
+balance_dirty_pages_ratelimited()
+---
+    if (inode_cgwb_enabled(inode))
+        wb = wb_get_create_current(bdi, GFP_KERNEL);
+    if (!wb)
+        wb = &bdi->wb;
+---
+</pre>
 </font>
 </p>
 
