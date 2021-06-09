@@ -18,6 +18,12 @@
 <ul>
 <li> <a href="#split_page_table_lock">split page table lock</a><br/>
 </ul>
+
+<a href="#reclaim">Reclaim</a><br/>
+<ul>
+<li> <a href="#shift_between_active_and_inactive">Shift between active and inactive list</a>
+<li> <a href="#reclaim_and_writeback">Reclaim and Writeback</a><br/>
+</ul>
 </font>
 </p>
 
@@ -342,6 +348,534 @@ static inline spinlock_t *pud_lockptr(struct mm_struct *mm, pud_t *pud)
 </pre>
 The handle_mm_fault works under <font color="red">mmap_read_lock()</font><br/>
 do_mmap_pgoff works under mmap_write_lock()
+</font>
+</p>
+
+<h2><a name="reclaim">Reclaim</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="minior_and_major_faults">minor and major faults</a></h3>
+<p>
+<font size="2">
+There are two kinds of page faults, minor and major, or soft and hard.
+<ul>
+<li> minor/soft
+<pre>
+If the page is loaded in memory at the time the fault is generated,
+but is not marked in the memory management unit as being loaded in memory,
+then it is called a minor or soft page fault.
+</pre>
+<li> major/hard
+<pre>
+The operating system delays loading parts of the program from disk until
+the program attempts to use it and the page fault is generated. If the
+page is not loaded in memory at the time of the fault, then it is called
+a major or hard page fault.
+</pre>
+</ul>
+
+We could observe these two kinds of page faults in following ways,
+<ul>
+<li> per-thread, /proc/_pid_/task/_tid_/stat
+<li> per-process, /proc/_pid_/stat
+<li> per-cgroup, /sys/fs/cgroup/memory/memory.stat 
+</ul>
+
+In code, it works as following,
+<pre>
+filemap_fault()
+---
+    page = find_get_page(mapping, offset);
+    if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+        fpin = do_async_mmap_readahead(vmf, page);
+    } else if (!page) {
+        /* No page in the page cache at all */
+        count_vm_event(PGMAJFAULT);
+        count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
+<font color="red">        ret = VM_FAULT_MAJOR;</font>
+        fpin = do_sync_mmap_readahead(vmf);
+retry_find:
+        page = pagecache_get_page(mapping, offset,
+                      FGP_CREAT|FGP_FOR_MMAP,
+                      vmf->gfp_mask);
+        ...
+    }
+    if (!lock_page_maybe_drop_mmap(vmf, page, &fpin))
+        goto out_retry;
+---
+
+mm_account_fault()
+---
+    major = (ret & VM_FAULT_MAJOR) || (flags & FAULT_FLAG_TRIED);
+
+    if (major)
+        current->maj_flt++;
+    else
+        current->min_flt++;
+---
+
+However, there are some confusing things here,
+
+The readahead could case the page cache has been allocated but IO
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+is still ongoing. When we fault on this page, it will be accounted
+^^^^^^^^^^^^^^^^
+as min fault, but we need to wait the read IO complete. This is
+similar with the major faults.
+
+</pre>
+</font>
+</p>
+
+<h3><a name="shift_between_active_and_inactive">Shift between active and inactive list</a></h3>
+<p>
+<font size="2">
+<pre>
+ 
+            CPU0             CPU1             CPU2             CPU3
+  per-cpu   pvecs.lru_add    pvecs.lru_add    pvecs.lru_add    pvecs.lru_add
+                 
+  per-numa                              pglist_data
+
+                            File/Anon Active/Inactive  LRU list
+
+
+                    +-------------+               +------------+
+                   /    active   /               /  inactive   /
+                  +-------------+               +-------------+
+</pre>
+<ul>
+<li> <B>How to move ?</B>
+<pre>
+The basic principle is to add to a local per-cpu queue and then batch to add to
+global lru list when the number of local reaches a threshold.
+
+filemap_fault()
+grab_cache_page_write_begin()
+  -> pagecache_get_page()
+    -> add_to_page_cache_lru()
+
+generic_file_buffered_read()
+  -> add_to_page_cache_lru()
+    -> lru_cache_add()
+    ---
+<font color="red">    get_page(page);</font>
+    local_lock(&lru_pvecs.lock);
+    pvec = this_cpu_ptr(&lru_pvecs.lru_add);
+<font color="blue">
+    // the threshold is PAGEVEC_SIZE 15
+</font>
+    if (!pagevec_add(pvec, page) || PageCompound(page))
+        __pagevec_lru_add(pvec);
+    local_unlock(&lru_pvecs.lock);
+    ---
+<font color="blue">
+This percpu pagevec is to reduce the contending on the pgdat->lru_lock
+which is a per numa node one.
+</font>
+__pagevec_lru_add()
+---
+    pagevec_lru_move_fn(pvec, __pagevec_lru_add_fn, NULL);
+---
+<font color="blue">
+//This is the infrastructure of rotating pages around lru list
+</font>
+pagevec_lru_move_fn()
+---
+    for (i = 0; i < pagevec_count(pvec); i++) {
+        struct page *page = pvec->pages[i];
+        struct pglist_data *pagepgdat = page_pgdat(page);
+
+        if (pagepgdat != pgdat) {
+            if (pgdat)
+                spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+            pgdat = pagepgdat;
+<font color="blue">
+            //The pgdat represents a whole numa node !!!!
+            //So the lock here is very big
+</font>
+            spin_lock_irqsave(&pgdat->lru_lock, flags);
+        }
+
+<font color="blue">
+        // per-memcg lruvec
+</font>
+        lruvec = mem_cgroup_page_lruvec(page, pgdat);
+        (*move_fn)(page, lruvec, arg);
+    }
+    if (pgdat)
+        spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+<font color="blue">
+    // The reference is got when add to the percpu pagevec
+</font>
+    release_pages(pvec->pages, pvec->nr);
+    pagevec_reinit(pvec);
+---
+
+__pagevec_lru_add_fn()
+  -> SetPageLRU()
+<font color="blue">
+    // Only active list when PageActive
+    // Is a newly added page deemed active ?
+    // Maybe not, look into the mark_page_accessed()
+</font>
+  -> lru = page_lru(page)
+  -> add_page_to_lru_list()
+
+There some other special percpu pagevecs
+<ul>
+<li> lru_rotate
+<font color="blue">
+/*
+ * Writeback is about to end against a page which has been marked for immediate
+ * reclaim.  If it still appears to be reclaimable, move it to the tail of the
+ * inactive list.
+ */
+</font>
+end_page_writeback()
+  -> rotate_reclaimable_page()
+   ---
+    if (!PageLocked(page) && !PageDirty(page) &&
+        !PageUnevictable(page) && PageLRU(page)) {
+        struct pagevec *pvec;
+        unsigned long flags;
+
+        get_page(page);
+        local_lock_irqsave(&lru_rotate.lock, flags);
+        pvec = this_cpu_ptr(&lru_rotate.pvec);
+        if (!pagevec_add(pvec, page) || PageCompound(page))
+            pagevec_move_tail(pvec);
+        local_unlock_irqrestore(&lru_rotate.lock, flags);
+    }
+   ---
+
+   pagevec_move_tail()
+     -> pagevec_move_tail_fn()
+     ---
+    if (PageLRU(page) && !PageUnevictable(page)) {
+        del_page_from_lru_list(page, lruvec, page_lru(page));
+        ClearPageActive(page);
+        add_page_to_lru_list_tail(page, lruvec, page_lru(page));
+        (*pgmoved) += thp_nr_pages(page);
+    }
+     ---
+<li> lru_deactivate_file
+The pages here come from __invalidate_mapping_pages()
+
+<li> lru_pvecs.activate_page
+mark_page_accessed()
+---
+    if (!PageReferenced(page)) {
+        SetPageReferenced(page);
+    } else if (PageUnevictable(page)) {
+    } else if (!PageActive(page)) {
+<font color="blue">
+        /*
+         * If the page is on the LRU, queue it for activation via
+         * lru_pvecs.activate_page. Otherwise, assume the page is on a
+         * pagevec, mark it active and it'll be moved to the active
+         * LRU on the next drain.
+         */
+</font>
+        if (PageLRU(page))
+            activate_page(page);
+        else
+            __lru_cache_activate_page(page);
+        ClearPageReferenced(page);
+        workingset_activation(page);
+    }
+---
+</pre>
+
+<li> <B>When to activate ?</B>
+<pre>
+SetPageActive() <- __activate_page() <- activate_page() \ mark_page_accessed()[1] >
+                <- __lru_cache_activate_page()          /                         >
+
+                <- shrink_page_list [2]                                           >
+[1] mark_page_accessed()
+    If the page has been marked PageReferenced, activate it !
+<font color="blue">    If a page in page cache for file or anon must be on LRU list or on the way
+    there, namely the lru_pvecs.lru_add, refer to  lru_cache_add.</font>
+
+[2] shrink_page_list()
+
+There are many conditions could cause shrink_page_list() to activate a page.
+<ul>
+<li> PageWriteback
+<U>When page is in PageWriteback sate, this indicates the page has been written out
+but not completed.</U> There are mainly two cases here,
+ (1) activate it, give the page another round in LRU list and avoid the scan the
+    page in unactive LRU list again and again
+ (2) wait_on_page_writeback, this could be deemed as another kind of dirty throttling mechanism.
+
+<li> page_check_references()
+There are two kinds of <font color="red">Referenced</font> here.
+ (1) PageReferenced() from mark_page_accessed
+ (2) reference bit in the pte.
+
+page_check_references()
+---
+<font color="blue">
+    // page_referenced_one() would test and clear the 'young' bit on pte
+</font>
+    referenced_ptes = page_referenced(page, 1, sc->target_mem_cgroup,
+                      &vm_flags);
+    referenced_page = <font color="red">TestClearPageReferenced(page)</font>;
+                                            ^^^^^
+    if (referenced_ptes) {
+        SetPageReferenced(page);
+<font color"blue">
+        // A page could be mapped to address spaces of two tasks,
+        // so referenced_ptes could be bigger than 1
+</font>
+        if (referenced_page || referenced_ptes > 1)
+            return PAGEREF_ACTIVATE;
+
+        return PAGEREF_KEEP;
+    }
+---
+<li> try_to_unmap return FAILURE
+<li> <B>PageDirty</B>
+Only kswapd can writeback filesystem pages to avoid risk of stack overflow.
+But avoid injecting inefficient single-page IO into flusher writeback as
+much as possible: only write pages when we've encountered many dirty pages,
+and when we've already scanned the rest of the LRU for clean pages and see
+the same dirty pages again (PageReclaim).
+
+This says that direct reclaim path would always activate the dirty pages.
+And WB_REASON_VMSCAN writeback will be triggered When
+shrink_inactive_list()
+---
+    if (stat.nr_unqueued_dirty == nr_taken)
+        wakeup_flusher_threads(WB_REASON_VMSCAN);
+---
+<li> a_ops->writepage is NULL or return AOP_WRITEPAGE_ACTIVATE
+</ul>
+
+An interesting thing is when a file-backed page is added to LRU firstly, it
+should be added to the inactive LRU list.
+
+</pre>
+<li> <B>When to inactivate ?</B>
+<ul>
+<li> add to lru list initially
+<pre>
+Yes, when the page is added to lru initially, it is added to inactive list
+
+Look at
+page_lru()
+---
+    if (PageUnevictable(page))
+        return LRU_UNEVICTABLE;
+
+    lru = page_is_file_lru(page) ? <font color="red">LRU_INACTIVE_FILE : LRU_INACTIVE_ANON;</font>
+    if (PageActive(page))
+        lru += LRU_ACTIVE;
+
+    return lru;
+---
+</pre>
+<li> shrink_active_list()
+<pre>
+    while (!list_empty(&l_hold)) {
+        ...
+        if (page_referenced(page, 0, sc->target_mem_cgroup,
+                    &vm_flags)) {
+<font color="blue">
+            /*
+             * Identify referenced, file-backed active pages and
+             * give them one more trip around the active list. So
+             * that executable code get better chances to stay in
+             * memory under moderate memory pressure.  Anon pages
+             * are not likely to be evicted by use-once streaming
+             * IO, plus JVM can create lots of anon VM_EXEC pages,
+             * so we ignore them here.
+             */
+</font>
+            if ((vm_flags & VM_EXEC) && page_is_file_lru(page)) {
+                nr_rotated += thp_nr_pages(page);
+                list_add(&page->lru, &l_active);
+                continue;
+            }
+        }
+
+        ClearPageActive(page);    /* we are de-activating */
+        SetPageWorkingset(page);
+        list_add(&page->lru, &l_inactive);
+    }
+</pre>
+</ul>
+</ul>
+</font>
+</p>
+
+<h3><a name="reclaim_and_writeback">Reclaim and Writeback</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> PageReclaim
+<pre>
+end_page_writeback()
+  -> ClearPageReclaim(page);
+  -> rotate_reclaimable_page()
+<font color="blue">
+Writeback is about to end against a page which has been marked for immediate
+reclaim.  If it still appears to be reclaimable, move it to the tail of the
+inactive list.
+</font>
+</pre>
+<li> only kswapd could write dirty page out, direct reclaim cannot do that
+<pre>
+shrink_page_list()
+---
+        if (PageDirty(page)) {
+<font color="blue">
+            /*
+             * Only kswapd can writeback filesystem pages
+             * to avoid risk of stack overflow. <U>But avoid
+             * injecting inefficient single-page IO into
+             * flusher writeback as much as possible</U>[1]: only
+             * write pages when we've encountered many
+             * dirty pages, and when we've already scanned
+             * the rest of the LRU for clean pages and see
+             * the same dirty pages again (PageReclaim).
+             */
+</font>
+            if (page_is_file_lru(page) &&
+                (!current_is_kswapd() || !PageReclaim(page) ||
+                 !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
+
+                inc_node_page_state(page, NR_VMSCAN_IMMEDIATE);
+                SetPageReclaim(page);
+
+                goto activate_locked;
+            }
+            ...
+            switch (<font color="red">pageout(page, mapping)</font>) {
+                ...
+            }
+
+---
+[1] writeback_single_inode()  employs do_writepages()
+
+We could get two points here,
+(a) direct relcaim path cannot write dirty pages out
+(b) kswapd could do that but must comply with a strict condition.
+</pre>
+<li> Can reclaim path trigger writeback ?
+<pre>
+Yes !!!
+
+shrink_page_list()
+---
+<font color="blue">
+        /*
+         * The number of dirty pages determines if a node is marked
+         * reclaim_congested which affects wait_iff_congested. kswapd
+         * will stall and start writing pages if the tail of the LRU
+         * is all dirty unqueued pages.
+         */
+</font>
+        page_check_dirty_writeback(page, &dirty, &writeback);
+        if (dirty || writeback)
+            stat->nr_dirty++;
+
+        if (dirty && !writeback)
+            stat->nr_unqueued_dirty++;
+---
+
+This would trigger
+(1) kick up the writeback flusher
+shrink_inactive_list()
+---
+<font color="blue">
+    /*
+     * If dirty pages are scanned that are not queued for IO, it
+     * implies that flushers are not doing their job. <U>This can
+     * happen when memory pressure pushes dirty pages to the end of
+     * the LRU before the dirty limits are reached and the dirty
+     * data has expired.</U> It can also happen when the proportion of
+     * dirty pages grows not through writes but through memory
+     * pressure reclaiming all the clean cache. And in some cases,
+     * the flushers simply cannot keep up with the allocation
+     * rate. Nudge the flusher threads in case they are asleep.
+     */
+</font>
+    if (stat.nr_unqueued_dirty == nr_taken)
+        wakeup_flusher_threads(WB_REASON_VMSCAN);
+---
+(2) allow kswap to start write dirty pages out
+shrink_node()
+---
+        /* Allow kswapd to start writing pages during reclaim.*/
+        if (sc->nr.unqueued_dirty == sc->nr.file_taken)
+            set_bit(PGDAT_DIRTY, &pgdat->flags);
+---
+
+</pre>
+<li> another dirty page throttling mechanism
+<pre>
+As to dirty page throttling, we would think of balance_dirty_pages()
+But it only works in global or cgroup v2. The legacy memcg doesn't
+have it.
+
+shrink_page_list()
+---
+        if (PageWriteback(page)) {
+            /* Case 1 above */
+            if (<font color="red">current_is_kswapd()</font> &&
+                PageReclaim(page) &&
+                test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
+                stat->nr_immediate++;
+                goto activate_locked;
+
+            /* Case 2 above */
+            } else if (<font color="red">writeback_throttling_sane(sc)</font> ||
+                <font color="red">!PageReclaim(page)</font> || !may_enter_fs) {
+                SetPageReclaim(page);
+                stat->nr_writeback++;
+                goto activate_locked;
+
+            /* Case 3 above */
+            } else {
+                unlock_page(page);
+                <font color="red">wait_on_page_writeback(page);</font>
+                /* then go back and try same page again */
+                list_add_tail(&page->lru, page_list);
+                continue;
+            }
+        }
+
+---
+
+Look into the
+writeback_throttling_sane()
+---
+<font color="blue">
+/*
+ * The normal page dirty throttling mechanism in balance_dirty_pages() is
+ * completely broken with the legacy memcg and direct stalling in
+                                               ^^^^^^^^^^^^^^^^^^
+ * shrink_page_list() is used for throttling instead, which lacks all the
+  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ * niceties such as fairness, adaptive pausing, bandwidth proportional
+ * allocation and configurability.
+ */
+</font>
+    if (!cgroup_reclaim(sc))
+        return true;
+    if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
+        return true;
+    return false;
+---
+
+In shrink_page_list, a direct reclaim path in cgroup v1 would fall
+into sleep to wait the Writeback page if it meet a recycled
+PageReclaim page.
+
+</pre>
+</ul>
 </font>
 </p>
 

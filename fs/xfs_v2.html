@@ -1,12 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>XFS_V2</title>
+        <meta charset="UTF-8">
+        <title>XFS_V2</title>
 </head>
 <body>
 <div>
-    <h1>XFS_V2</h1> 
+        <h1>XFS_V2</h1> 
 </div>
 <p>
 <font size="2">
@@ -28,13 +28,32 @@
 <li> <a href="#proc_pid_io">/proc/PID/io</a>
 </ul>
 <li> <a href="#iov_iter">iov_iter</a>
+<li> <a href="#page_fault">page fault</a>
+<ul>
 <li> <a href="#inode_lock_and_fault">inode lock and page fault</a>
+<li> <a href="#mmap_sem_in_page_fault">mmap_sem in page fault</a>
+<li> <a href="#do_shared_fault_steps">steps of do_shared_fault</a>
+</ul>
 <li> <a href="#sendfile">sendfile</a>
 <li> <a href="#open_and_close">open and close</a>
 <li> <a href="#mount">mount</a>
 <li> <a href="#writenotify">writenotify</a>
 <li> <a href="#synchronous_fault">synchronous page fault</a>
+<li> <a href="#backing_dev_info">backing dev info (bdi)</a>
 <li> <a href="#writeback_and_cgroup_blkio">writeback and cgroup blkio</a>
+<li> <a href="#partial_write">partial write</a>
+<li> <a href="#nofs_when_alloc_pagecache">__GFP_NOFS when alloc pagecache</a>
+<li> <a href="#umount">umount</a>
+</ul>
+
+<a href="#bh">buffer head</a>
+<ul>
+<li> <a href="bh_vfs_and_block">bh vs vfs and block</a>
+</ul>
+
+<a href="#jbd2">jbd2</a>
+<ul>
+<li> <a href="jbd2_transaction">transaction</a>
 </ul>
 
 <a href="#inode">Inode</a>
@@ -53,18 +72,22 @@
 </ul>
 
 <a href="#tmpfs">Tmpfs</a><br/>
-<a href="#xfs_log">Xfs Log</a>
+<a href="#xfs_log">xfs Log</a>
 <ul>
 <li> <a href="#xlog_framework">xlog framework</a>
 <li> <a href="#relog">Relog</a>
 <li> <a href="#deferred_operations">Deferred operations</a>
 <li> <a href="#log_space">log space</a>
 </ul>
-<a href="#xfs_inode">Xfs Inode</a>
+<a href="#xfs_inode">xfs Inode</a>
 <ul>
 <li> <a href="#xfs_inode_mgnt">inode management</a>
 </ul>
-<a href="#xfs_buf">xfs buf</a>
+<a href="#xfs_buf">xfs buf</a><br/>
+<a href="#xfs_bmap">xfs bmap</a>
+<ul>
+<li> <a href="#xfs_bmap_unwritten">unwritten</a>
+</ul>
 </font>
 </p>
 
@@ -100,7 +123,7 @@ Quote from https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.htm
 When the file's link count becomes 0 and no process has the file open, the space occupied by
 the file shall be freed and the file shall no longer be accessible. If one or more processes
 have the file open when the last link is removed, the link shall be removed before unlink()
-                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 returns, but the removal of the file contents shall be postponed until all references to the
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 file are closed.
@@ -113,87 +136,87 @@ How does xfs implement this ?
 <pre>
 xfs_droplink()
 ---
-    xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+        xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
 <font color="blue">
-    // drop the link in the indoe on disk
+        // drop the link in the indoe on disk
 </font>
-    drop_nlink(VFS_I(ip));
-    xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+        drop_nlink(VFS_I(ip));
+        xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
 
-    if (VFS_I(ip)->i_nlink)
-        return 0;
+        if (VFS_I(ip)->i_nlink)
+                return 0;
 
-    return xfs_iunlink(tp, ip);
+        return xfs_iunlink(tp, ip);
 ---
 <font color="blue">
 // link this inode on the list on agi->agi_unlinked[]
 </font>
 xfs_iunlink()
-  -> xfs_iunlink_update_bucket()
-  ---
-    agi->agi_unlinked[bucket_index] = cpu_to_be32(new_agino);
-    offset = offsetof(struct xfs_agi, agi_unlinked) +
-            (sizeof(xfs_agino_t) * bucket_index);
-<font color="red">    xfs_trans_log_buf(tp, agibp, offset, offset + sizeof(xfs_agino_t) - 1);</font>
+    -> xfs_iunlink_update_bucket()
+    ---
+        agi->agi_unlinked[bucket_index] = cpu_to_be32(new_agino);
+        offset = offsetof(struct xfs_agi, agi_unlinked) +
+                        (sizeof(xfs_agino_t) * bucket_index);
+<font color="red">        xfs_trans_log_buf(tp, agibp, offset, offset + sizeof(xfs_agino_t) - 1);</font>
 ---
 </pre>
 <li> when reference of inode reaches zero
 <pre>
 xfs_fs_destroy_inode()
-  -> xfs_inactive()
-  ---
-    if (VFS_I(ip)->i_nlink != 0) {
-        ...
-        return;
-    }
+    -> xfs_inactive()
+    ---
+        if (VFS_I(ip)->i_nlink != 0) {
+                ...
+                return;
+        }
 
-    if (S_ISREG(VFS_I(ip)->i_mode) &&
-        (ip->i_d.di_size != 0 || XFS_ISIZE(ip) != 0 ||
-         ip->i_df.if_nextents > 0 || ip->i_delayed_blks > 0))
-        truncate = 1;
-    ...
-    if (S_ISLNK(VFS_I(ip)->i_mode))
-        error = xfs_inactive_symlink(ip);
-    else if (truncate)
-<font color="red">        error = xfs_inactive_truncate(ip);</font>
-    if (error)
-        return;
-    ...
-    /*
-     * Free the inode.
-     */
-    error = xfs_inactive_ifree(ip);
-      -> xfs_ifree()
-<font color="red">        -> xfs_iunlink_remove()</font>
-  ---
+        if (S_ISREG(VFS_I(ip)->i_mode) &&
+                (ip->i_d.di_size != 0 || XFS_ISIZE(ip) != 0 ||
+                 ip->i_df.if_nextents > 0 || ip->i_delayed_blks > 0))
+                truncate = 1;
+        ...
+        if (S_ISLNK(VFS_I(ip)->i_mode))
+                error = xfs_inactive_symlink(ip);
+        else if (truncate)
+<font color="red">                error = xfs_inactive_truncate(ip);</font>
+        if (error)
+                return;
+        ...
+        /*
+         * Free the inode.
+         */
+        error = xfs_inactive_ifree(ip);
+            -> xfs_ifree()
+<font color="red">                -> xfs_iunlink_remove()</font>
+    ---
 </pre>
 <li> Recover AGI unlinked lists
 <pre>
 This is called during recovery to <U>process any inodes which we unlinked but
-not freed when the system crashed.</U>  These inodes will be on the lists in the
+not freed when the system crashed.</U>    These inodes will be on the lists in the
 AGI blocks. What we do here is scan all the AGIs and fully truncate and free
 any inodes found on the lists. Each inode is removed from the lists when it
 has been fully truncated and is freed. The freeing of the inode and its
 removal from the list must be atomic.
 
 xlog_recover_process_iunlinks()
-  -> xlog_recover_process_one_iunlink()
-  ---
-    ino = XFS_AGINO_TO_INO(mp, agno, agino);
-    error = xfs_iget(mp, NULL, ino, 0, 0, &ip);
-    ...
-    error = xfs_imap_to_bp(mp, NULL, &ip->i_imap, &dip, &ibp, 0);
-    ...
-    <font color="red">agino = be32_to_cpu(dip->di_next_unlinked);</font>
-    xfs_buf_relse(ibp);
+    -> xlog_recover_process_one_iunlink()
+    ---
+        ino = XFS_AGINO_TO_INO(mp, agno, agino);
+        error = xfs_iget(mp, NULL, ino, 0, 0, &ip);
+        ...
+        error = xfs_imap_to_bp(mp, NULL, &ip->i_imap, &dip, &ibp, 0);
+        ...
+        <font color="red">agino = be32_to_cpu(dip->di_next_unlinked);</font>
+        xfs_buf_relse(ibp);
 
-    xfs_irele(ip);
-      -> iput(VFS_I(ip));
+        xfs_irele(ip);
+            -> iput(VFS_I(ip));
 <font color="blue">
-      //The reference would be zero and triger xfs_fs_destroy_inode()
+            //The reference would be zero and triger xfs_fs_destroy_inode()
 </font>
 
-  ---
+    ---
 </pre>
 </ul>
 </font>
@@ -212,38 +235,38 @@ Let's look at how does xfs and ext4-jbd2 implement the asynchronous journal
 <li> XFS
 <pre>
 __xfs_trans_commit()
-  -> xfs_log_commit_cil()
-    -> xlog_cil_push_background()
+    -> xfs_log_commit_cil()
+        -> xlog_cil_push_background()
 ---
 <font color="blue">
-    // min_t(int, (log)->l_logsize >> 3, BBTOB(XLOG_TOTAL_REC_SHIFT(log)) << 4)
-    //                                         ^^^^^^^^^^^^^^^^^^^^^^^^
-    //                                         Max of the xlog buffer
+        // min_t(int, (log)->l_logsize >> 3, BBTOB(XLOG_TOTAL_REC_SHIFT(log)) << 4)
+        //                                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^
+        //                                                                                 Max of the xlog buffer
 </font>
-    if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log)) {
+        if (cil->xc_ctx->space_used < XLOG_CIL_SPACE_LIMIT(log)) {
+                up_read(&cil->xc_ctx_lock);
+                return;
+        }
+
+        spin_lock(&cil->xc_push_lock);
+        if (cil->xc_push_seq < cil->xc_current_sequence) {
+                cil->xc_push_seq = cil->xc_current_sequence;
+                queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
+        }
+
         up_read(&cil->xc_ctx_lock);
-        return;
-    }
-
-    spin_lock(&cil->xc_push_lock);
-    if (cil->xc_push_seq < cil->xc_current_sequence) {
-        cil->xc_push_seq = cil->xc_current_sequence;
-        queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
-    }
-
-    up_read(&cil->xc_ctx_lock);
 
 <font color="blue">
-    /*
-     * If we are well over the space limit, throttle the work that is being
-     * done until the push work on this context has begun.
-     */
+        /*
+         * If we are well over the space limit, throttle the work that is being
+         * done until the push work on this context has begun.
+         */
 </font>
-    if (cil->xc_ctx->space_used >= XLOG_CIL_BLOCKING_SPACE_LIMIT(log)) {
-        xlog_wait(&cil->xc_push_wait, &cil->xc_push_lock);
-        return;
-    }
-    spin_unlock(&cil->xc_push_lock);
+        if (cil->xc_ctx->space_used >= XLOG_CIL_BLOCKING_SPACE_LIMIT(log)) {
+                xlog_wait(&cil->xc_push_wait, &cil->xc_push_lock);
+                return;
+        }
+        spin_unlock(&cil->xc_push_lock);
 ---
 </pre>
 <li> EXT4-JBD2
@@ -251,52 +274,52 @@ __xfs_trans_commit()
 When to start commit jdb2?
 (1) log space is not enough
 start_this_handle()
-  -> add_transaction_credits()
-  ---
-    needed = atomic_add_return(total, &t->t_outstanding_credits);
-    if (needed > journal->j_max_transaction_buffers) {
+    -> add_transaction_credits()
+    ---
+        needed = atomic_add_return(total, &t->t_outstanding_credits);
+        if (needed > journal->j_max_transaction_buffers) {
 <font color="blue">
-        /*
-         * If the current transaction is already too large,
-         * then start to commit it: we can then go back and
-         * attach this handle to a new transaction.
-         */
+                /*
+                 * If the current transaction is already too large,
+                 * then start to commit it: we can then go back and
+                 * attach this handle to a new transaction.
+                 */
 </font>
-        atomic_sub(total, &t->t_outstanding_credits);
-        ...
-        wait_transaction_locked(journal);
-        return 1;
-    }
-  ---
+                atomic_sub(total, &t->t_outstanding_credits);
+                ...
+                wait_transaction_locked(journal);
+                return 1;
+        }
+    ---
 (2) transaction is too old
 jbd2_journal_stop()
 ---
 <font color="blue">
-    /*
-     * If the handle is marked SYNC, we need to set another commit
-     * going!  We also want to force a commit if the transaction is too
-     * old now.
-     */
+        /*
+         * If the handle is marked SYNC, we need to set another commit
+         * going!    We also want to force a commit if the transaction is too
+         * old now.
+         */
 </font>
-    if (handle->h_sync ||
-        time_after_eq(jiffies, transaction->t_expires)) {
-        /* This is non-blocking */
-        jbd2_log_start_commit(journal, tid);
-    }
+        if (handle->h_sync ||
+                time_after_eq(jiffies, transaction->t_expires)) {
+                /* This is non-blocking */
+                jbd2_log_start_commit(journal, tid);
+        }
 ---
 (3) commit timeouts
 jbd2_get_transaction()
 ---
-    /* Set up the commit timer for the new transaction. */
-    journal->j_commit_timer.expires = round_jiffies_up(transaction->t_expires);
-    add_timer(&journal->j_commit_timer);
+        /* Set up the commit timer for the new transaction. */
+        journal->j_commit_timer.expires = round_jiffies_up(transaction->t_expires);
+        add_timer(&journal->j_commit_timer);
 ---
 
 commit_timeout()
 ---
-    journal_t *journal = from_timer(journal, t, j_commit_timer);
+        journal_t *journal = from_timer(journal, t, j_commit_timer);
 
-    wake_up_process(journal->j_task);
+        wake_up_process(journal->j_task);
 ---
 </pre>
 </ul>
@@ -308,84 +331,84 @@ supported by jbd2.
 jbd2_journal_stop()
 ---
 <font color="blue">
-    /*
-     * Implement synchronous transaction batching.<font color="red">If the handle
-     * was synchronous, don't force a commit immediately.  Let's
-     * yield and let another thread piggyback onto this
-     * transaction.</font>  Keep doing that while new threads continue to
-     * arrive.  It doesn't cost much - we're about to run a committed
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     * and sleep on IO anyway.  Speeds up many-threaded, many-dir
-       ^^^^^^^^^^^^^^^^^^^^^^
-                The io here means the journal IO if we commit immediately.
-     * operations by 30x or more...
-     *
-     * We try and optimize the sleep time against what the
-     * underlying disk can do, instead of having a static sleep
-     * time.  This is useful for the case where our storage is so
-     * fast that it is more optimal to go ahead and force a flush
-     * and wait for the transaction to be committed than it is to
-     * wait for an arbitrary amount of time for new writers to
-     * join the transaction.  We achieve this by measuring how
-     * long it takes to commit a transaction, and compare it with
-     * how long this transaction has been running, and if run time
-     * < commit time then we sleep for the delta and commit.  This
-     * greatly helps super fast disks that would see slowdowns as
-     * more threads started doing fsyncs.
-     *
-     * But don't do this if this process was the most recent one '
-     * to perform a synchronous write.  We do this to detect the
-     * case where a single process is doing a stream of sync
-     * writes.  No point in waiting for joiners in that case.
-     *
-     * Setting max_batch_time to 0 disables this completely.
-     */
-</font>
-    pid = current->pid;
-    if (handle->h_sync && journal->j_last_sync_writer != pid &&
-        journal->j_max_batch_time) {
-        u64 commit_time, trans_time;
-
-        journal->j_last_sync_writer = pid;
-
-        read_lock(&journal->j_state_lock);
-        commit_time = journal->j_average_commit_time;
-        read_unlock(&journal->j_state_lock);
-
-        trans_time = ktime_to_ns(ktime_sub(ktime_get(),
-                           transaction->t_start_time));
-
-        commit_time = max_t(u64, commit_time,
-                    1000*journal->j_min_batch_time);
-        commit_time = min_t(u64, commit_time,
-                    1000*journal->j_max_batch_time);
-
-        if (trans_time < commit_time) {
-            ktime_t expires = ktime_add_ns(ktime_get(),
-                               commit_time);
-            set_current_state(TASK_UNINTERRUPTIBLE);
-            schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
-        }
-    }
-
-    if (handle->h_sync)
-        transaction->t_synchronous_commit = 1;
-
-    if (handle->h_sync ||
-        time_after_eq(jiffies, transaction->t_expires)) {
-        jbd2_log_start_commit(journal, tid);
         /*
-         * Special case: JBD2_SYNC synchronous updates require us
-         * to wait for the commit to complete.
+         * Implement synchronous transaction batching.<font color="red">If the handle
+         * was synchronous, don't force a commit immediately.    Let's
+         * yield and let another thread piggyback onto this
+         * transaction.</font>    Keep doing that while new threads continue to
+         * arrive.    It doesn't cost much - we're about to run a committed
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * and sleep on IO anyway.    Speeds up many-threaded, many-dir
+             ^^^^^^^^^^^^^^^^^^^^^^
+                                The io here means the journal IO if we commit immediately.
+         * operations by 30x or more...
+         *
+         * We try and optimize the sleep time against what the
+         * underlying disk can do, instead of having a static sleep
+         * time.    This is useful for the case where our storage is so
+         * fast that it is more optimal to go ahead and force a flush
+         * and wait for the transaction to be committed than it is to
+         * wait for an arbitrary amount of time for new writers to
+         * join the transaction.    We achieve this by measuring how
+         * long it takes to commit a transaction, and compare it with
+         * how long this transaction has been running, and if run time
+         * < commit time then we sleep for the delta and commit.    This
+         * greatly helps super fast disks that would see slowdowns as
+         * more threads started doing fsyncs.
+         *
+         * But don't do this if this process was the most recent one '
+         * to perform a synchronous write.    We do this to detect the
+         * case where a single process is doing a stream of sync
+         * writes.    No point in waiting for joiners in that case.
+         *
+         * Setting max_batch_time to 0 disables this completely.
          */
-        if (handle->h_sync && !(current->flags & PF_MEMALLOC))
-            wait_for_commit = 1;
-    }
+</font>
+        pid = current->pid;
+        if (handle->h_sync && journal->j_last_sync_writer != pid &&
+                journal->j_max_batch_time) {
+                u64 commit_time, trans_time;
 
-    stop_this_handle(handle);
+                journal->j_last_sync_writer = pid;
 
-    if (wait_for_commit)
-        err = jbd2_log_wait_commit(journal, tid);
+                read_lock(&journal->j_state_lock);
+                commit_time = journal->j_average_commit_time;
+                read_unlock(&journal->j_state_lock);
+
+                trans_time = ktime_to_ns(ktime_sub(ktime_get(),
+                                                     transaction->t_start_time));
+
+                commit_time = max_t(u64, commit_time,
+                                        1000*journal->j_min_batch_time);
+                commit_time = min_t(u64, commit_time,
+                                        1000*journal->j_max_batch_time);
+
+                if (trans_time < commit_time) {
+                        ktime_t expires = ktime_add_ns(ktime_get(),
+                                                             commit_time);
+                        set_current_state(TASK_UNINTERRUPTIBLE);
+                        schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
+                }
+        }
+
+        if (handle->h_sync)
+                transaction->t_synchronous_commit = 1;
+
+        if (handle->h_sync ||
+                time_after_eq(jiffies, transaction->t_expires)) {
+                jbd2_log_start_commit(journal, tid);
+                /*
+                 * Special case: JBD2_SYNC synchronous updates require us
+                 * to wait for the commit to complete.
+                 */
+                if (handle->h_sync && !(current->flags & PF_MEMALLOC))
+                        wait_for_commit = 1;
+        }
+
+        stop_this_handle(handle);
+
+        if (wait_for_commit)
+                err = jbd2_log_wait_commit(journal, tid);
 ---
 </pre>
 </font>
@@ -410,7 +433,7 @@ file being accessed with regards to which modes have been set (Read/Write/eXecut
 Access Control List extends classic UNIX checks to allow more options regarding permission control.
 </pre>
 <li> Mandatory Access Control (MAC)
-<pre>    
+<pre>        
 Or policy based access control.
 This is implemented using Linux Security Modules (LSM) which are not real modules anymore (they
 used to be but it was dropped). They enable additionnal checks based on other models than the
@@ -467,40 +490,40 @@ by following compoments
 The code of permission check is as following,
 <pre>
 do_last()
-  -> may_open()
-    -> inode_permission()
-      -> sb_permission()
-         ---
+    -> may_open()
+        -> inode_permission()
+            -> sb_permission()
+                 ---
 <font color="blue">
-            /* Nobody gets write access to a read-only fs. */
+                        /* Nobody gets write access to a read-only fs. */
 </font>
-            if (sb_rdonly(sb) && (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
-                return -EROFS;
-         ---
-      -> do_inode_permission()
-        -> generic_permission()
-          -> acl_permission_check()
+                        if (sb_rdonly(sb) && (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
+                                return -EROFS;
+                 ---
+            -> do_inode_permission()
+                -> generic_permission()
+                    -> acl_permission_check()
 
 
 acl_permission_check()
 ---
-    if (likely(uid_eq(current_fsuid(), inode->i_uid)))
-        mode >>= 6;
-    else {
-        if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
-            int error = check_acl(inode, mask);
-            if (error != -EAGAIN)
-                return error;
-        }
+        if (likely(uid_eq(current_fsuid(), inode->i_uid)))
+                mode >>= 6;
+        else {
+                if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
+                        int error = check_acl(inode, mask);
+                        if (error != -EAGAIN)
+                                return error;
+                }
 
-        if (in_group_p(inode->i_gid))
-            mode >>= 3;
-    }
+                if (in_group_p(inode->i_gid))
+                        mode >>= 3;
+        }
 <font color="red">
-    if ((mask & ~mode & (MAY_READ | MAY_WRITE | MAY_EXEC)) == 0)
-        return 0;
+        if ((mask & ~mode & (MAY_READ | MAY_WRITE | MAY_EXEC)) == 0)
+                return 0;
 </font>
-    return -EACCES;
+        return -EACCES;
 ---
 </pre>
 </font>
@@ -528,46 +551,46 @@ cancelled_write_bytes: 393216
 What do these fields stand for ? Let's look at the code.
 <pre>
 proc_tid_io_accounting/proc_tgid_io_accounting()
-  -> do_io_accounting()
-  ---
-    struct task_io_accounting acct = task->ioac;
-    ...
-    if (whole && lock_task_sighand(task, &flags)) {
-        struct task_struct *t = task;
+    -> do_io_accounting()
+    ---
+        struct task_io_accounting acct = task->ioac;
+        ...
+        if (whole && lock_task_sighand(task, &flags)) {
+                struct task_struct *t = task;
 
-        task_io_accounting_add(&acct, &task->signal->ioac);
-        while_each_thread(task, t)
-            task_io_accounting_add(&acct, &t->ioac);
+                task_io_accounting_add(&acct, &task->signal->ioac);
+                while_each_thread(task, t)
+                        task_io_accounting_add(&acct, &t->ioac);
 
-        unlock_task_sighand(task, &flags);
-    }
-    seq_printf(m,
-           "rchar: %llu\n"
-           "wchar: %llu\n"
-           "syscr: %llu\n"
-           "syscw: %llu\n"
-           "read_bytes: %llu\n"
-           "write_bytes: %llu\n"
-           "cancelled_write_bytes: %llu\n",
-           (unsigned long long)acct.rchar,
-           (unsigned long long)acct.wchar,
-           (unsigned long long)acct.syscr,
-           (unsigned long long)acct.syscw,
-           (unsigned long long)acct.read_bytes,
-           (unsigned long long)acct.write_bytes,
-           (unsigned long long)acct.cancelled_write_bytes);
-  ---
+                unlock_task_sighand(task, &flags);
+        }
+        seq_printf(m,
+                     "rchar: %llu\n"
+                     "wchar: %llu\n"
+                     "syscr: %llu\n"
+                     "syscw: %llu\n"
+                     "read_bytes: %llu\n"
+                     "write_bytes: %llu\n"
+                     "cancelled_write_bytes: %llu\n",
+                     (unsigned long long)acct.rchar,
+                     (unsigned long long)acct.wchar,
+                     (unsigned long long)acct.syscr,
+                     (unsigned long long)acct.syscw,
+                     (unsigned long long)acct.read_bytes,
+                     (unsigned long long)acct.write_bytes,
+                     (unsigned long long)acct.cancelled_write_bytes);
+    ---
 </pre>
 Let's look into the fields only by one
 <ul>
 <li> rchar, bytes read through synchronous read
 <pre>
 add_rchar() <- vfs_read()
-            <- do_readv()
-            <- do_preadv()
-            <- compat_readv()
-            <- do_sendfile()
-            <- vfs_copy_file_range() >
+                        <- do_readv()
+                        <- do_preadv()
+                        <- compat_readv()
+                        <- do_sendfile()
+                        <- vfs_copy_file_range() >
 
 rchar records the bytes read through read/readv/preadv...
 the data can be from not only a regular file but also a socket
@@ -575,11 +598,11 @@ the data can be from not only a regular file but also a socket
 <li> wchar, bytes write through synchronous write
 <pre>
 add_wchar() <- vfs_write()
-            <- do_writev()
-            <- do_pwritev()
-            <- compat_writev()
-            <- do_sendfile()
-            <- vfs_copy_file_range() >
+                        <- do_writev()
+                        <- do_pwritev()
+                        <- compat_writev()
+                        <- do_sendfile()
+                        <- vfs_copy_file_range() >
 
 wchar is almost same with rchar
 </pre>
@@ -591,8 +614,8 @@ inc_syscr/syscw() are hooked along with add_rchar/wchar()
 <pre>
 task_io_account_read() <- submit_bio()
                        <- nfs_file_direct_read()
-                       <- read_cache_pages()     <-nfs_readpages()
-                                                 <-fuse_readpages() >
+                       <- read_cache_pages()         <-nfs_readpages()
+                                                     <-fuse_readpages() >
 
 read is always __synchronous__ no mater buffer read nor direct IO, so submit_bio is always necessary, except for special filesystem,
 such as networking filesystem.
@@ -600,13 +623,13 @@ such as networking filesystem.
 <li> write_bytes, the number of bytes which this task has caused, or shall cause to be <font color="red"> written to disk</font>
 <pre>
 task_io_account_write() <- __blkdev_direct_IO_simple()
-                        <- __blkdev_direct_IO()
-                        <- submit_page_section()        <- dio_zero_block()
-                                                        <- do_direct_IO()
-                        <- iomap_dio_bio_actor()
-                        <- nfs_file_direct_write()
-                        <- account_page_dirtied()       <- __set_page_dirty()
-                                                        <- __set_page_dirty_nobuffers() >
+                           <- __blkdev_direct_IO()
+                           <- submit_page_section()       <- dio_zero_block()
+                                                          <- do_direct_IO()
+                           <- iomap_dio_bio_actor()
+                           <- nfs_file_direct_write()
+                           <- account_page_dirtied()      <- __set_page_dirty()
+                                                          <- __set_page_dirty_nobuffers() >
 buffer write is asynchronous, the final writeback is done by writeback workers, so we cannot
 account it in submit_bio.
 </pre>
@@ -620,21 +643,21 @@ account it in submit_bio.
 What's iov_iter ?<br/>
 <pre>
 struct iov_iter {
-    unsigned int type;   <font color="blue">Type, IOVEC/KVEC/BVEC</font>
-    size_t iov_offset;   <font color="blue">current offset, like bio.bi_iter.bi_sector</font>
-    size_t count;        <font color="blue">residual count like bio.bi_iter.bi_size</font>
-    union {
-        const struct iovec *iov;   
-        const struct kvec *kvec;
-        const struct bio_vec *bvec;
-        ...
-    };
+        unsigned int type;     <font color="blue">Type, IOVEC/KVEC/BVEC</font>
+        size_t iov_offset;     <font color="blue">current offset, like bio.bi_iter.bi_sector</font>
+        size_t count;                <font color="blue">residual count like bio.bi_iter.bi_size</font>
+        union {
+                const struct iovec *iov;     
+                const struct kvec *kvec;
+                const struct bio_vec *bvec;
+                ...
+        };
 <font color="blue">
-    See the bio_vec, basically, iov and kvec have similar functions.
-    The bio.bi_io_vec always points the head of the bvec array.
-    iov/kvec/bvec always points the current vector, like bio.bi_io_vec[bio->bi_iter.bi_idx]
+        See the bio_vec, basically, iov and kvec have similar functions.
+        The bio.bi_io_vec always points the head of the bvec array.
+        iov/kvec/bvec always points the current vector, like bio.bi_io_vec[bio->bi_iter.bi_idx]
 </font>
-    ...
+        ...
 };
 
 Just refer to iterate_and_advance() to know how does the iov_iter work
@@ -642,7 +665,7 @@ Just refer to iterate_and_advance() to know how does the iov_iter work
 Even though we try to compare the bio with iov_iter, but they are not different.
 bio has a map between the block device and buffer in memory,
 however, iov_iter only describes the buffer, which is more similar with sglist.
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 </pre>
 Next, we will figure out what does the IOVEC/KVEC/BVEC mean and who dose use them.
 <ul>
@@ -651,126 +674,126 @@ Next, we will figure out what does the IOVEC/KVEC/BVEC mean and who dose use the
 
 struct iovec
 {
-    void __user *iov_base;
-    __kernel_size_t iov_len;
+        void __user *iov_base;
+        __kernel_size_t iov_len;
 };
 
 There are two cases here,
 (1) construct iov_iter in kernel, and address from userland
 vfs_read()
-  -> new_sync_read() <font color="blue">//read_iter</font>
-  ---
-    struct iovec iov = { .iov_base = buf, .iov_len = len };
-    struct kiocb kiocb;
-    struct iov_iter iter;
-    ssize_t ret;
+    -> new_sync_read() <font color="blue">//read_iter</font>
+    ---
+        struct iovec iov = { .iov_base = buf, .iov_len = len };
+        struct kiocb kiocb;
+        struct iov_iter iter;
+        ssize_t ret;
 
-    init_sync_kiocb(&kiocb, filp);
+        init_sync_kiocb(&kiocb, filp);
 <font color="blue">
-    // We have said that iov_iter is just buffer, the io is described 
-    // by kiocb.ki_filp and kiocb.ki_pos
+        // We have said that iov_iter is just buffer, the io is described 
+        // by kiocb.ki_filp and kiocb.ki_pos
 </font>
-    kiocb.ki_pos = (ppos ? *ppos : 0);
-    iov_iter_init(&iter, READ, &iov, 1, len);
+        kiocb.ki_pos = (ppos ? *ppos : 0);
+        iov_iter_init(&iter, READ, &iov, 1, len);
 
-    ret = call_read_iter(filp, &kiocb, &iter);
-  ---
+        ret = call_read_iter(filp, &kiocb, &iter);
+    ---
 (2) iov array is from userland
 
 static ssize_t vfs_readv(
-    struct file *file,
-<font color="red">    const struct iovec __user *vec,</font>
-    unsigned long vlen,
-    loff_t *pos,
-    rwf_t flags)
+        struct file *file,
+<font color="red">        const struct iovec __user *vec,</font>
+        unsigned long vlen,
+        loff_t *pos,
+        rwf_t flags)
 {
-    struct iovec iovstack[UIO_FASTIOV];
-    struct iovec *iov = iovstack;
-    struct iov_iter iter;
-    ssize_t ret;
+        struct iovec iovstack[UIO_FASTIOV];
+        struct iovec *iov = iovstack;
+        struct iov_iter iter;
+        ssize_t ret;
 
-    ret = import_iovec(READ, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
+        ret = import_iovec(READ, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
 <font color="blue">
-    // __import_iovec()->iovec_from_user() would copy the iovec array from userland
+        // __import_iovec()->iovec_from_user() would copy the iovec array from userland
 </font>
-    if (ret >= 0) {
-        ret = do_iter_read(file, &iter, pos, flags);
-        kfree(iov);
-    }
+        if (ret >= 0) {
+                ret = do_iter_read(file, &iter, pos, flags);
+                kfree(iov);
+        }
 
-    return ret;
+        return ret;
 }
 
 </pre>
 <li> KVEC, address from kernel, BVEC, a page in it
 <pre>
 struct kvec {
-    void *iov_base;
-    size_t iov_len;
+        void *iov_base;
+        size_t iov_len;
 };
 
 struct bio_vec {
-    struct page    *bv_page;
-    unsigned int    bv_len;
-    unsigned int    bv_offset;
+        struct page        *bv_page;
+        unsigned int        bv_len;
+        unsigned int        bv_offset;
 };
 
 nbd_send_cmd() use both of them,
 
 nbd_send_cmd()
 ---
-    struct nbd_request request = {.magic = htonl(NBD_REQUEST_MAGIC)};
-    struct kvec iov = {.iov_base = &request, .iov_len = sizeof(request)};
-    struct iov_iter from;
+        struct nbd_request request = {.magic = htonl(NBD_REQUEST_MAGIC)};
+        struct kvec iov = {.iov_base = &request, .iov_len = sizeof(request)};
+        struct iov_iter from;
 <font color="blue">
-    //1st kvec is used to send nbd command
+        //1st kvec is used to send nbd command
 </font>
-    iov_iter_kvec(&from, WRITE, &iov, 1, sizeof(request));
-    ...
-    cmd->index = index;
-    cmd->cookie = nsock->cookie;
-    cmd->retries = 0;
-    request.type = htonl(type | nbd_cmd_flags);
-    if (type != NBD_CMD_FLUSH) {
-        request.from = cpu_to_be64((u64)blk_rq_pos(req) << 9);
-        request.len = htonl(size);
-    }
-    handle = nbd_cmd_handle(cmd);
-    memcpy(request.handle, &handle, sizeof(handle));
+        iov_iter_kvec(&from, WRITE, &iov, 1, sizeof(request));
+        ...
+        cmd->index = index;
+        cmd->cookie = nsock->cookie;
+        cmd->retries = 0;
+        request.type = htonl(type | nbd_cmd_flags);
+        if (type != NBD_CMD_FLUSH) {
+                request.from = cpu_to_be64((u64)blk_rq_pos(req) << 9);
+                request.len = htonl(size);
+        }
+        handle = nbd_cmd_handle(cmd);
+        memcpy(request.handle, &handle, sizeof(handle));
 <font color="blue">
-    //the iov_iter 'from' carry the nbd command
+        //the iov_iter 'from' carry the nbd command
 </font>
-    result = sock_xmit(nbd, index, 1, &from,
-            (type == NBD_CMD_WRITE) ? MSG_MORE : 0, &sent);
+        result = sock_xmit(nbd, index, 1, &from,
+                        (type == NBD_CMD_WRITE) ? MSG_MORE : 0, &sent);
 
 send_pages:
-    if (type != NBD_CMD_WRITE)
-        goto out;
+        if (type != NBD_CMD_WRITE)
+                goto out;
 <font color="blue">
-    //Then let's send out the request with bvec iov_iter_bvec
+        //Then let's send out the request with bvec iov_iter_bvec
 </font>
-    bio = req->bio;
-    while (bio) {
-        struct bio *next = bio->bi_next;
-        struct bvec_iter iter;
-        struct bio_vec bvec;
+        bio = req->bio;
+        while (bio) {
+                struct bio *next = bio->bi_next;
+                struct bvec_iter iter;
+                struct bio_vec bvec;
 
-        bio_for_each_segment(bvec, bio, iter) {
-            bool is_last = !next && bio_iter_last(bvec, iter);
-            int flags = is_last ? 0 : MSG_MORE;
+                bio_for_each_segment(bvec, bio, iter) {
+                        bool is_last = !next && bio_iter_last(bvec, iter);
+                        int flags = is_last ? 0 : MSG_MORE;
 
 <font color="blue">
-            //Setup a iov_iter for every bvec
+                        //Setup a iov_iter for every bvec
 </font>
-            iov_iter_bvec(&from, WRITE, &bvec, 1, bvec.bv_len);
-            ...
-            result = sock_xmit(nbd, index, 1, &from, flags, &sent);
-            ...
-            if (is_last)
-                break;
+                        iov_iter_bvec(&from, WRITE, &bvec, 1, bvec.bv_len);
+                        ...
+                        result = sock_xmit(nbd, index, 1, &from, flags, &sent);
+                        ...
+                        if (is_last)
+                                break;
+                }
+                bio = next;
         }
-        bio = next;
-    }
 ---
 </pre>
 </ul>
@@ -778,56 +801,59 @@ The other modules that receive iov_iter could use following interfaces to handle
 <pre>
 
 size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
-             struct iov_iter *i)
+                         struct iov_iter *i)
 {
-    if (unlikely(!page_copy_sane(page, offset, bytes)))
-        return 0;
+        if (unlikely(!page_copy_sane(page, offset, bytes)))
+                return 0;
 <font color="red">
-    if (i->type & (ITER_BVEC|ITER_KVEC)) {
+        if (i->type & (ITER_BVEC|ITER_KVEC)) {
 </font>
-        void *kaddr = kmap_atomic(page);
-        size_t wanted = copy_to_iter(kaddr + offset, bytes, i);
-        kunmap_atomic(kaddr);
-        return wanted;
-    } else if (unlikely(iov_iter_is_discard(i)))
-        return bytes;
-    else if (likely(!iov_iter_is_pipe(i)))
-        return copy_page_to_iter_iovec(page, offset, bytes, i);
-    else
-        return copy_page_to_iter_pipe(page, offset, bytes, i);
+                void *kaddr = kmap_atomic(page);
+                size_t wanted = copy_to_iter(kaddr + offset, bytes, i);
+                kunmap_atomic(kaddr);
+                return wanted;
+        } else if (unlikely(iov_iter_is_discard(i)))
+                return bytes;
+        else if (likely(!iov_iter_is_pipe(i)))
+                return copy_page_to_iter_iovec(page, offset, bytes, i);
+        else
+                return copy_page_to_iter_pipe(page, offset, bytes, i);
 }
 
 
 size_t _copy_to_iter(const void *addr, size_t bytes, struct iov_iter *i)
 {
-    const char *from = addr;
-    if (unlikely(iov_iter_is_pipe(i)))
-        return copy_pipe_to_iter(addr, bytes, i);
-    if (iter_is_iovec(i))
-        might_fault();
-    iterate_and_advance(i, bytes, v,
+        const char *from = addr;
+        if (unlikely(iov_iter_is_pipe(i)))
+                return copy_pipe_to_iter(addr, bytes, i);
+        if (iter_is_iovec(i))
+                might_fault();
+        iterate_and_advance(i, bytes, v,
 <font color="blue">
-        //IOVEC, userland buffers, the 'I' in iterate_and_advance
+                //IOVEC, userland buffers, the 'I' in iterate_and_advance
 </font>
-        copyout(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len),
+                copyout(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len),
 <font color="blue">
-        //BVEC, pages, the 'B' in iterate_and_advance
+                //BVEC, pages, the 'B' in iterate_and_advance
 </font>
-        memcpy_to_page(v.bv_page, v.bv_offset,
-                   (from += v.bv_len) - v.bv_len, v.bv_len),
+                memcpy_to_page(v.bv_page, v.bv_offset,
+                                     (from += v.bv_len) - v.bv_len, v.bv_len),
 <font color="blue">
-        //KVEC, kernel buffers, the 'K' in iterate_and_advance
+                //KVEC, kernel buffers, the 'K' in iterate_and_advance
 </font>
-        memcpy(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len)
-    )
+                memcpy(v.iov_base, (from += v.iov_len) - v.iov_len, v.iov_len)
+        )
 
-    return bytes;
+        return bytes;
 }
 </pre>
 </font>
 </p>
 
-<h3><a name="inode_lock_and_fault">inode lock and page fault</font></h3>
+<h3><a name="page_fault">page fault</font></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+
+<h4><a name="inode_lock_and_fault">inode lock and page fault</font></h4>
 <p>
 <font size="2">
 We cannot take the inode lock (inode.i_rwsem) in page fault path.<br/>
@@ -835,42 +861,42 @@ For example,
 <pre>
 ext4_dax_vm_ops.ext4_dax_huge_fault()
 ---
-    if (write) {
-        ...
-    } else {
-<font color="red">        down_read(&EXT4_I(inode)->i_mmap_sem);</font>
-    }
-    result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
-    if (write) {
-        ...
-    } else {
-<font color="red">        up_read(&EXT4_I(inode)->i_mmap_sem);</font>
-    }
+        if (write) {
+                ...
+        } else {
+<font color="red">                down_read(&EXT4_I(inode)->i_mmap_sem);</font>
+        }
+        result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
+        if (write) {
+                ...
+        } else {
+<font color="red">                up_read(&EXT4_I(inode)->i_mmap_sem);</font>
+        }
 ---
 
 xfs_file_vm_ops.xfs_filemap_fault()
 ---
 <font color="blue">
-    // XFS_MMAPLOCK_SHARED -> xfs_inode_t.i_mmaplock
+        // XFS_MMAPLOCK_SHARED -> xfs_inode_t.i_mmaplock
 </font>
-    xfs_ilock(XFS_I(inode), <font color="red">XFS_MMAPLOCK_SHARED</font>);
-    if (IS_DAX(inode)) {
-        pfn_t pfn;
+        xfs_ilock(XFS_I(inode), <font color="red">XFS_MMAPLOCK_SHARED</font>);
+        if (IS_DAX(inode)) {
+                pfn_t pfn;
 
-        ret = dax_iomap_fault(vmf, pe_size, &pfn, NULL,
-                (write_fault && !vmf->cow_page) ?
-                 &xfs_direct_write_iomap_ops :
-                 &xfs_read_iomap_ops);
-        if (ret & VM_FAULT_NEEDDSYNC)
-            ret = dax_finish_sync_fault(vmf, pe_size, pfn);
-    } else {
-        if (write_fault)
-            ret = iomap_page_mkwrite(vmf,
-                    &xfs_buffered_write_iomap_ops);
-        else
-            ret = filemap_fault(vmf);
-    }
-    xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+                ret = dax_iomap_fault(vmf, pe_size, &pfn, NULL,
+                                (write_fault && !vmf->cow_page) ?
+                                 &xfs_direct_write_iomap_ops :
+                                 &xfs_read_iomap_ops);
+                if (ret & VM_FAULT_NEEDDSYNC)
+                        ret = dax_finish_sync_fault(vmf, pe_size, pfn);
+        } else {
+                if (write_fault)
+                        ret = iomap_page_mkwrite(vmf,
+                                        &xfs_buffered_write_iomap_ops);
+                else
+                        ret = filemap_fault(vmf);
+        }
+        xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
 ---
 </pre>
 <B>Why ?</B>
@@ -887,31 +913,242 @@ Let's look at the code that could show us the lock ordering,
 <li> fs lock -> mmap lock
 <pre>
 ext4_dax_read_iter()
-  -> <font color="red">inode_lock_shared()</font>
-  -> dax_iomap_rw()
-    -> iomap_apply()
-      -> dax_iomap_actor()
-        -> dax_copy_to_iter()
-          -> _copy_mc_to_iter()
-          <font color="blue">
-          // when we write to userland buffer, page fault would happen, and then
-          // do_user_addr_fault() would come
-          </font>
+    -> <font color="red">inode_lock_shared()</font>
+    -> dax_iomap_rw()
+        -> iomap_apply()
+            -> dax_iomap_actor()
+                -> dax_copy_to_iter()
+                    -> _copy_mc_to_iter()
+                    <font color="blue">
+                    // when we write to userland buffer, page fault would happen, and then
+                    // do_user_addr_fault() would come
+                    </font>
 </pre>
 <li> mmap lock -> fs lock
 <pre>
 do_user_addr_fault()
-<font color="red">  -> mmap_read_lock(mm)</font>
-  -> handle_mm_fault()
-    -> __handle_mm_fault()
-      -> handle_pte_fault()
-        -> do_fault()
-          -> do_read_fault()
-            -> __do_fault()
-              -> vma->vm_ops->fault(vmf);
-                 ext4_dax_fault()
-                 xfs_filemap_fault()
+<font color="red">    -> mmap_read_lock(mm)</font>
+    -> handle_mm_fault()
+        -> __handle_mm_fault()
+            -> handle_pte_fault()
+                -> do_fault()
+                    -> do_read_fault()
+                        -> __do_fault()
+                            -> vma->vm_ops->fault(vmf);
+                                 ext4_dax_fault()
+                                 xfs_filemap_fault()
 </pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="mmap_sem_in_page_fault">mmap_sem in page fault</font></h4>
+<p>
+<font size="2">
+In the previous section, we have known that the whole page fault path is<br/>
+under the mm->mmap_sem. In page fault path, we could do a lot of thing,<br/>
+including some read or write IO, And this could cause a lot of problems, such as
+<pre>
+Holding the mmap_sem while doing IO is problematic because it can cause
+system-wide priority inversions.  Consider some large company that does a
+lot of web traffic.  This large company has load balancing logic in it's
+core web server, cause some engineer thought this was a brilliant plan.
+<U>This load balancing logic gets statistics from /proc about the system,
+which trip over processes mmap_sem for various reasons.</U>  Now the web
+server application is in a protected cgroup, but these other processes may
+not be, and if they are being throttled while their mmap_sem is held we'll
+stall, and cause this nice death spiral.
+</pre>
+The upstream solves this problem as following,
+<pre>
+static inline struct file *maybe_unlock_mmap_for_io(struct vm_fault *vmf,
+                            struct file *fpin)
+{
+    int flags = vmf->flags;
+
+    if (fpin)
+        return fpin;
+
+    if (fault_flag_allow_retry_first(flags) && !(flags & FAULT_FLAG_RETRY_NOWAIT)) {
+<font color="red">
+        fpin = get_file(vmf->vma->vm_file);
+        mmap_read_unlock(vmf->vma->vm_mm);
+</font>
+    }
+    return fpin;
+}
+
+(1) Get the reference of the file under mmap_sem
+(2) Unlock the mmap_sem
+</pre>
+To understand this solotuion, we need to know what does the mmap_sem protect.
+<ul>
+<li> vma rbtree ()
+<pre>
+This rbtree is to quickly finding the VMA associated with a given address,
+or finding a gap in the address space that is large enough to hold a new VMA
+</pre>
+<li> vma list
+<pre>
+Making it possible to walk through the entire space.
+</pre>
+<li> vm_area_struct itself
+<pre>
+It includes the page fault policy behind this vma and also the things behind it,
+a file or just some pages.
+</pre>
+</ul>
+The common case is that the vma is backed by a regular file.
+<pre>
+vm_mmap_pgoff()
+  -> mmap_write_lock_killable()
+  -> do_mmap()
+    -> mmap_region()
+    ---
+        vma = vm_area_alloc(mm);
+        ...
+        if (file) {
+<font color="red">            vma->vm_file = get_file(file);</font>
+            error = call_mmap(file, vma);
+            ...
+        } 
+    ---
+
+A reference is grabbed here to keep it alive during the mapping
+
+__do_munmap()
+  -> unmap_region()
+    -> unmap_vmas()
+       ---
+        for ( ; vma && vma->vm_start < end_addr; vma = vma->vm_next)
+            unmap_single_vma(tlb, vma, start_addr, end_addr, NULL);
+<font color="blue">
+            // Page table is removed here
+</font>
+       ---
+  -> remove_vma_list()
+    -> remove_vma_list()
+      -> remove_vma()
+      ---
+        if (vma->vm_file)
+<font color="red">
+            fput(vma->vm_file)
+</font>
+      ---
+</pre>
+
+After maybe_unlock_mmap_for_io() pins the file and unlock the mmap_sem,<br/>
+it could guarantee the file will be gone during this, and it looks like<br/>
+a normal IO through syscall read/write. When the IO is completed, we could<br/>
+retry the page fault path, at the moment, the IO has been ready.
+<pre>
+do_user_addr_fault()
+---
+    if (unlikely(!mmap_read_trylock(mm))) {
+        ...
+retry:
+        mmap_read_lock(mm);
+    } else {
+        might_sleep();
+    }
+
+    vma = find_vma(mm, address);
+    ...
+    fault = handle_mm_fault(vma, address, flags, regs);
+    ...
+<font color="blue">
+    /*
+     * If we need to retry the mmap_lock has already been released,
+     * and if there is a fatal signal pending there is no guarantee
+     * that we made any progress. Handle this case first.
+     */
+</font>
+    if (unlikely((fault & VM_FAULT_RETRY) &&
+             (flags & FAULT_FLAG_ALLOW_RETRY))) {
+        flags |= FAULT_FLAG_TRIED;
+        goto retry;
+    }
+---
+</pre>
+</font>
+</p>
+
+<h4><a name="do_shared_fault_steps">steps of do_shared_fault</font></h4>
+<p>
+<font size="2">
+do_shared_fault() handles the page fault on
+<ul>
+<li> PAGE_SIZE (not PUD_SIZE or PMD_SIZE)
+<li> triggered by <U>write</U> on the <U>shared</U> mapping
+</ul>
+The main steps of do_shared_fault is as following,
+<ul>
+<li> vm_ops->fault, prepare the page
+<pre>
+Prepare the page in page cache and fill it.
+ext4 follows the basic fashion of linux page fault. It invokes
+filemap_fault()
+---
+<font color="blue">
+    //Try to find the page, if not exist, create a new one
+</font>
+    page = find_get_page(mapping, offset);
+    if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+        fpin = do_async_mmap_readahead(vmf, page);
+    } else if (!page) {
+        ...
+retry_find:
+        page = pagecache_get_page(mapping, offset, FGP_CREAT|FGP_FOR_MMAP, vmf->gfp_mask);
+    }
+    ...
+page_not_uptodate:
+    ClearPageError(page);
+    fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+<font color="blue">
+    // If not update, read it in
+</font>
+    error = mapping->a_ops->readpage(file, page);
+    if (!error) {
+        wait_on_page_locked(page);
+        if (!PageUptodate(page))
+            error = -EIO;
+    }
+---
+</pre>
+<li> vm_ops->page_mkwrite, make the page writable
+<pre>
+What do we need to do to make a page writable ?
+Look int othe ext4_page_mkwrite()
+---
+    do {
+        err = block_page_mkwrite(vma, vmf,
+                       ext4_da_get_block_prep);
+    } while (err == -ENOSPC &&
+           ext4_should_retry_alloc(inode->i_sb, &retries));
+
+The most important thing here is to reserve the space for the page (delay
+allocation case)
+---
+</pre>
+<li> finish_fault, cook the page table entry
+<pre>
+finish_fault()
+---
+    vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+                      vmf->address, &vmf->ptl);
+    ret = 0;
+    /* Re-check under ptl */
+    if (likely(pte_none(*vmf->pte)))
+        do_set_pte(vmf, page, vmf->address);
+    else
+        ret = VM_FAULT_NOPAGE;
+
+    update_mmu_tlb(vma, vmf->address, vmf->pte);
+    pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+---
+</pre>
+<li> balance dirty, limit the speed of dirtying pages
 </ul>
 </font>
 </p>
@@ -922,19 +1159,19 @@ do_user_addr_fault()
 sendfile is one of the feature to implement zero-copy<br/>
 <pre>
 
-    read       write              sendfile
-        |uuuuuu|        ---\
-        ^      \        ---/
+        read             write                            sendfile
+                |uuuuuu|                ---\
+                ^            \                ---/
 -------/--------\--------------------------------------
-      /          v
-  |ssssss|   |dddddd|           |ssssss|  -> |dddddd|
+            /                    v
+    |ssssss|     |dddddd|                     |ssssss|    -> |dddddd|
 
 do_sendfile()
-  -> splice_direct_to_actor()
-    -> do_splice_to() //<font color="blue">read from src into pipe</font>
-      -> f_op->splice_read()
-    -> do_splice_from() //<font color="blue">write from pipe into dest</font>
-      -> f_op->splice_write()
+    -> splice_direct_to_actor()
+        -> do_splice_to() //<font color="blue">read from src into pipe</font>
+            -> f_op->splice_read()
+        -> do_splice_from() //<font color="blue">write from pipe into dest</font>
+            -> f_op->splice_write()
 </pre>
 Let's how does the pipe dance here ?
 <ul>
@@ -942,39 +1179,39 @@ Let's how does the pipe dance here ?
 <pre>
 
 generic_file_splice_read()
-  -> ext4_file_read_iter()
-    -> generic_file_read_iter()
-      -> generic_file_read_iter()
-        -> copy_page_to_iter()
-          -> copy_page_to_iter_pipe()
+    -> ext4_file_read_iter()
+        -> generic_file_read_iter()
+            -> generic_file_read_iter()
+                -> copy_page_to_iter()
+                    -> copy_page_to_iter_pipe()
 ---
-    off = i->iov_offset;
-<font color="red">    buf = &pipe->bufs[i_head & p_mask];</font>
-    if (off) {
-        if (offset == off && buf->page == page) {
-            /* merge with the last one */
-            buf->len += bytes;
-            i->iov_offset += bytes;
-            goto out;
+        off = i->iov_offset;
+<font color="red">        buf = &pipe->bufs[i_head & p_mask];</font>
+        if (off) {
+                if (offset == off && buf->page == page) {
+                        /* merge with the last one */
+                        buf->len += bytes;
+                        i->iov_offset += bytes;
+                        goto out;
+                }
+                i_head++;
+                buf = &pipe->bufs[i_head & p_mask];
         }
-        i_head++;
-        buf = &pipe->bufs[i_head & p_mask];
-    }
-    if (pipe_full(i_head, p_tail, pipe->max_usage))
-        return 0;
+        if (pipe_full(i_head, p_tail, pipe->max_usage))
+                return 0;
 
-    buf->ops = &page_cache_pipe_buf_ops;
-    get_page(page);
+        buf->ops = &page_cache_pipe_buf_ops;
+        get_page(page);
 <font color="red">
-    buf->page = page;
-    buf->offset = offset;
-    buf->len = bytes;
+        buf->page = page;
+        buf->offset = offset;
+        buf->len = bytes;
 </font>
-    pipe->head = i_head + 1;
-    i->iov_offset = offset + bytes;
-    i->head = i_head;
+        pipe->head = i_head + 1;
+        i->iov_offset = offset + bytes;
+        i->head = i_head;
 out:
-    i->count -= bytes;
+        i->count -= bytes;
 ---
 
 The pipe here looks like the another kind of bvec arrays.
@@ -983,75 +1220,75 @@ The pipe here looks like the another kind of bvec arrays.
 <pre>
 iter_file_splice_write()
 ---
-    pipe_lock(pipe);
+        pipe_lock(pipe);
 
-    splice_from_pipe_begin(&sd);
-    while (sd.total_len) {
-        struct iov_iter from;
-        unsigned int head, tail, mask;
-        size_t left;
-        int n;
+        splice_from_pipe_begin(&sd);
+        while (sd.total_len) {
+                struct iov_iter from;
+                unsigned int head, tail, mask;
+                size_t left;
+                int n;
 
-        ret = splice_from_pipe_next(pipe, &sd);
-        if (ret <= 0)
-            break;
+                ret = splice_from_pipe_next(pipe, &sd);
+                if (ret <= 0)
+                        break;
 
-        ...
-        head = pipe->head;
-        tail = pipe->tail;
-        mask = pipe->ring_size - 1;
+                ...
+                head = pipe->head;
+                tail = pipe->tail;
+                mask = pipe->ring_size - 1;
 
-        /* build the vector */
-        left = sd.total_len;
-        for (n = 0; !pipe_empty(head, tail) && left && n < nbufs; tail++, n++) {
-            struct pipe_buffer *buf = &pipe->bufs[tail & mask];
-            size_t this_len = buf->len;
+                /* build the vector */
+                left = sd.total_len;
+                for (n = 0; !pipe_empty(head, tail) && left && n < nbufs; tail++, n++) {
+                        struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+                        size_t this_len = buf->len;
 
-            if (this_len > left)
-                this_len = left;
-            ...
-            array[n].bv_page = buf->page;
-            array[n].bv_len = this_len;
-            array[n].bv_offset = buf->offset;
-            left -= this_len;
-        }
+                        if (this_len > left)
+                                this_len = left;
+                        ...
+                        array[n].bv_page = buf->page;
+                        array[n].bv_len = this_len;
+                        array[n].bv_offset = buf->offset;
+                        left -= this_len;
+                }
 <font color="blue">
-        // construct a bvec iov_iter from the pipe
+                // construct a bvec iov_iter from the pipe
 </font>
-        iov_iter_bvec(&from, WRITE, array, n, sd.total_len - left);
-        ret = vfs_iter_write(out, &from, &sd.pos, 0);
-        if (ret <= 0)
-            break;
+                iov_iter_bvec(&from, WRITE, array, n, sd.total_len - left);
+                ret = vfs_iter_write(out, &from, &sd.pos, 0);
+                if (ret <= 0)
+                        break;
 
-        sd.num_spliced += ret;
-        sd.total_len -= ret;
-        *ppos = sd.pos;
+                sd.num_spliced += ret;
+                sd.total_len -= ret;
+                *ppos = sd.pos;
 <font color="blue">
-        /* dismiss the fully eaten buffers, adjust the partial one */
+                /* dismiss the fully eaten buffers, adjust the partial one */
 </font>
-        tail = pipe->tail;
-        while (ret) {
-            struct pipe_buffer *buf = &pipe->bufs[tail & mask];
-            if (ret >= buf->len) {
-                ret -= buf->len;
-                buf->len = 0;
-                pipe_buf_release(pipe, buf);
-                tail++;
-                pipe->tail = tail;
-                if (pipe->files)
-                    sd.need_wakeup = true;
-            } else {
-                buf->offset += ret;
-                buf->len -= ret;
-                ret = 0;
-            }
+                tail = pipe->tail;
+                while (ret) {
+                        struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+                        if (ret >= buf->len) {
+                                ret -= buf->len;
+                                buf->len = 0;
+                                pipe_buf_release(pipe, buf);
+                                tail++;
+                                pipe->tail = tail;
+                                if (pipe->files)
+                                        sd.need_wakeup = true;
+                        } else {
+                                buf->offset += ret;
+                                buf->len -= ret;
+                                ret = 0;
+                        }
+                }
         }
-    }
 done:
-    kfree(array);
-    splice_from_pipe_end(pipe, &sd);
+        kfree(array);
+        splice_from_pipe_end(pipe, &sd);
 
-    pipe_unlock(pipe);
+        pipe_unlock(pipe);
 
 ---
 </pre>
@@ -1092,23 +1329,23 @@ locking-order violations is real.
 
 void fput_many(struct file *file, unsigned int refs)
 {
-    if (atomic_long_sub_and_test(refs, &file->f_count)) {
-        struct task_struct *task = current;
+        if (atomic_long_sub_and_test(refs, &file->f_count)) {
+                struct task_struct *task = current;
 
-        if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
-            init_task_work(&file->f_u.fu_rcuhead, ____fput);
-            if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_RESUME))
-                return;
+                if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+                        init_task_work(&file->f_u.fu_rcuhead, ____fput);
+                        if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_RESUME))
+                                return;
+                }
+
+                if (llist_add(&file->f_u.fu_llist, &delayed_fput_list))
+                        schedule_delayed_work(&delayed_fput_work, 1);
         }
-
-        if (llist_add(&file->f_u.fu_llist, &delayed_fput_list))
-            schedule_delayed_work(&delayed_fput_work, 1);
-    }
 }
 
 exit_to_user_mode_loop()
-  -> tracehook_notify_resume()
-    -> task_work_run()
+    -> tracehook_notify_resume()
+        -> task_work_run()
 </pre>
 <br/>
 Let's focus on the dput() and mntput() in __fput().
@@ -1116,84 +1353,84 @@ Let's focus on the dput() and mntput() in __fput().
 <li> mntput()
 <pre>
 mntput()
-  -> mntput_no_expire()
+    -> mntput_no_expire()
 ---
-    ...
-    lock_mount_hash();
-    smp_mb();
-    mnt_add_count(mnt, -1);
-    count = mnt_get_count(mnt);
-    if (count != 0) {
-        WARN_ON(count < 0);
-        rcu_read_unlock();
-        unlock_mount_hash();
-        return;
-    }
-    ...
-    if (likely(!(mnt->mnt.mnt_flags & MNT_INTERNAL))) {
-        struct task_struct *task = current;
-        if (likely(!(task->flags & PF_KTHREAD))) {
-            init_task_work(&mnt->mnt_rcu, __cleanup_mnt);
-            if (!task_work_add(task, &mnt->mnt_rcu, TWA_RESUME))
+        ...
+        lock_mount_hash();
+        smp_mb();
+        mnt_add_count(mnt, -1);
+        count = mnt_get_count(mnt);
+        if (count != 0) {
+                WARN_ON(count < 0);
+                rcu_read_unlock();
+                unlock_mount_hash();
                 return;
         }
-        if (llist_add(&mnt->mnt_llist, &delayed_mntput_list))
-            schedule_delayed_work(&delayed_mntput_work, 1);
-        return;
-    }
-    cleanup_mnt(mnt);
+        ...
+        if (likely(!(mnt->mnt.mnt_flags & MNT_INTERNAL))) {
+                struct task_struct *task = current;
+                if (likely(!(task->flags & PF_KTHREAD))) {
+                        init_task_work(&mnt->mnt_rcu, __cleanup_mnt);
+                        if (!task_work_add(task, &mnt->mnt_rcu, TWA_RESUME))
+                                return;
+                }
+                if (llist_add(&mnt->mnt_llist, &delayed_mntput_list))
+                        schedule_delayed_work(&delayed_mntput_work, 1);
+                return;
+        }
+        cleanup_mnt(mnt);
 ---
 
 If the reference of the mnt is exhausted, cleanup_mnt() will be invoked.
 cleanup_mnt()
 ---
-    ...
+        ...
 <font color="blue">
-    //put the dentry of the mount point
+        //put the dentry of the mount point
 </font>
-    dput(mnt->mnt.mnt_root);
+        dput(mnt->mnt.mnt_root);
 <font color="blue">
-    //This is the most important part, the real work of umount would be done
-    //here
+        //This is the most important part, the real work of umount would be done
+        //here
 </font>
-    deactivate_super(mnt->mnt.mnt_sb);
-    mnt_free_id(mnt);
-    call_rcu(&mnt->mnt_rcu, delayed_free_vfsmnt);
+        deactivate_super(mnt->mnt.mnt_sb);
+        mnt_free_id(mnt);
+        call_rcu(&mnt->mnt_rcu, delayed_free_vfsmnt);
 ---
 
 deactivate_super()
-  -> deactivate_locked_super()
-    -> fs->kill_sb()
-       kill_block_super()
-       ---
-        generic_shutdown_super(sb);
-        sync_blockdev(bdev);
-        WARN_ON_ONCE(!(mode & FMODE_EXCL));
-        blkdev_put(bdev, mode | FMODE_EXCL);
-       ---
+    -> deactivate_locked_super()
+        -> fs->kill_sb()
+             kill_block_super()
+             ---
+                generic_shutdown_super(sb);
+                sync_blockdev(bdev);
+                WARN_ON_ONCE(!(mode & FMODE_EXCL));
+                blkdev_put(bdev, mode | FMODE_EXCL);
+             ---
 
 generic_shutdown_super()
 ---
 <font color="blue">
-    // shrink the dcache to release all of the reference to inode cache
+        // shrink the dcache to release all of the reference to inode cache
 </font>
-    shrink_dcache_for_umount(sb);
-    sync_filesystem(sb);
-    sb->s_flags &= ~SB_ACTIVE;
+        shrink_dcache_for_umount(sb);
+        sync_filesystem(sb);
+        sb->s_flags &= ~SB_ACTIVE;
 
 <font color="blue">
-    /* evict all inodes with zero refcount */
-    // Can we ensure all of the inode to be evicted ?
-    // It should be YES, because every opened file holds a reference of mount.
-    // When we reach here, all of them should be closed.
+        /* evict all inodes with zero refcount */
+        // Can we ensure all of the inode to be evicted ?
+        // It should be YES, because every opened file holds a reference of mount.
+        // When we reach here, all of them should be closed.
 </font>
-    evict_inodes(sb);
-    ...
-    if (!list_empty(&sb->s_inodes)) {
-        printk("VFS: Busy inodes after unmount of %s. "
-           "Self-destruct in 5 seconds.  Have a nice day...\n",
-           sb->s_id);
-    }
+        evict_inodes(sb);
+        ...
+        if (!list_empty(&sb->s_inodes)) {
+                printk("VFS: Busy inodes after unmount of %s. "
+                     "Self-destruct in 5 seconds.    Have a nice day...\n",
+                     sb->s_id);
+        }
 ---
 </pre>
 <li> dput()
@@ -1206,16 +1443,16 @@ reference to inode.
 The mnt and dentry associated with the file is assigned in vfs_open()
 <pre>
 path_openat()
-  -> link_path_walk()
-  -> open_last_lookups()
-  -> do_open()
-    -> vfs_open()
+    -> link_path_walk()
+    -> open_last_lookups()
+    -> do_open()
+        -> vfs_open()
 int vfs_open(const struct path *path, struct file *file)
 {
 <font color="red">
-    file->f_path = *path;
+        file->f_path = *path;
 </font>
-    return do_dentry_open(file, d_backing_inode(path->dentry), NULL);
+        return do_dentry_open(file, d_backing_inode(path->dentry), NULL);
 }
 
 </pre>
@@ -1230,51 +1467,51 @@ Let's first look at what will be done during a mount
 <li> prepare filesystem context
 <pre>
 do_new_mount()
-  -> fs_context_for_mount()
-    -> alloc_fs_context()
-      -> fc->fs_type->init_fs_context()
-         legacy_init_fs_context()
+    -> fs_context_for_mount()
+        -> alloc_fs_context()
+            -> fc->fs_type->init_fs_context()
+                 legacy_init_fs_context()
 <font color="red">
-         fc->ops = &legacy_fs_context_ops
+                 fc->ops = &legacy_fs_context_ops
 </font>
 </pre>
 <li> get_tree
 <pre>
 vfs_get_tree()
-  -> fc->ops->get_tree()
-     legacy_get_tree()
-     -> fc->fs_type->mount()
-        ext4_mount()
-          -> mount_bdev() with <font color="red">ext4_fill_super()</font>
+    -> fc->ops->get_tree()
+         legacy_get_tree()
+         -> fc->fs_type->mount()
+                ext4_mount()
+                    -> mount_bdev() with <font color="red">ext4_fill_super()</font>
 mount_bdev()
 ---
-    bdev = blkdev_get_by_path(dev_name, mode, fs_type);
-    ...
-    mutex_lock(&bdev->bd_fsfreeze_mutex);
-    ...
-    s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
-         bdev);
-    mutex_unlock(&bdev->bd_fsfreeze_mutex);
-    if (s->s_root) {
+        bdev = blkdev_get_by_path(dev_name, mode, fs_type);
         ...
-    } else {
-        s->s_mode = mode;
-        snprintf(s->s_id, sizeof(s->s_id), "%pg", bdev);
-        sb_set_blocksize(s, block_size(bdev));
-        error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
-        ---
-            root = ext4_iget(sb, EXT4_ROOT_INO, EXT4_IGET_SPECIAL);
-            ...
+        mutex_lock(&bdev->bd_fsfreeze_mutex);
+        ...
+        s = sget(fs_type, test_bdev_super, set_bdev_super, flags | SB_NOSEC,
+                 bdev);
+        mutex_unlock(&bdev->bd_fsfreeze_mutex);
+        if (s->s_root) {
+                ...
+        } else {
+                s->s_mode = mode;
+                snprintf(s->s_id, sizeof(s->s_id), "%pg", bdev);
+                sb_set_blocksize(s, block_size(bdev));
+                error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
+                ---
+                        root = ext4_iget(sb, EXT4_ROOT_INO, EXT4_IGET_SPECIAL);
+                        ...
 <font color="red">
-            sb->s_root = d_make_root(root);
+                        sb->s_root = d_make_root(root);
 </font>
-        ---
-        ...
-        s->s_flags |= SB_ACTIVE;
-        bdev->bd_super = s;
-    }
+                ---
+                ...
+                s->s_flags |= SB_ACTIVE;
+                bdev->bd_super = s;
+        }
 
-    return dget(s->s_root);
+        return dget(s->s_root);
 ---
 </pre>
 </ul>
@@ -1290,36 +1527,36 @@ The answer is writenotify<br/>
 <li> vma access permissions
 <pre>
 do_mmap()
-  -> mmap_region()
-    -> vma_set_page_prot()
-    ---
-    unsigned long vm_flags = vma->vm_flags;
-    pgprot_t vm_page_prot;
+    -> mmap_region()
+        -> vma_set_page_prot()
+        ---
+        unsigned long vm_flags = vma->vm_flags;
+        pgprot_t vm_page_prot;
 
-    vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
-    if (vma_wants_writenotify(vma, vm_page_prot)) {
+        vm_page_prot = vm_pgprot_modify(vma->vm_page_prot, vm_flags);
+        if (vma_wants_writenotify(vma, vm_page_prot)) {
 <font color="red">
-        vm_flags &= ~VM_SHARED;
+                vm_flags &= ~VM_SHARED;
 </font>
-        vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
-    }
+                vm_page_prot = vm_pgprot_modify(vm_page_prot, vm_flags);
+        }
 <font color="blue">
-    // Note, vma->vm_flags is not modified
+        // Note, vma->vm_flags is not modified
 </font>
-    /* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
-    WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
-    ---
+        /* remove_protection_ptes reads vma->vm_page_prot without mmap_lock */
+        WRITE_ONCE(vma->vm_page_prot, vm_page_prot);
+        ---
 vma_wants_writenotify()
 ---
-    /* If it was private or non-writable, the write bit is already clear */
-    if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
-        return 0;
+        /* If it was private or non-writable, the write bit is already clear */
+        if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
+                return 0;
 <font color="blue">
-    /* The backer wishes to know when pages are first written to? */
+        /* The backer wishes to know when pages are first written to? */
 </font>
-    if (vm_ops && (vm_ops->page_mkwrite || vm_ops->pfn_mkwrite))
-                           ^^^^^^^^^^^^            ^^^^^^^^^^^
-        return 1;
+        if (vm_ops && (vm_ops->page_mkwrite || vm_ops->pfn_mkwrite))
+                                                     ^^^^^^^^^^^^                        ^^^^^^^^^^^
+                return 1;
 ---
 The vma->wm_page_prot will be used when vmf_insert_mixed_mkwrite()
 
@@ -1329,26 +1566,26 @@ Finally, the mapped page doesn't have write permission
 <pre>
 handle_pte_fault()
 ---
-    if (vmf->flags & FAULT_FLAG_WRITE) {
+        if (vmf->flags & FAULT_FLAG_WRITE) {
 <font color="red">
-        if (!pte_write(entry))
+                if (!pte_write(entry))
 </font>
-            return do_wp_page(vmf);
-        entry = pte_mkdirty(entry);
-    }
+                        return do_wp_page(vmf);
+                entry = pte_mkdirty(entry);
+        }
 <font color="blue">
-    // Set the pte access flags
+        // Set the pte access flags
 </font>
-    entry = pte_mkyoung(entry);
-    if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
-                vmf->flags & FAULT_FLAG_WRITE)) {
-        update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
-    }
+        entry = pte_mkyoung(entry);
+        if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
+                                vmf->flags & FAULT_FLAG_WRITE)) {
+                update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
+        }
 ---
 
 do_wp_page()
-  -> wp_page_shared()
-    -> do_page_mkwrite()
+    -> wp_page_shared()
+        -> do_page_mkwrite()
 
 The page will be marked dirty during this.
 </pre>
@@ -1367,7 +1604,7 @@ clear_page_dirty_for_io() is invoked during page writeback
 <pre>
 https://lwn.net/Articles/731706/
 Normally, filesystems are in control of all I/O to the underlying storage
-                                        ^^^^^^^
+                                                                                ^^^^^^^
 media; they use that control to ensure that the filesystem structure is
 consistent at all times. Even when a file on a traditional storage device
 is mapped into a process's virtual address space, the filesystem manages
@@ -1378,21 +1615,21 @@ corruption and loss if the filesystem relocates the file being modified.
 
 For example, in ext4,
 ext4_dax_huge_fault()
-  -> dax_iomap_fault()
-    -> dax_iomap_pte_fault()
-      -> ext4_iomap_begin()
-        -> ext4_iomap_alloc()
-          -> ext4_journal_start()
-          -> ext4_map_blocks()
-          -> ext4_journal_stop()
+    -> dax_iomap_fault()
+        -> dax_iomap_pte_fault()
+            -> ext4_iomap_begin()
+                -> ext4_iomap_alloc()
+                    -> ext4_journal_start()
+                    -> ext4_map_blocks()
+                    -> ext4_journal_stop()
 <font color="blue">
-          At this moment, the metadata has not been on persistent storage.
+                    At this moment, the metadata has not been on persistent storage.
 </font>
-      -> vmf_insert_mixed_mkwrite() <font color="blue">//insert page fault</font>
-   
+            -> vmf_insert_mixed_mkwrite() <font color="blue">//insert page fault</font>
+     
 After the page fault returns, the metadata may have not been on the page fault
 due to the asynchronous journal employed by both xfs and ext4. The userland process
-           ^^^^^^^^^^^^^^^^^^^^
+                     ^^^^^^^^^^^^^^^^^^^^
 (usually a storage engine) can write data on the mapping. But if the system crashes
 before the fs metadata get flushed the persistent storage medium, the written data
 could be lost.
@@ -1401,50 +1638,78 @@ MAP_SYNC is such as flags that tells kernel do the fsync after before the page f
 returns.
 
 ext4_dax_huge_fault()
-  -> dax_iomap_fault()
-    -> dax_iomap_pte_fault()
-      -> ext4_iomap_begin()
+    -> dax_iomap_fault()
+        -> dax_iomap_pte_fault()
+            -> ext4_iomap_begin()
 ---
 <font color="blue">
-        /*
-         * If we are doing synchronous page fault and inode needs fsync,
-         * we can insert PTE into page tables only after that happens.
-         * Skip insertion for now and return the pfn so that caller can
-         * insert it after fsync is done.
-         */
+                /*
+                 * If we are doing synchronous page fault and inode needs fsync,
+                 * we can insert PTE into page tables only after that happens.
+                 * Skip insertion for now and return the pfn so that caller can
+                 * insert it after fsync is done.
+                 */
 </font>
-        if (sync) {
-            *pfnp = pfn;
-            ret = VM_FAULT_NEEDDSYNC | major;
-            goto finish_iomap;
-        }
+                if (sync) {
+                        *pfnp = pfn;
+                        ret = VM_FAULT_NEEDDSYNC | major;
+                        goto finish_iomap;
+                }
 ---
 
 ext4_dax_huge_fault()
 --
-    result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
-    if (write) {
-        ext4_journal_stop(handle);
+        result = dax_iomap_fault(vmf, pe_size, &pfn, &error, &ext4_iomap_ops);
+        if (write) {
+                ext4_journal_stop(handle);
 
-        /* Handling synchronous page fault? */
-        if (result & VM_FAULT_NEEDDSYNC)
-            result = dax_finish_sync_fault(vmf, pe_size, pfn);
+                /* Handling synchronous page fault? */
+                if (result & VM_FAULT_NEEDDSYNC)
+                        result = dax_finish_sync_fault(vmf, pe_size, pfn);
 <font color="blue">
-              //guarantee the metadat get flushed to the persistent storage medium
+                            //guarantee the metadat get flushed to the persistent storage medium
 </font>
-              -> vfs_fsync_range()
-                -> file_write_and_wait_range()
-                -> ext4_fsync_journal()
-                -> blkdev_issue_flush()
+                            -> vfs_fsync_range()
+                                -> file_write_and_wait_range()
+                                -> ext4_fsync_journal()
+                                -> blkdev_issue_flush()
 <font color="blue">
-                // insert page table
+                                // insert page table
 </font>
-              -> dax_insert_pfn_mkwrite()
-        up_read(&EXT4_I(inode)->i_mmap_sem);
-        sb_end_pagefault(sb);
-    } 
+                            -> dax_insert_pfn_mkwrite()
+                up_read(&EXT4_I(inode)->i_mmap_sem);
+                sb_end_pagefault(sb);
+        } 
 --
 </pre>
+</font>
+</p>
+
+<h3><a name="backing_dev_info">backing dev info (bdi)</a></h3>
+<p>
+<font size="2">
+bdi, namely backing_dev_info, represents the underlying device (maybe a virtual<br/>
+device for nfs or fuse). It mainly works for writeback, but also carry the <font color="red">ra_pages</font><br/>
+which is for readahead.<br/>
+<ul>
+<li> noop and bdev
+<pre>
+By default, the super_block has noop_backing_dev_info,
+alloc_super()
+---
+        s->s_bdi = &noop_backing_dev_info;
+---
+Then s_bdi will be set to the bdi of the underlaying device or a virtual one.
+set_bdev_super() <- mount_bdev()             <- ext2_mount()
+                                                                             <- ext4_mount()
+                                 <- get_tree_bdev()        <- xfs_fs_get_tree()
+super_setup_bdi_name() <- ceph_setup_bdi()
+                                             <- nfs_get_tree_common()
+                                             <- super_setup_bdi()         <- btrfs_fill_super()                 >
+
+If the s_bdi is noop_backing_dev_info, there won't be any writeback activity on this filesystem.
+</pre>
+</ul>
 </font>
 </p>
 
@@ -1455,22 +1720,22 @@ In the past, only direct IO and buffered read IO can be controlled by cgroup<br/
 blkio. The reason is as following diragram.
 <pre>
 
-   a cgroup      VFS LAYER      root cgroup
-    Task A                     writeback kworker
-      |                             |
-      | dirtying pages              | flush dirty inodes
-      v                             v
-[D] [D] [D] [D]      ------->   writepages
-[D] [D] [D] [D]                     |
+     a cgroup            VFS LAYER            root cgroup
+        Task A                                         writeback kworker
+            |                                                         |
+            | dirtying pages                            | flush dirty inodes
+            v                                                         v
+[D] [D] [D] [D]            ------->     writepages
+[D] [D] [D] [D]                                         |
 ------------------------------------^--------------------
-                  BLOCK LAYER       |
-                                    v
-                                 submit_bio
-                                    | blkio qos/scheduler
-                                    v
-                               [R] [R] [R] [R]
+                                    BLOCK LAYER             |
+                                                                        v
+                                                                 submit_bio
+                                                                        | blkio qos/scheduler
+                                                                        v
+                                                             [R] [R] [R] [R]
 ---------------------------------------------------------
-                 SCSI/NVME/....
+                                 SCSI/NVME/....
 </pre>
 writeback kworker does the real IO but it belongs to the root cgroup.<br/>
 More details, refer to <a href="https://lwn.net/Articles/648292/">Writeback and control groups</a><br/>
@@ -1486,8 +1751,15 @@ and block device.
 </pre>
 <li> associate bdi_writeback and inode
 <pre>
-This is done by __mark_inode_dirty -> inode_attach_wb()
-It is in the context of the task that's dirtying pages
+This is done by inode_attach_wb(). It is in the context of the task that's dirtying pages
+
+inode_attach_wb    <-    __mark_inode_dirty()
+                                 <- wbc_attach_fdatawrite_inode()    <-    __filemap_fdatawrite_range()
+                                                                                                     <-    __set_page_dirty_nobuffers()[M]
+                                 <- account_page_dirtied()                 <-    __set_page_dirty()    <-    __set_page_dirty_buffers()[M]
+                                                                                                                                                     <-    mark_buffer_dirty()[M]
+                                                                                                                                                     <-    iomap_set_page_dirty()[M]
+[M] : there is __mark_inode_dirty invoked in it
 </pre>
 <li> associate blkcg and bio
 <pre>
@@ -1495,31 +1767,31 @@ This is done by wbc_init_bio in .writepages
 wbc_init_bio()
 ---
 <font color="blue">
-    /*
-     * pageout() path doesn't attach @wbc to the inode being written
-     * out.  This is intentional as we don't want the function to block
-                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     * behind a slow cgroup.  Ultimately, we want pageout() to kick off
-       ^^^^^^^^^^^^^^^^^^^^
-     * regular writeback instead of writing things out itself.
-     */
+        /*
+         * pageout() path doesn't attach @wbc to the inode being written
+         * out.    This is intentional as we don't want the function to block
+                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         * behind a slow cgroup.    Ultimately, we want pageout() to kick off
+             ^^^^^^^^^^^^^^^^^^^^
+         * regular writeback instead of writing things out itself.
+         */
 </font>
-    if (wbc->wb)
-        bio_associate_blkg_from_css(bio, wbc->wb->blkcg_css);
+        if (wbc->wb)
+                bio_associate_blkg_from_css(bio, wbc->wb->blkcg_css);
 ---
 
 Take ext4 as example,
 io_submit_init_bio()
 ---
-    bio = bio_alloc(GFP_NOIO, BIO_MAX_VECS);
-    fscrypt_set_bio_crypt_ctx_bh(bio, bh, GFP_NOIO);
-    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
-    bio_set_dev(bio, bh->b_bdev);
-    bio->bi_end_io = ext4_end_bio;
-    bio->bi_private = ext4_get_io_end(io->io_end);
-    io->io_bio = bio;
-    io->io_next_block = bh->b_blocknr;
-    wbc_init_bio(io->io_wbc, bio);
+        bio = bio_alloc(GFP_NOIO, BIO_MAX_VECS);
+        fscrypt_set_bio_crypt_ctx_bh(bio, bh, GFP_NOIO);
+        bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+        bio_set_dev(bio, bh->b_bdev);
+        bio->bi_end_io = ext4_end_bio;
+        bio->bi_private = ext4_get_io_end(io->io_end);
+        io->io_bio = bio;
+        io->io_next_block = bh->b_blocknr;
+        wbc_init_bio(io->io_wbc, bio);
 ---
 </pre>
 </ul>
@@ -1530,59 +1802,59 @@ the speed of dirtying and cleaning. And this has been done in balance_dirty_page
 <pre>
 balance_dirty_pages()
 ---
-    struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
-    struct dirty_throttle_control * const mdtc = mdtc_valid(&mdtc_stor) ? &mdtc_stor : NULL;
+        struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
+        struct dirty_throttle_control * const mdtc = mdtc_valid(&mdtc_stor) ? &mdtc_stor : NULL;
 <font color="blue">
-    //mdtc is for memcg dirty throttle control
+        //mdtc is for memcg dirty throttle control
 </font>
-        if (mdtc) {
-            unsigned long filepages, headroom, writeback;
+                if (mdtc) {
+                        unsigned long filepages, headroom, writeback;
 
-            /*
-             * If @wb belongs to !root memcg, repeat the same
-             * basic calculations for the memcg domain.
-             */
-            mem_cgroup_wb_stats(wb, &filepages, &headroom,
-                        &mdtc->dirty, &writeback);
-            mdtc->dirty += writeback;
-            mdtc_calc_avail(mdtc, filepages, headroom);
+                        /*
+                         * If @wb belongs to !root memcg, repeat the same
+                         * basic calculations for the memcg domain.
+                         */
+                        mem_cgroup_wb_stats(wb, &filepages, &headroom,
+                                                &mdtc->dirty, &writeback);
+                        mdtc->dirty += writeback;
+                        mdtc_calc_avail(mdtc, filepages, headroom);
 
-            domain_dirty_limits(mdtc);
-        }
-        ...
-        if (mdtc) {
-            ...
-            dirty_exceeded |= (mdtc->wb_dirty > mdtc->wb_thresh) &&
-                ((mdtc->dirty > mdtc->thresh) || strictlimit);
+                        domain_dirty_limits(mdtc);
+                }
+                ...
+                if (mdtc) {
+                        ...
+                        dirty_exceeded |= (mdtc->wb_dirty > mdtc->wb_thresh) &&
+                                ((mdtc->dirty > mdtc->thresh) || strictlimit);
 
-            wb_position_ratio(mdtc);
-            if (mdtc->pos_ratio < gdtc->pos_ratio)
-                sdtc = mdtc;
-        }
+                        wb_position_ratio(mdtc);
+                        if (mdtc->pos_ratio < gdtc->pos_ratio)
+                                sdtc = mdtc;
+                }
 ---
 
 domain_dirty_limits() is for calculating the limit of per-memcg
 ---
-    /* gdtc is !NULL iff @dtc is for memcg domain */
-    if (gdtc) {
-        unsigned long global_avail = gdtc->avail;
+        /* gdtc is !NULL iff @dtc is for memcg domain */
+        if (gdtc) {
+                unsigned long global_avail = gdtc->avail;
 <font color="blue">
-        /*
-         * The byte settings can't be applied directly to memcg
-         * domains.  Convert them to ratios by scaling against
-         * globally available memory.  As the ratios are in
-         * per-PAGE_SIZE, they can be obtained by dividing bytes by
-         * number of pages.
-         */
+                /*
+                 * The byte settings can't be applied directly to memcg
+                 * domains.    Convert them to ratios by scaling against
+                 * globally available memory.    As the ratios are in
+                 * per-PAGE_SIZE, they can be obtained by dividing bytes by
+                 * number of pages.
+                 */
 </font>
-        if (bytes)
-            ratio = min(DIV_ROUND_UP(bytes, global_avail),
-                    PAGE_SIZE);
-        if (bg_bytes)
-            bg_ratio = min(DIV_ROUND_UP(bg_bytes, global_avail),
-                       PAGE_SIZE);
-        bytes = bg_bytes = 0;
-    }
+                if (bytes)
+                        ratio = min(DIV_ROUND_UP(bytes, global_avail),
+                                        PAGE_SIZE);
+                if (bg_bytes)
+                        bg_ratio = min(DIV_ROUND_UP(bg_bytes, global_avail),
+                                             PAGE_SIZE);
+                bytes = bg_bytes = 0;
+        }
 ---
 
 Whether enable this feature is controlled by wb->memcg_css->parent,
@@ -1592,12 +1864,297 @@ Refer to MDTC_INIT() and mdtc_valid();
 And the belonging of the bdi_writeback is decided when
 balance_dirty_pages_ratelimited()
 ---
-    if (inode_cgwb_enabled(inode))
-        wb = wb_get_create_current(bdi, GFP_KERNEL);
-    if (!wb)
-        wb = &bdi->wb;
+        if (inode_cgwb_enabled(inode))
+                wb = wb_get_create_current(bdi, GFP_KERNEL);
+        if (!wb)
+                wb = &bdi->wb;
 ---
 </pre>
+</font>
+</p>
+
+<h3><a name="partial_write">partial write</a></h3>
+<p>
+<font size="2">
+Partial Write
+<pre>
+/------------------------------------------------------------------/
+__block_write_begin_int()
+---
+        for(bh = head, block_start = 0; bh != head || !block_start;
+                block++, block_start=block_end, bh = bh->b_this_page) {
+                block_end = block_start + blocksize;
+                ...
+                if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
+                        !buffer_unwritten(bh) &&
+                         (block_start < from || block_end > to)) {
+                        ll_rw_block(REQ_OP_READ, 0, 1, &bh);
+                        *wait_bh++=bh;
+                }
+        }
+---
+Pages will be read in befoare written.
+</pre>
+</font>
+</p>
+
+<h3><a name="nofs_when_alloc_pagecache">__GFP_NOFS when alloc pagecache</a></h3>
+<p>
+<font size="2">
+When allocate page cache, what's gfp_mask is used ?
+<pre>
+inode_init_always()
+---
+        mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+---
+
+#define GFP_HIGHUSER_MOVABLE        (GFP_HIGHUSER | __GFP_MOVABLE)
+                                                                     /     \
+                                                        GFP_USER | __GFP_HIGHMEM
+                                                         /         \
+                        __GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_HARDWALL
+</pre>
+ITOW, pagecache allocation use GFP_KERNEL. However, xfs is not.
+<pre>
+xfs_setup_inode()
+---
+<font color="blue">
+        /*
+         * Ensure all page cache allocations are done from GFP_NOFS context to
+         * prevent direct reclaim recursion back into the filesystem and blowing
+         * stacks or deadlocking.
+         */
+</font>
+        gfp_mask = mapping_gfp_mask(inode->i_mapping);
+        mapping_set_gfp_mask(inode->i_mapping, (gfp_mask & ~(__GFP_FS)));
+---
+</pre>
+And this can influence the action in shrink_page_list,
+<pre>
+                if (PageWriteback(page)) {
+                        /* Case 1 above */
+                        if (current_is_kswapd() &&
+                                PageReclaim(page) &&
+                                test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
+                                stat->nr_immediate++;
+                                goto activate_locked;
+
+                        /* Case 2 above */
+                        } else if (writeback_throttling_sane(sc) ||
+                                !PageReclaim(page) || <font color="red">!may_enter_fs</font>) {
+                                SetPageReclaim(page);
+                                stat->nr_writeback++;
+                                goto activate_locked;
+
+                        /* Case 3 above */
+                        } else {
+                                unlock_page(page);
+                                wait_on_page_writeback(page);
+                                /* then go back and try same page again */
+                                list_add_tail(&page->lru, page_list);
+                                continue;
+                        }
+                }
+
+This means xfs is easy to OOM with buffer IO, but ext4 is not.
+[<0>] io_schedule+0x12/0x40
+[<0>] wait_on_page_bit+0x137/0x230
+[<0>] shrink_page_list+0xbab/0xc50
+[<0>] shrink_inactive_list+0x254/0x580
+[<0>] shrink_node_memcg+0x1fa/0x720
+[<0>] shrink_node+0xce/0x440
+[<0>] do_try_to_free_pages+0xc3/0x360
+[<0>] try_to_free_mem_cgroup_pages+0xf9/0x210
+[<0>] try_charge+0x192/0x780
+[<0>] mem_cgroup_try_charge+0x8b/0x1a0
+[<0>] __add_to_page_cache_locked+0x64/0x240
+[<0>] add_to_page_cache_lru+0x64/0x100
+[<0>] pagecache_get_page+0xf2/0x2c0
+[<0>] grab_cache_page_write_begin+0x1f/0x40
+[<0>] ext4_da_write_begin+0xce/0x470 [ext4]
+[<0>] generic_perform_write+0xf4/0x1b0
+[<0>] __generic_file_write_iter+0xfe/0x1c0
+[<0>] ext4_file_write_iter+0xc6/0x3b0 [ext4]
+[<0>] new_sync_write+0x124/0x170
+[<0>] vfs_write+0xa5/0x1a0
+[<0>] ksys_write+0x4f/0xb0
+[<0>] do_syscall_64+0x5b/0x1b0
+[<0>] entry_SYSCALL_64_after_hwframe+0x65/0xca
+[<0>] 0xffffffffffffffff
+</pre>
+</font>
+</p>
+
+<h3><a name="umount">umount</a></h3>
+<p>
+<font size="2">
+When we mount a filesystem, there are mainly 3 things to be setup,
+<ul>
+<li> superblock
+<pre>
+All of the things about the filesystem is in the super block
+</pre>
+<li> root inode
+<pre>
+root inode is the entry of the filesystem
+</pre>
+<li> mount point
+</ul>
+A umount mainly do following things,
+<ul>
+<li> 
+</ul>
+</font>
+</p>
+
+
+<h2><a name="bh">buffer_head</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="bh_and_friends">bh vs its friends</a></h3>
+<p>
+<font size="2">
+bh is a legacy of old version kernel. Nowadays, it mainly works with following
+compoments,
+<ul>
+<li> page cache
+<pre>
+In linux kernel, a page is 4K, but the filesystem block could be smaller than it.
+In ext2/ext4, bh is used to represent the filesystem block.
+
+page->private -> bh0 -> bh1 -> bh2 -> bh3
+                                         /\
+                                        /    \
+                                 b_this_page
+
+Currently, there are mainly two positions that employ bh
+(1) <B>store bmap info</B>
+ext4 is an example
+
+__block_write_begin_int()
+---
+        for(bh = head, block_start = 0; bh != head || !block_start;
+                block++, block_start=block_end, bh = bh->b_this_page) {
+                if (!buffer_mapped(bh)) {
+                        WARN_ON(bh->b_size != blocksize);
+                        if (get_block) {
+<font color="red">                                err = get_block(inode, block, bh, 1);</font>
+                                if (err)
+                                        break;
+                        }
+                if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
+                        !buffer_unwritten(bh) &&
+                         (block_start < from || block_end > to)) {
+<font color="red">                        ll_rw_block(REQ_OP_READ, 0, 1, &bh);</font>
+                        *wait_bh++=bh;
+                }
+        }
+        /*
+         * If we issued read requests - let them complete.
+         */
+        while(wait_bh > wait) {
+                wait_on_buffer(*--wait_bh);
+                if (!buffer_uptodate(*wait_bh))
+                        err = -EIO;
+        }
+
+---
+
+io_submit_add_bh()
+    -> io_submit_add_bh()
+    ---
+        bio = bio_alloc(GFP_NOIO, BIO_MAX_VECS);
+        bio->bi_iter.bi_sector = <font color="red">bh->b_blocknr</font> * (bh->b_size >> 9);
+        bio_set_dev(bio, <font color="red">bh->b_bdev</font>);
+        bio->bi_end_io = ext4_end_bio;
+        bio->bi_private = ext4_get_io_end(io->io_end);
+        wbc_init_bio(io->io_wbc, bio);
+    ---
+        
+(2) <B>fs metadata</B>
+__ext4_get_inode_loc()
+---
+<font color="blue">
+        /*
+         * Figure out the offset within the block group inode table
+         */
+</font>
+        inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
+        inode_offset = ((ino - 1) %
+                        EXT4_INODES_PER_GROUP(sb));
+        block = ext4_inode_table(sb, gdp) + (inode_offset / inodes_per_block);
+        iloc->offset = (inode_offset % inodes_per_block) * EXT4_INODE_SIZE(sb);
+        bh = sb_getblk(sb, block);
+        ...
+        if (!buffer_uptodate(bh)) {
+<font color="red">                lock_buffer(bh);</font>
+                ...
+make_io:
+                blk_start_plug(&plug);
+                ext4_read_bh_nowait(bh, REQ_META | REQ_PRIO, NULL);
+                blk_finish_plug(&plug);
+                wait_on_buffer(bh);
+        }
+---
+</pre>
+<li> bio
+<pre>
+bio is the unit of IO in both fs (such as xfs) and block. And kernel also
+provide wrapper interfaces for backward compatibility of legacy bh.
+submit_bh_wbc()
+---
+        bio = bio_alloc(GFP_NOIO, 1);
+
+        bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+        bio_set_dev(bio, bh->b_bdev);
+        bio->bi_write_hint = write_hint;
+
+        bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+
+        bio->bi_end_io = end_bio_bh_io_sync;
+        bio->bi_private = bh;
+
+        if (buffer_meta(bh))
+                op_flags |= REQ_META;
+        if (buffer_prio(bh))
+                op_flags |= REQ_PRIO;
+        bio_set_op_attrs(bio, op, op_flags);
+
+        submit_bio(bio);
+---
+</pre>
+<li> journal_head
+<pre>
+Yes !!! jbd2 still uses bh.
+
+                    b_bh
+        jh    ---------->
+                <---------    bh
+                 b_private
+>
+ - commit to jbd2
+     ext4_do_update_inode()
+         -> ext4_handle_dirty_metadata(handle, NULL, bh)
+
+ - after log is committed
+     __jbd2_journal_temp_unlink_buffer()
+     ---
+        jh->b_jlist = BJ_None;
+        if (transaction && is_journal_aborted(transaction->t_journal))
+                clear_buffer_jbddirty(bh);
+        else if (test_clear_buffer_jbddirty(bh))
+                mark_buffer_dirty(bh);        <font color="blue">/* Expose it to the VM */</font>
+     ---
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="jbd2">jbd2</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="jbd2_transaction">transaction</a></h3>
+<p>
+<font size="2">
+
 </font>
 </p>
 
@@ -1606,47 +2163,120 @@ balance_dirty_pages_ratelimited()
 <h3><a name="reference_of_inode">reference of inode</a></h3>
 <p>
 <font size="2">
-The put of reference of inode is done in iput(),
+There are two reference of the inode,
+<ul>
+<li> i_nlink
+<pre>
+This reference is the count of <font color="red"><B>dentries</B></font> that point to this inode and
+it decides the lifecycle of the inode on disk.
+</pre>
+<li> i_count
+<pre>
+This reference decides the lifecycle of the inode in memory
+</pre>
+</ul>
+In this section, we would look into the second kind of reference above.
+<ul>
+<li> gone of the inode
 <pre>
 void iput(struct inode *inode)
 {
-    if (!inode)
-        return;
-    BUG_ON(inode->i_state & I_CLEAR);
-retry:
-    if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
-        if (inode->i_nlink && (inode->i_state & I_DIRTY_TIME)) {
-            atomic_inc(&inode->i_count);
-            spin_unlock(&inode->i_lock);
-            trace_writeback_lazytime_iput(inode);
-            mark_inode_dirty_sync(inode);
-            goto retry;
+    ...
+        if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
+        ...
+        iput_final(inode);
         }
-<font color="red">        iput_final(inode);</font>
-    }
 }
-Regarding to the lazytime, refer to this section <a href="#lazytime_mode">lazytime mode</a>
-</pre>
 When the last reference of an inode is dropped, we may have two choices,
-<ul>
-<li> evict the inode
-<li> retain indoe in cache if fs is active
-</ul>
-Before talking deeply into how to determine evict or not, let's look into<br>
-When is the reference of inode get ?
-<pre>
+Look at the code,
+iput_final()
+---
+    if (op->drop_inode)
+        drop = op->drop_inode(inode);
+    else
+        drop = generic_drop_inode(inode);
 <font color="blue">
-/*
- * inode->i_lock must be held
- */
+    // (1) retain inode in cache if fs is active
 </font>
-void __iget(struct inode *inode)
-{
-    atomic_inc(&inode->i_count);
-}
-
-__iget() <- iterate_bdevs()
+    if (!drop &&
+            !(inode->i_state & I_DONTCACHE) &&
+            (sb->s_flags & SB_ACTIVE)) {
+        inode_add_lru(inode);
+        spin_unlock(&inode->i_lock);
+        return;
+    }
+    ...
+    WRITE_ONCE(inode->i_state, state | I_FREEING);
+    if (!list_empty(&inode->i_lru))
+        inode_lru_list_del(inode);
+    spin_unlock(&inode->i_lock);
+<font color="blue">
+    // (2) evict the inode
+</font>
+    evict(inode);
+---
 </pre>
+<li> get of the inode
+<pre>
+We usually get the reference of the inode when look up in inode cache,
+for example,
+iget_locked()
+---
+    spin_lock(&inode_hash_lock);
+    inode = find_inode_fast(sb, head, ino);
+    ---
+        hlist_for_each_entry(inode, head, i_hash) {
+            if (inode->i_ino != ino)
+                continue;
+            if (inode->i_sb != sb)
+                continue;
+            spin_lock(&inode->i_lock);
+            if (inode->i_state & (I_FREEING|I_WILL_FREE)) {
+                __wait_on_freeing_inode(inode);
+                goto repeat;
+            }
+            ...
+            __iget(inode);
+            spin_unlock(&inode->i_lock);
+            return inode;
+        }
+    ---
+    spin_unlock(&inode_hash_lock);
+---
+<font color="red">
+The reference get of inode is done under inode->i_lock which is protect it
+against iput_final.
+</font>
+</pre>
+</ul>
+
+The main user of inode is dcache.
+<pre>
+           fd         user
+------------------------------
+           file       kernel
+            v         file->f_path.dentry
+          dcache
+            v         dentry->d_inode
+          inode
+</pre>
+<ul>
+<li> get
+<li> put
+<pre>
+__fput()
+---
+    dput(dentry);
+    ...
+    mntput(mnt);
+---
+dput()
+  -> dentry_kill()
+    -> __dentry_kill()
+      -> dentry_unlink_inode()
+        -> iput()
+</pre>
+</ul>
 
 </font>
 </p>
@@ -1659,33 +2289,33 @@ The commit is
 <pre>
 commit 0ae45f63d4ef8d8eeec49c7d8b44a1775fff13e8
 Author: Theodore Ts'o <tytso@mit.edu>
-Date:   Mon Feb 2 00:37:00 2015 -0500
+Date:     Mon Feb 2 00:37:00 2015 -0500
 
-    vfs: add support for a lazytime mount option
-    
-    Add a new mount option which enables a new "lazytime" mode.  <U>This mode
-    causes atime, mtime, and ctime updates to only be made to the
-    in-memory version of the inode.</U>  The on-disk times will only get
-    updated when (a) if the inode needs to be updated for some non-time
-    related change, (b) if userspace calls fsync(), syncfs() or sync(), or
-    (c) just before an undeleted inode is evicted from memory.
-    
-    This is OK according to POSIX because there are no guarantees after a
-    crash unless userspace explicitly requests via a fsync(2) call.
-    
-    For workloads which feature a large number of random write to a
-    preallocated file, the lazytime mount option significantly reduces
-    writes to the inode table.  The repeated 4k writes to a single block
-    will result in undesirable stress on flash devices and SMR disk
-    drives.  Even on conventional HDD's, the repeated writes to the inode
-    table block will trigger Adjacent Track Interference (ATI) remediation
-    latencies, which very negatively impact long tail latencies --- which
-    is a very big deal for web serving tiers (for example).
-    
-    Google-Bug-Id: 18297052
-    
-    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+        vfs: add support for a lazytime mount option
+        
+        Add a new mount option which enables a new "lazytime" mode.    <U>This mode
+        causes atime, mtime, and ctime updates to only be made to the
+        in-memory version of the inode.</U>    The on-disk times will only get
+        updated when (a) if the inode needs to be updated for some non-time
+        related change, (b) if userspace calls fsync(), syncfs() or sync(), or
+        (c) just before an undeleted inode is evicted from memory.
+        
+        This is OK according to POSIX because there are no guarantees after a
+        crash unless userspace explicitly requests via a fsync(2) call.
+        
+        For workloads which feature a large number of random write to a
+        preallocated file, the lazytime mount option significantly reduces
+        writes to the inode table.    The repeated 4k writes to a single block
+        will result in undesirable stress on flash devices and SMR disk
+        drives.    Even on conventional HDD's, the repeated writes to the inode
+        table block will trigger Adjacent Track Interference (ATI) remediation
+        latencies, which very negatively impact long tail latencies --- which
+        is a very big deal for web serving tiers (for example).
+        
+        Google-Bug-Id: 18297052
+        
+        Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+        Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
 
 </pre>
 Firstly, let's look at the 3 time fields in POSIX,
@@ -1699,8 +2329,8 @@ And they will be modified in following code path,
 <li> atime
 <pre>
 file_accessed()
-  -> touch_atime()
-    -> update_time() //<font color="blue">S_ATIME</font>
+    -> touch_atime()
+        -> update_time() //<font color="blue">S_ATIME</font>
 
 file_accessed() could be invoked by
  - generic_file_read_iter() // in direct IO path
@@ -1712,37 +2342,37 @@ file_accessed() could be invoked by
 <li> ctime and mtime
 <pre>
 file_update_time()
-  -> update_time() // S_MTIME or S_CTIME
+    -> update_time() // S_MTIME or S_CTIME
 
 filemap_page_mkwrite()
-  -> file_update_time()
+    -> file_update_time()
 
 __generic_file_write_iter() //cover both buffer and direct IO path
-  -> file_update_time()
+    -> file_update_time()
 </pre>
 </ul>
 The time of inode is updated in generic_update_time,
 <pre>
 generic_update_time()
-  -> __mark_inode_dirty()
-    -> sb->s_op->dirty_inode()
-       ext4_dirty_inode()
-     ---
+    -> __mark_inode_dirty()
+        -> sb->s_op->dirty_inode()
+             ext4_dirty_inode()
+         ---
 <font color="blue">
-        // If flags only contain I_DIRTY_TIME, just return and leave the
-        // modified times fields in memory
+                // If flags only contain I_DIRTY_TIME, just return and leave the
+                // modified times fields in memory
 </font>
-        if (flags == I_DIRTY_TIME)
-            return;
-        handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
-        ...
-        ext4_mark_inode_dirty(handle, inode);
-          -> __ext4_mark_inode_dirty()
-            -> ext4_mark_iloc_dirty()
-              -> ext4_do_update_inode() // <font color="blue">synchronize the inode in-memory to the one on-disk</font>
+                if (flags == I_DIRTY_TIME)
+                        return;
+                handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
+                ...
+                ext4_mark_inode_dirty(handle, inode);
+                    -> __ext4_mark_inode_dirty()
+                        -> ext4_mark_iloc_dirty()
+                            -> ext4_do_update_inode() // <font color="blue">synchronize the inode in-memory to the one on-disk</font>
 
-        ext4_journal_stop(handle);
-     ---
+                ext4_journal_stop(handle);
+         ---
 </pre>
 If we look into the __mark_inode_dirty,<br/>
 we could find out that I_DIRTY_TIME is set on inode->i_state, and the inode is inserted into the wb->b_dirty_time<br/>
@@ -1751,13 +2381,13 @@ There is no modifications on the on-disk inode buffer in-memory, what does the w
 <li> When will the inode on wb->b_dirty_time be flushed ?
 <pre>
 wb_writeback()
-  -> queue_io()
-  ---
-    if (!work->for_sync)
-        time_expire_jif = jiffies - dirtytime_expire_interval * HZ;
-    moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
-                     time_expire_jif);
-  ---
+    -> queue_io()
+    ---
+        if (!work->for_sync)
+                time_expire_jif = jiffies - dirtytime_expire_interval * HZ;
+        moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
+                                         time_expire_jif);
+    ---
 
 unsigned int dirtytime_expire_interval = 12 * 60 * 60;
 <font color="blue">
@@ -1768,55 +2398,55 @@ See it !?, <B>it is 12 hours</B>
 <pre>
 __writeback_single_inode()
 ---
-    ret = do_writepages(mapping, wbc);
+        ret = do_writepages(mapping, wbc);
 <font color="blue">
-    /*
-     * Make sure to wait on the data before writing out the metadata.
-     * This is important for filesystems that modify metadata on data
-     * I/O completion. We don't do it for sync(2) writeback because it has a
-     * separate, external IO completion path and ->sync_fs for guaranteeing
-     * inode metadata is written back correctly.
-     */
+        /*
+         * Make sure to wait on the data before writing out the metadata.
+         * This is important for filesystems that modify metadata on data
+         * I/O completion. We don't do it for sync(2) writeback because it has a
+         * separate, external IO completion path and ->sync_fs for guaranteeing
+         * inode metadata is written back correctly.
+         */
 </font>
-    if (wbc->sync_mode == WB_SYNC_ALL && !wbc->for_sync) {
-        int err = filemap_fdatawait(mapping);
-        if (ret == 0)
-            ret = err;
-    }
+        if (wbc->sync_mode == WB_SYNC_ALL && !wbc->for_sync) {
+                int err = filemap_fdatawait(mapping);
+                if (ret == 0)
+                        ret = err;
+        }
 
-    spin_lock(&inode->i_lock);
+        spin_lock(&inode->i_lock);
 
-    dirty = inode->i_state & I_DIRTY;
-    if ((inode->i_state & I_DIRTY_TIME) &&
-        ((dirty & I_DIRTY_INODE) ||
-         wbc->sync_mode == WB_SYNC_ALL || wbc->for_sync ||
-         time_after(jiffies, inode->dirtied_time_when +
-            dirtytime_expire_interval * HZ))) {
-        dirty |= I_DIRTY_TIME;
-        trace_writeback_lazytime(inode);
-    }
-    inode->i_state &= ~dirty;
-    ...
-    smp_mb();
+        dirty = inode->i_state & I_DIRTY;
+        if ((inode->i_state & I_DIRTY_TIME) &&
+                ((dirty & I_DIRTY_INODE) ||
+                 wbc->sync_mode == WB_SYNC_ALL || wbc->for_sync ||
+                 time_after(jiffies, inode->dirtied_time_when +
+                        dirtytime_expire_interval * HZ))) {
+                dirty |= I_DIRTY_TIME;
+                trace_writeback_lazytime(inode);
+        }
+        inode->i_state &= ~dirty;
+        ...
+        smp_mb();
 
-    if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
-        inode->i_state |= I_DIRTY_PAGES;
+        if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+                inode->i_state |= I_DIRTY_PAGES;
 
-    spin_unlock(&inode->i_lock);
+        spin_unlock(&inode->i_lock);
 <font color="blue">
 <U>
-    //See it ? I_DIRTY_SYNC will be set here and ext4_dirty_inode() won't do
-    nothing anymore
+        //See it ? I_DIRTY_SYNC will be set here and ext4_dirty_inode() won't do
+        nothing anymore
 </U>
 </font>
-    if (dirty & I_DIRTY_TIME)
-        mark_inode_dirty_sync(inode);
-    /* Don't write the inode if only I_DIRTY_PAGES was set */
-    if (dirty & ~I_DIRTY_PAGES) {
-        int err = write_inode(inode, wbc);
-        if (ret == 0)
-            ret = err;
-    }
+        if (dirty & I_DIRTY_TIME)
+                mark_inode_dirty_sync(inode);
+        /* Don't write the inode if only I_DIRTY_PAGES was set */
+        if (dirty & ~I_DIRTY_PAGES) {
+                int err = write_inode(inode, wbc);
+                if (ret == 0)
+                        ret = err;
+        }
 ---
 </pre>
 </ul>
@@ -1824,22 +2454,22 @@ Well, a normal case that flush out the time fields of inode should be in iput()
 <pre>
 void iput(struct inode *inode)
 {
-    if (!inode)
-        return;
-    BUG_ON(inode->i_state & I_CLEAR);
+        if (!inode)
+                return;
+        BUG_ON(inode->i_state & I_CLEAR);
 retry:
-    if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
-        if (inode->i_nlink && (inode->i_state & I_DIRTY_TIME)) {
-            atomic_inc(&inode->i_count);
-            spin_unlock(&inode->i_lock);
-            trace_writeback_lazytime_iput(inode);
+        if (atomic_dec_and_lock(&inode->i_count, &inode->i_lock)) {
+                if (inode->i_nlink && (inode->i_state & I_DIRTY_TIME)) {
+                        atomic_inc(&inode->i_count);
+                        spin_unlock(&inode->i_lock);
+                        trace_writeback_lazytime_iput(inode);
 <font color="red">
-            mark_inode_dirty_sync(inode);
+                        mark_inode_dirty_sync(inode);
 </font>
-            goto retry;
+                        goto retry;
+                }
+                iput_final(inode);
         }
-        iput_final(inode);
-    }
 }
 </pre>
 </font>
@@ -1850,15 +2480,15 @@ retry:
 <font size="2">
 Where is the inode cache ?<br/>
 <pre>
-    inode_hashtable =
-        alloc_large_system_hash("Inode-cache",
-                    sizeof(struct hlist_head),
-                    ihash_entries,
-                    14,
-                    HASH_ZERO,
-                    &i_hash_shift,
-                    &i_hash_mask,
-                    0
+        inode_hashtable =
+                alloc_large_system_hash("Inode-cache",
+                                        sizeof(struct hlist_head),
+                                        ihash_entries,
+                                        14,
+                                        HASH_ZERO,
+                                        &i_hash_shift,
+                                        &i_hash_mask,
+                                        0
 </pre>
 The inode would be inserted into this hash table to be looked up quickly.
 <ul>
@@ -1877,7 +2507,7 @@ a generalized version of iget_locked() for file systems where the inode
 number is not sufficient for unique identification of an inode.
 </font>
 inode_insert5 <- iget5_locked()
-              <- insert_inode_locked4()
+                            <- insert_inode_locked4()
 
 __insert_inode_hash() <- insert_inode_hash()
 </pre>
@@ -1887,100 +2517,100 @@ A very common code path should be,
 ext4_lookup()
 ---
 <font color="blue">
-    //Try to lookup the file in directory entry
+        //Try to lookup the file in directory entry
 </font>
-    bh = ext4_lookup_entry(dir, dentry, &de);
-    if (bh) {
-        __u32 ino = le32_to_cpu(de->inode);
-        brelse(bh);
-        ...
+        bh = ext4_lookup_entry(dir, dentry, &de);
+        if (bh) {
+                __u32 ino = le32_to_cpu(de->inode);
+                brelse(bh);
+                ...
 <font color="blue">
-        // Get a valid inode id, try to get the inode for it
+                // Get a valid inode id, try to get the inode for it
 </font>
-        inode = ext4_iget(dir->i_sb, ino, EXT4_IGET_NORMAL);
-          -> __ext4_iget()
-          ---
-            inode = iget_locked(sb, ino);
-            ...
+                inode = ext4_iget(dir->i_sb, ino, EXT4_IGET_NORMAL);
+                    -> __ext4_iget()
+                    ---
+                        inode = iget_locked(sb, ino);
+                        ...
 <font color="blue">
-            // It is cached in inode cache
+                        // It is cached in inode cache
 </font>
-            if (!(inode->i_state & I_NEW))
-                return inode;
+                        if (!(inode->i_state & I_NEW))
+                                return inode;
 
-            ei = EXT4_I(inode);
-            iloc.bh = NULL;
+                        ei = EXT4_I(inode);
+                        iloc.bh = NULL;
 <font color="blue">
-            // Get the inode on disk
+                        // Get the inode on disk
 </font>
-            ret = __ext4_get_inode_loc_noinmem(inode, &iloc);
-            ...
-            raw_inode = ext4_raw_inode(&iloc);
-          ---
+                        ret = __ext4_get_inode_loc_noinmem(inode, &iloc);
+                        ...
+                        raw_inode = ext4_raw_inode(&iloc);
+                    ---
 ---
 </pre>
 </ul>
 Some filesystems, such as xfs, maintain a inode cache itself.
 <pre>
 xfs_lookup()
-  -> xfs_dir_lookup()
-  -> xfs_iget()
-  ---
+    -> xfs_dir_lookup()
+    -> xfs_iget()
+    ---
 <font color="blue">
-    // See it ? this is a fs private inode cache and it is more scalable
+        // See it ? this is a fs private inode cache and it is more scalable
 </font>
-    pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ino));
-    agino = XFS_INO_TO_AGINO(mp, ino);
+        pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ino));
+        agino = XFS_INO_TO_AGINO(mp, ino);
 
 again:
-    error = 0;
-    rcu_read_lock();
-    ip = radix_tree_lookup(&pag->pag_ici_root, agino);
+        error = 0;
+        rcu_read_lock();
+        ip = radix_tree_lookup(&pag->pag_ici_root, agino);
 
-    if (ip) {
-        error = xfs_iget_cache_hit(pag, ip, ino, flags, lock_flags);
-        ...
-    } else {
-        rcu_read_unlock();
-        ...
-
-        error = xfs_iget_cache_miss(mp, pag, tp, ino, &ip,
-                            flags, lock_flags);
-                            
-        ...
-        ---
-<font color="blue">
-        // Allocate xfs_inode where a vfs inode is embedded in
-</font>
-        ip = xfs_inode_alloc(mp, ino);
-        ...
+        if (ip) {
+                error = xfs_iget_cache_hit(pag, ip, ino, flags, lock_flags);
+                ...
         } else {
-<font color="blue">
-            // get the xfs_buf for this inode
-</font>
-            error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &bp, 0);
-<font color="blue">
-            // fill the inode with data on disk
-</font>
-            error = xfs_inode_from_disk(ip, dip);
-            xfs_trans_brelse(tp, bp);
-        }
-        ...
-<font color="red">
-        iflags = XFS_INEW;
-</font>
-        if (flags & XFS_IGET_DONTCACHE)
-            d_mark_dontcache(VFS_I(ip));
-        xfs_iflags_set(ip, iflags);
+                rcu_read_unlock();
+                ...
 
-        /* insert the new inode */
-        spin_lock(&pag->pag_ici_lock);
-        error = radix_tree_insert(&pag->pag_ici_root, agino, ip);
-        spin_unlock(&pag->pag_ici_lock);
-        ---
-    }
-    xfs_perag_put(pag);
-  ---
+                error = xfs_iget_cache_miss(mp, pag, tp, ino, &ip,
+                                                        flags, lock_flags);
+                                                        
+                ...
+                ---
+<font color="blue">
+                // Allocate xfs_inode where a vfs inode is embedded in
+</font>
+                ip = xfs_inode_alloc(mp, ino);
+                ...
+                } else {
+<font color="blue">
+                        // get the xfs_buf for this inode
+</font>
+                        error = xfs_imap_to_bp(mp, tp, &ip->i_imap, &dip, &bp, 0);
+<font color="blue">
+                        // fill the inode with data on disk
+</font>
+                        error = xfs_inode_from_disk(ip, dip);
+                        xfs_trans_brelse(tp, bp);
+                }
+                ...
+<font color="red">
+                iflags = XFS_INEW;
+</font>
+                if (flags & XFS_IGET_DONTCACHE)
+                        d_mark_dontcache(VFS_I(ip));
+                xfs_iflags_set(ip, iflags);
+
+                /* insert the new inode */
+                spin_lock(&pag->pag_ici_lock);
+                error = radix_tree_insert(&pag->pag_ici_root, agino, ip);
+                spin_unlock(&pag->pag_ici_lock);
+                ---
+        }
+        xfs_perag_put(pag);
+    ---
 </pre>
 Another thing need to be talked is the way to reclaim indoe cache
 <ul>
@@ -1990,74 +2620,74 @@ Another thing need to be talked is the way to reclaim indoe cache
 <B>For xfs</B>
 
 iput()
-  -> iput_final()
-  ---
-    if (op->drop_inode)
-        drop = op->drop_inode(inode);
-    else
-        drop = generic_drop_inode(inode);
+    -> iput_final()
+    ---
+        if (op->drop_inode)
+                drop = op->drop_inode(inode);
+        else
+                drop = generic_drop_inode(inode);
 <font color="blue">
-    // In generic_drop_inode, there are 3 conditions,
-    //  - !inode->i_nlink, means the file or hardlink have been cut off
-    //  - inode_unhashed(), means this inode is not in inode hash table
-          <font color="red">for xfs, this true,</font> because it use inode cache of its own
-    //  - I_DONTCACHE
+        // In generic_drop_inode, there are 3 conditions,
+        //    - !inode->i_nlink, means the file or hardlink have been cut off
+        //    - inode_unhashed(), means this inode is not in inode hash table
+                    <font color="red">for xfs, this true,</font> because it use inode cache of its own
+        //    - I_DONTCACHE
 </font>
-    if (!drop && (sb->s_flags & SB_ACTIVE)) {
-        inode_add_lru(inode);
+        if (!drop && (sb->s_flags & SB_ACTIVE)) {
+                inode_add_lru(inode);
+                spin_unlock(&inode->i_lock);
+                return;
+        }
+        ...
+        WRITE_ONCE(inode->i_state, state | I_FREEING);
+        if (!list_empty(&inode->i_lru))
+                inode_lru_list_del(inode);
         spin_unlock(&inode->i_lock);
-        return;
-    }
-    ...
-    WRITE_ONCE(inode->i_state, state | I_FREEING);
-    if (!list_empty(&inode->i_lru))
-        inode_lru_list_del(inode);
-    spin_unlock(&inode->i_lock);
 
-    evict(inode);
-  ---
+        evict(inode);
+    ---
 evict()
-  -> destroy_inode()
-    -> sb ops->destroy_inode()
-       xfs_fs_destroy_inode()
-         -> xfs_inactive() //<font color="blue">Won't do more because i_nlink is not zero</font>>
-         -> xfs_inode_set_reclaim_tag()
-         --
-             xfs_perag_set_reclaim_tag(pag);
-<font color="red">            __xfs_iflags_set(ip, XFS_IRECLAIMABLE);</font>
-         --
+    -> destroy_inode()
+        -> sb ops->destroy_inode()
+             xfs_fs_destroy_inode()
+                 -> xfs_inactive() //<font color="blue">Won't do more because i_nlink is not zero</font>>
+                 -> xfs_inode_set_reclaim_tag()
+                 --
+                         xfs_perag_set_reclaim_tag(pag);
+<font color="red">                        __xfs_iflags_set(ip, XFS_IRECLAIMABLE);</font>
+                 --
 
 This XFS_IRECLAIMABLE will be handled by
 xfs_iget_cache_hit()
 ---
 <font color="blue">
-    /*
-     * If IRECLAIMABLE is set, we've torn down the VFS inode already.
-     * Need to carefully get it back into useable state.
-     */
+        /*
+         * If IRECLAIMABLE is set, we've torn down the VFS inode already.
+         * Need to carefully get it back into useable state.
+         */
 </font>
-    if (ip->i_flags & XFS_IRECLAIMABLE) {
-        ...
-    }
+        if (ip->i_flags & XFS_IRECLAIMABLE) {
+                ...
+        }
 ---
 <B>For normal</B>
 prune_icache_sb()
-  -> inode_lru_isolate()
-  ---
+    -> inode_lru_isolate()
+    ---
 <font color="blue">
-    /*
-     * Referenced or dirty inodes are still in use. Give them another pass
-     * through the LRU as we canot reclaim them now.
-     */
+        /*
+         * Referenced or dirty inodes are still in use. Give them another pass
+         * through the LRU as we canot reclaim them now.
+         */
 </font>
-    if (atomic_read(&inode->i_count) ||
-        (inode->i_state & ~I_REFERENCED)) {
-        list_lru_isolate(lru, &inode->i_lru);
-        spin_unlock(&inode->i_lock);
-        this_cpu_dec(nr_unused);
-        return LRU_REMOVED;
-    }
-  ---
+        if (atomic_read(&inode->i_count) ||
+                (inode->i_state & ~I_REFERENCED)) {
+                list_lru_isolate(lru, &inode->i_lru);
+                spin_unlock(&inode->i_lock);
+                this_cpu_dec(nr_unused);
+                return LRU_REMOVED;
+        }
+    ---
 </pre>
 </ul>
 </font>
@@ -2073,91 +2703,91 @@ prune_icache_sb()
 <pre>
 prune_dcache_sb()
 ---
-    freed = list_lru_shrink_walk(&sb->s_dentry_lru, sc,
-                     <font color="red">dentry_lru_isolate</font>, &dispose);
-<font color="red">    shrink_dentry_list(&dispose);</font>
+        freed = list_lru_shrink_walk(&sb->s_dentry_lru, sc,
+                                         <font color="red">dentry_lru_isolate</font>, &dispose);
+<font color="red">        shrink_dentry_list(&dispose);</font>
 ---
 dentry_lru_isolate()
 ---
-    if (!spin_trylock(&dentry->d_lock))
-        return LRU_SKIP;
+        if (!spin_trylock(&dentry->d_lock))
+                return LRU_SKIP;
 <font color="blue">
-    /*
-     * Referenced dentries are still in use. If they have active
-     * counts, just remove them from the LRU. Otherwise give them
-     * another pass through the LRU.
-     */
+        /*
+         * Referenced dentries are still in use. If they have active
+         * counts, just remove them from the LRU. Otherwise give them
+         * another pass through the LRU.
+         */
 </font>
-    if (dentry->d_lockref.count) {
-        d_lru_isolate(lru, dentry);
+        if (dentry->d_lockref.count) {
+                d_lru_isolate(lru, dentry);
+                spin_unlock(&dentry->d_lock);
+                return LRU_REMOVED;
+        }
+
+        if (dentry->d_flags & DCACHE_REFERENCED) {
+                dentry->d_flags &= ~DCACHE_REFERENCED;
+                spin_unlock(&dentry->d_lock);
+                return LRU_ROTATE;
+        }
+
+        d_lru_shrink_move(lru, dentry, freeable);
         spin_unlock(&dentry->d_lock);
+
         return LRU_REMOVED;
-    }
-
-    if (dentry->d_flags & DCACHE_REFERENCED) {
-        dentry->d_flags &= ~DCACHE_REFERENCED;
-        spin_unlock(&dentry->d_lock);
-        return LRU_ROTATE;
-    }
-
-    d_lru_shrink_move(lru, dentry, freeable);
-    spin_unlock(&dentry->d_lock);
-
-    return LRU_REMOVED;
 ---
 
 shrink_dentry_list()
-  -> __dentry_kill()
-    -> __d_drop()
-      -> ___d_drop() //<font color="blue">remove the dentry from the hashtable</font>
-    -> dentry_free()
-      -> call_rcu(&dentry->d_u.d_rcu, __d_free);<font color="blue">Nothing will be freed under rcu_read_lock</font>
+    -> __dentry_kill()
+        -> __d_drop()
+            -> ___d_drop() //<font color="blue">remove the dentry from the hashtable</font>
+        -> dentry_free()
+            -> call_rcu(&dentry->d_u.d_rcu, __d_free);<font color="blue">Nothing will be freed under rcu_read_lock</font>
 </pre>
 <li> get and put
 <pre>
 dget()
 ---
-    if (dentry)
-        lockref_get(&dentry->d_lockref);
-    return dentry;
+        if (dentry)
+                lockref_get(&dentry->d_lockref);
+        return dentry;
 ---
 
 dput()
 ---
-    rcu_read_lock();
-        if (likely(fast_dput(dentry))) {
-            rcu_read_unlock();
-            return;
-        }
+        rcu_read_lock();
+                if (likely(fast_dput(dentry))) {
+                        rcu_read_unlock();
+                        return;
+                }
 <font color="blue">
-        /* Slow case: now with the dentry lock held */
+                /* Slow case: now with the dentry lock held */
 </font>
-        rcu_read_unlock();
+                rcu_read_unlock();
 
-        if (likely(retain_dentry(dentry))) {
-            spin_unlock(&dentry->d_lock);
-            return;
-        }
+                if (likely(retain_dentry(dentry))) {
+                        spin_unlock(&dentry->d_lock);
+                        return;
+                }
 
-        dentry = dentry_kill(dentry);
+                dentry = dentry_kill(dentry);
 ---
 retain_dentry()
 ---
 <font color="blue">
-    //vfs_unlink() -> __d_drop() could cause this.
+        //vfs_unlink() -> __d_drop() could cause this.
 </font>
-    if (unlikely(d_unhashed(dentry)))
-        return false;
-    ...
+        if (unlikely(d_unhashed(dentry)))
+                return false;
+        ...
 <font color="blue">
-    // Two rounds in lru
+        // Two rounds in lru
 </font>
-    dentry->d_lockref.count--;
-    if (unlikely(!(dentry->d_flags & DCACHE_LRU_LIST)))
-        d_lru_add(dentry);
-    else if (unlikely(!(dentry->d_flags & DCACHE_REFERENCED)))
-        dentry->d_flags |= DCACHE_REFERENCED;
-    return true;
+        dentry->d_lockref.count--;
+        if (unlikely(!(dentry->d_flags & DCACHE_LRU_LIST)))
+                d_lru_add(dentry);
+        else if (unlikely(!(dentry->d_flags & DCACHE_REFERENCED)))
+                dentry->d_flags |= DCACHE_REFERENCED;
+        return true;
 ---
 
 To prevent dentry from being reclaimed,
@@ -2177,29 +2807,29 @@ To prevent dentry from being reclaimed,
 do_filp_open()
 ---
 <font color="blue">
-    // Try to use LOOKUP_RCU first, if failed with ECHILD,
-    // try again w/o LOOKUP_RCU
+        // Try to use LOOKUP_RCU first, if failed with ECHILD,
+        // try again w/o LOOKUP_RCU
 </font>
-    filp = path_openat(&nd, op, flags | LOOKUP_RCU);
-    if (unlikely(filp == ERR_PTR(-ECHILD)))
-        filp = path_openat(&nd, op, flags)
+        filp = path_openat(&nd, op, flags | LOOKUP_RCU);
+        if (unlikely(filp == ERR_PTR(-ECHILD)))
+                filp = path_openat(&nd, op, flags)
 ---
 
 path_openat()
 ---
-        const char *s = path_init(nd, flags); //<font color="blue">rcu_read_lock is get here</font>
+                const char *s = path_init(nd, flags); //<font color="blue">rcu_read_lock is get here</font>
 <font color="blue">
-        /home/jianchwa/linux-stable/fs/dcache.c 
-        \____________ _______________/ \__ __/
-                     v                    v
-              link_path_walk()     open_last_lookups()
+                /home/jianchwa/linux-stable/fs/dcache.c 
+                \____________ _______________/ \__ __/
+                                         v                                        v
+                            link_path_walk()         open_last_lookups()
 </font>
-        while (!(error = link_path_walk(s, nd)) &&
-               (s = open_last_lookups(nd, file, op)) != NULL)
-            ;
-        if (!error)
-            error = do_open(nd, file, op); <font color="blue">// do the finally open</font>
-        terminate_walk(nd);
+                while (!(error = link_path_walk(s, nd)) &&
+                             (s = open_last_lookups(nd, file, op)) != NULL)
+                        ;
+                if (!error)
+                        error = do_open(nd, file, op); <font color="blue">// do the finally open</font>
+                terminate_walk(nd);
 
 ---
 </pre>
@@ -2207,119 +2837,119 @@ path_openat()
 <pre>
 There are 3 points here regarding to fast lookup
 (1) it is only to accelerate the dentry cache hit cases
-    if not hit, lookup would fallback to non-rcu mode
+        if not hit, lookup would fallback to non-rcu mode
 (2) dentry won't be freed during this but maybe killed
 (3) <U>sequence count is used to protect the lookup against rename</U>
 
 Regarding to the point 3,
 vfs_rename()
-  -> d_move()
-    -> __d_move()
-    ---
-    spin_lock_nested(&dentry->d_lock, 2);
-    spin_lock_nested(&target->d_lock, 3);
-    ...
-    write_seqcount_begin(&dentry->d_seq);
-    write_seqcount_begin_nested(&target->d_seq, DENTRY_D_LOCK_NESTED);
+    -> d_move()
+        -> __d_move()
+        ---
+        spin_lock_nested(&dentry->d_lock, 2);
+        spin_lock_nested(&target->d_lock, 3);
+        ...
+        write_seqcount_begin(&dentry->d_seq);
+        write_seqcount_begin_nested(&target->d_seq, DENTRY_D_LOCK_NESTED);
 
-    /* unhash both */
-    if (!d_unhashed(dentry))
-        ___d_drop(dentry);
-    if (!d_unhashed(target))
-        ___d_drop(target);
+        /* unhash both */
+        if (!d_unhashed(dentry))
+                ___d_drop(dentry);
+        if (!d_unhashed(target))
+                ___d_drop(target);
 
-    /* ... and switch them in the tree */
-    dentry->d_parent = target->d_parent;
-    if (!exchange) {
-        copy_name(dentry, target);
-        target->d_hash.pprev = NULL;
-        dentry->d_parent->d_lockref.count++;
-        if (dentry != old_parent) /* wasn't IS_ROOT */
-            WARN_ON(!--old_parent->d_lockref.count);
-    }
-    ...
-    list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
-    __d_rehash(dentry);
-    ...
-    write_seqcount_end(&target->d_seq);
-    write_seqcount_end(&dentry->d_seq);
-    ---
+        /* ... and switch them in the tree */
+        dentry->d_parent = target->d_parent;
+        if (!exchange) {
+                copy_name(dentry, target);
+                target->d_hash.pprev = NULL;
+                dentry->d_parent->d_lockref.count++;
+                if (dentry != old_parent) /* wasn't IS_ROOT */
+                        WARN_ON(!--old_parent->d_lockref.count);
+        }
+        ...
+        list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+        __d_rehash(dentry);
+        ...
+        write_seqcount_end(&target->d_seq);
+        write_seqcount_end(&dentry->d_seq);
+        ---
 
 __d_lookup_rcu()
 ---
-    hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
-        unsigned seq;
+        hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
+                unsigned seq;
 
 seqretry:
 <font color="blue">
-        /*
-         * The dentry sequence count protects us from concurrent
-         * renames, and thus protects parent and name fields.
-         * Otherwise, we may get a wrong entry, for example,
-         * during rename /home/will/aaaa to /home/will/bbbb,
-         * we could get baaa, bbaa, bbba, and if these files
-         * do exist, look up is screwed up.
-         */
+                /*
+                 * The dentry sequence count protects us from concurrent
+                 * renames, and thus protects parent and name fields.
+                 * Otherwise, we may get a wrong entry, for example,
+                 * during rename /home/will/aaaa to /home/will/bbbb,
+                 * we could get baaa, bbaa, bbba, and if these files
+                 * do exist, look up is screwed up.
+                 */
 </font>
-        seq = raw_seqcount_begin(&dentry->d_seq);
-        if (dentry->d_parent != parent)
-            continue;
-        if (d_unhashed(dentry))
-            continue;
+                seq = raw_seqcount_begin(&dentry->d_seq);
+                if (dentry->d_parent != parent)
+                        continue;
+                if (d_unhashed(dentry))
+                        continue;
 
-        if (unlikely(parent->d_flags & DCACHE_OP_COMPARE)) {
-            ...
-        } else {
-            if (dentry->d_name.hash_len != hashlen)
-                continue;
-            if (dentry_cmp(dentry, str, hashlen_len(hashlen)) != 0)
-                continue;
+                if (unlikely(parent->d_flags & DCACHE_OP_COMPARE)) {
+                        ...
+                } else {
+                        if (dentry->d_name.hash_len != hashlen)
+                                continue;
+                        if (dentry_cmp(dentry, str, hashlen_len(hashlen)) != 0)
+                                continue;
+                }
+                *seqp = seq;
+                return dentry;
         }
-        *seqp = seq;
-        return dentry;
-    }
 ---
 
 lookup_fast()
 ---
-    if (nd->flags & LOOKUP_RCU) {
-        unsigned seq;
-        dentry = __d_lookup_rcu(parent, &nd->last, &seq);
-        ...
-        *inode = d_backing_inode(dentry);
-        if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
-            return ERR_PTR(-ECHILD);
+        if (nd->flags & LOOKUP_RCU) {
+                unsigned seq;
+                dentry = __d_lookup_rcu(parent, &nd->last, &seq);
+                ...
+                *inode = d_backing_inode(dentry);
+                if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
+                        return ERR_PTR(-ECHILD);
 <font color="blue">
-        /*
-         * This sequence count validates that the parent had no
-         * changes while we did the lookup of the dentry above.
-         */
+                /*
+                 * This sequence count validates that the parent had no
+                 * changes while we did the lookup of the dentry above.
+                 */
 
-         Why do we need to care about the parent ?
-         renaming of the parent won't influence the childrens, right ?
+                 Why do we need to care about the parent ?
+                 renaming of the parent won't influence the childrens, right ?
 </font>
-        if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
-            return ERR_PTR(-ECHILD);
+                if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
+                        return ERR_PTR(-ECHILD);
 
-        *seqp = seq;
-        status = d_revalidate(dentry, nd->flags);
-        if (likely(status > 0))
-            return dentry;
-    }
+                *seqp = seq;
+                status = d_revalidate(dentry, nd->flags);
+                if (likely(status > 0))
+                        return dentry;
+        }
 ---
 
 Before the finally open, we would recheck the sequence count,
 do_open()
-  -> complete_walk()
-    -> unlazy_walk()
-      -> legitimize_path()
-           ---
-            if (unlikely(!lockref_get_not_dead(&path->dentry->d_lockref))) {
-                path->dentry = NULL;
-                return false;
-            }
-            return !read_seqcount_retry(&path->dentry->d_seq, seq);
-          ---
+    -> complete_walk()
+        -> unlazy_walk()
+            -> legitimize_path()
+                     ---
+                        if (unlikely(!lockref_get_not_dead(&path->dentry->d_lockref))) {
+                                path->dentry = NULL;
+                                return false;
+                        }
+                        return !read_seqcount_retry(&path->dentry->d_seq, seq);
+                    ---
 </pre>
 </ul>
 </font>
@@ -2331,20 +2961,20 @@ do_open()
 The main points that dcache interacts with filesystem
 <pre>
 link_path_walk()
-  -> walk_component()
-    -> lookup_slow()
-      -> inode_lock_shared()
-      -> __lookup_slow()
-        -> d_alloc_parallel() //<font color="blue">allocate a dentry structure</font>
-<font color="red">        -> inode->i_op->lookup()</font>
+    -> walk_component()
+        -> lookup_slow()
+            -> inode_lock_shared()
+            -> __lookup_slow()
+                -> d_alloc_parallel() //<font color="blue">allocate a dentry structure</font>
+<font color="red">                -> inode->i_op->lookup()</font>
 <font color="blue">
-          look up dentry in metadata,
-          do d_add() if found which would add dentry into dcache hashtable             
+                    look up dentry in metadata,
+                    do d_add() if found which would add dentry into dcache hashtable                         
 </font>
 open_last_lookups()
-  -> lookup_open()
-    -> d_lookup() //<font color="blue">do look up under rename raed seqlock</font>
-    -> dir_inode->i_op->create() //<font color="blue">do create if needed</font>
+    -> lookup_open()
+        -> d_lookup() //<font color="blue">do look up under rename raed seqlock</font>
+        -> dir_inode->i_op->create() //<font color="blue">do create if needed</font>
 
 </pre>
 </font>
@@ -2362,28 +2992,28 @@ When is the dentry inserted to the dentry_hashtable ?<br/>
 When the file does not exist,
 lookup_open()
 <font color="blue">
-  // allocate dentry structure with d_alloc()
+    // allocate dentry structure with d_alloc()
 </font>
-  -> d_alloc_parallel()
-  -> dir_inode->i_op->lookup()
-     ext2_lookup()
-       -> ext2_inode_by_name() <font color="blue">//not found at this moment</font>
-       -> d_splice_alias() <font color="blue">//inode is NULL at this moment</font>
-  -> dir_inode->i_op->create()
-     ext2_create()
-       -> ext2_add_nondir()
-         -> d_instantiate_new()
-           -> d_instantiate() //fill inode information for a dentry
+    -> d_alloc_parallel()
+    -> dir_inode->i_op->lookup()
+         ext2_lookup()
+             -> ext2_inode_by_name() <font color="blue">//not found at this moment</font>
+             -> d_splice_alias() <font color="blue">//inode is NULL at this moment</font>
+    -> dir_inode->i_op->create()
+         ext2_create()
+             -> ext2_add_nondir()
+                 -> d_instantiate_new()
+                     -> d_instantiate() //fill inode information for a dentry
 </pre>
 <li> lookup
 <pre>
 When the file exists,
 lookup_slow()
-  -> ext2_lookup()
-    -> d_splice_alias()
-      -> __d_add()
-        -> __d_set_inode_and_type() // install the inode into the dentry
-          -> __d_rehash()
+    -> ext2_lookup()
+        -> d_splice_alias()
+            -> __d_add()
+                -> __d_set_inode_and_type() // install the inode into the dentry
+                    -> __d_rehash()
 </pre>
 </ul>
 </font>
@@ -2410,14 +3040,14 @@ See shmem_get_inode()
 An important thing is the dentry of this inode will be pined in memory
 shmem_mknod()
 ---
-    inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE);
-    if (inode) {
-        ...
-        dir->i_size += BOGO_DIRENT_SIZE;
-        dir->i_ctime = dir->i_mtime = current_time(dir);
-        d_instantiate(dentry, inode);
-        dget(dentry); /* Extra count - pin the dentry in core */
-    }
+        inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE);
+        if (inode) {
+                ...
+                dir->i_size += BOGO_DIRENT_SIZE;
+                dir->i_ctime = dir->i_mtime = current_time(dir);
+                d_instantiate(dentry, inode);
+                dget(dentry); /* Extra count - pin the dentry in core */
+        }
 ---
 <font color="red">
 The dentry for the inode will be perserved in dcache until it is deleted
@@ -2429,14 +3059,15 @@ An in-core dentry points to the linked inode
 
 shmem_link()
 ---
-    dir->i_size += BOGO_DIRENT_SIZE;
-    inode->i_ctime = dir->i_ctime = dir->i_mtime = current_time(inode);
-    inc_nlink(inode);
-    ihold(inode);    /* New dentry reference */
-    dget(dentry);<font color="blue">        /* Extra pinning count for the created dentry */</font>
-    d_instantiate(dentry, inode);
+        dir->i_size += BOGO_DIRENT_SIZE;
+        inode->i_ctime = dir->i_ctime = dir->i_mtime = current_time(inode);
+        inc_nlink(inode);
+        ihold(inode);        /* New dentry reference */
+        dget(dentry);<font color="blue">                /* Extra pinning count for the created dentry */</font>
+        d_instantiate(dentry, inode);
 ---
 </pre>
+</ul>
 </font>
 </p>
 
@@ -2450,41 +3081,41 @@ Let's take some relatively simple examples,
 <pre>
 <li><B>log format (record)</B>
 xfs_inode_item_ops.xfs_inode_item_format()
-  -> xfs_inode_item_format_core()
-    -> xfs_inode_to_log_dinode_ts()
-      -> copy the in-memory inode to <font color="red">xfs_log_dinode</font>
+    -> xfs_inode_item_format_core()
+        -> xfs_inode_to_log_dinode_ts()
+            -> copy the in-memory inode to <font color="red">xfs_log_dinode</font>
 
 Note ! <font color="red">the modifications are not applied on the inode cluster xfs buffer.</font>
 <li><B>log push (checkpoint)</B>
 xfs_inode_item_push()
 ---
-    if (xfs_ipincount(ip) > 0 || xfs_buf_ispinned(bp) ||
-        (ip->i_flags & XFS_ISTALE))
-        return XFS_ITEM_PINNED;
+        if (xfs_ipincount(ip) > 0 || xfs_buf_ispinned(bp) ||
+                (ip->i_flags & XFS_ISTALE))
+                return XFS_ITEM_PINNED;
 
-    if (xfs_iflags_test(ip, XFS_IFLUSHING))
-        return XFS_ITEM_FLUSHING;
+        if (xfs_iflags_test(ip, XFS_IFLUSHING))
+                return XFS_ITEM_FLUSHING;
 <font color="blue">
-    // cluster buffer need to be locked during IO
+        // cluster buffer need to be locked during IO
 </font>
-    if (!xfs_buf_trylock(bp))
-        return XFS_ITEM_LOCKED;
+        if (!xfs_buf_trylock(bp))
+                return XFS_ITEM_LOCKED;
 
-    spin_unlock(&lip->li_ailp->ail_lock);
+        spin_unlock(&lip->li_ailp->ail_lock);
 
-    xfs_buf_hold(bp);
+        xfs_buf_hold(bp);
 <font color="blue">
-    // flush the dirty inodes into cluster buffer
+        // flush the dirty inodes into cluster buffer
 </font>
-    error = xfs_iflush_cluster(bp);
-    if (!error) {
+        error = xfs_iflush_cluster(bp);
+        if (!error) {
 <font color="blue">
-    // queue the cluster buffer to delayed write queue
+        // queue the cluster buffer to delayed write queue
 </font>
-        if (!xfs_buf_delwri_queue(bp, buffer_list))
-            rval = XFS_ITEM_FLUSHING;
-        xfs_buf_relse(bp);
-    }
+                if (!xfs_buf_delwri_queue(bp, buffer_list))
+                        rval = XFS_ITEM_FLUSHING;
+                xfs_buf_relse(bp);
+        }
 
 ---
 </pre>
@@ -2492,104 +3123,104 @@ xfs_inode_item_push()
 <pre>
 <li><B>log format (record)</B>
 xfs_item_ops.xfs_buf_item_format()
-  -> xfs_buf_item_format_segment()
-  ---
-    for (;;) {
+    -> xfs_buf_item_format_segment()
+    ---
+        for (;;) {
 <font color="blue">
-        //The bitmap here describes which 128 bytes chunks of the buffer have
-        // been dirtied. This is done by
-        // xfs_trans_log_buf()
-        //   -> xfs_buf_item_log()
-        //     -> xfs_buf_item_log_segment()_
+                //The bitmap here describes which 128 bytes chunks of the buffer have
+                // been dirtied. This is done by
+                // xfs_trans_log_buf()
+                //     -> xfs_buf_item_log()
+                //         -> xfs_buf_item_log_segment()_
 </font>
-        next_bit = xfs_next_bit(blfp->blf_data_map, blfp->blf_map_size,
-                    (uint)last_bit + 1);
-        if (next_bit == -1) {
-            xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
-                        first_bit, nbits);
-            blfp->blf_size++;
-            break;
-        } else if (next_bit != last_bit + 1 ||
-                   xfs_buf_item_straddle(bp, offset, next_bit, last_bit)) {
-            xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
-                        first_bit, nbits);
-            blfp->blf_size++;
-            first_bit = next_bit;
-            last_bit = next_bit;
-            nbits = 1;
-        } else {
-            last_bit++;
-            nbits++;
+                next_bit = xfs_next_bit(blfp->blf_data_map, blfp->blf_map_size,
+                                        (uint)last_bit + 1);
+                if (next_bit == -1) {
+                        xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
+                                                first_bit, nbits);
+                        blfp->blf_size++;
+                        break;
+                } else if (next_bit != last_bit + 1 ||
+                                     xfs_buf_item_straddle(bp, offset, next_bit, last_bit)) {
+                        xfs_buf_item_copy_iovec(lv, vecp, bp, offset,
+                                                first_bit, nbits);
+                        blfp->blf_size++;
+                        first_bit = next_bit;
+                        last_bit = next_bit;
+                        nbits = 1;
+                } else {
+                        last_bit++;
+                        nbits++;
+                }
         }
-    }
 <font color="red">
 See it !? modifications are made into xfs buffer directly.
 And we will see that the push just add the xfs buffer into the del write queue.
 </font>
-  ---
+    ---
 <li><B>log push(checkpoint)</B>
 xfsaild_push()
-  -> xfsaild_push_item()
-    -> lip->li_ops->iop_push()
-       xfs_buf_item_push()
-       ---
-        if (xfs_buf_ispinned(bp))
-            return XFS_ITEM_PINNED;
-        if (!xfs_buf_trylock(bp)) {
-            if (xfs_buf_ispinned(bp))
-                return XFS_ITEM_PINNED;
-            return XFS_ITEM_LOCKED;
-        }
+    -> xfsaild_push_item()
+        -> lip->li_ops->iop_push()
+             xfs_buf_item_push()
+             ---
+                if (xfs_buf_ispinned(bp))
+                        return XFS_ITEM_PINNED;
+                if (!xfs_buf_trylock(bp)) {
+                        if (xfs_buf_ispinned(bp))
+                                return XFS_ITEM_PINNED;
+                        return XFS_ITEM_LOCKED;
+                }
 <font color="red">
-        if (!xfs_buf_delwri_queue(bp, buffer_list))
+                if (!xfs_buf_delwri_queue(bp, buffer_list))
 </font>
-            rval = XFS_ITEM_FLUSHING;
-        xfs_buf_unlock(bp);
-       ---
-  -> xfs_buf_delwri_submit_nowait()
-    -> xfs_buf_delwri_submit_buffers()
-    ---
-    list_sort(NULL, buffer_list, xfs_buf_cmp);
+                        rval = XFS_ITEM_FLUSHING;
+                xfs_buf_unlock(bp);
+             ---
+    -> xfs_buf_delwri_submit_nowait()
+        -> xfs_buf_delwri_submit_buffers()
+        ---
+        list_sort(NULL, buffer_list, xfs_buf_cmp);
 
-    blk_start_plug(&plug);
-    list_for_each_entry_safe(bp, n, buffer_list, b_list) {
+        blk_start_plug(&plug);
+        list_for_each_entry_safe(bp, n, buffer_list, b_list) {
 <font color="blue">
-    // The buf could be pinned and locked by new writing
-    // During the whole IO, the xfs buf is locked.
-       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        // The buf could be pinned and locked by new writing
+        // During the whole IO, the xfs buf is locked.
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 </font>
-        if (!wait_list) {
-            if (xfs_buf_ispinned(bp)) {
-                pinned++;
-                continue;
-            }
-            if (!xfs_buf_trylock(bp))
-                continue;
-        }
-        ...
-        bp->b_flags &= ~_XBF_DELWRI_Q;
-        bp->b_flags |= XBF_WRITE;
-        if (wait_list) {
-            ...
-        } else {
-            bp->b_flags |= XBF_ASYNC;
-            list_del_init(&bp->b_list);
-        }
-        __xfs_buf_submit(bp, false);
+                if (!wait_list) {
+                        if (xfs_buf_ispinned(bp)) {
+                                pinned++;
+                                continue;
+                        }
+                        if (!xfs_buf_trylock(bp))
+                                continue;
+                }
+                ...
+                bp->b_flags &= ~_XBF_DELWRI_Q;
+                bp->b_flags |= XBF_WRITE;
+                if (wait_list) {
+                        ...
+                } else {
+                        bp->b_flags |= XBF_ASYNC;
+                        list_del_init(&bp->b_list);
+                }
+                __xfs_buf_submit(bp, false);
 <font color="blue">
-        // bio->bi_end_io = xfs_buf_bio_end_io
+                // bio->bi_end_io = xfs_buf_bio_end_io
 </font>
-    }
-    blk_finish_plug(&plug);
-    ---
+        }
+        blk_finish_plug(&plug);
+        ---
 
 xfs_buf_bio_end_io()
-  -> xfs_buf_ioend_async()
-    -> queue_work xfs_buf_ioend_work()
-      -> xfs_buf_ioend()
-        -> xfs_buf_item_done() //<font color="blue">log item is freed here under xfs buf lock</font>
-        -> xfs_buf_relse()
-          -> xfs_buf_unlock()
+    -> xfs_buf_ioend_async()
+        -> queue_work xfs_buf_ioend_work()
+            -> xfs_buf_ioend()
+                -> xfs_buf_item_done() //<font color="blue">log item is freed here under xfs buf lock</font>
+                -> xfs_buf_relse()
+                    -> xfs_buf_unlock()
 </pre>
 </ul>
 </font>
@@ -2600,67 +3231,67 @@ xfs_buf_bio_end_io()
 <font size="2">
 iclog ring and state machine
 <pre>
-      .-->                                       
-     /   ---
-       /     \
-      | iclog |
-       \     /
-         ---  /
-          <--''                      -->
+            .-->                                                                             
+         /     ---
+             /         \
+            | iclog |
+             \         /
+                 ---    /
+                    <--''                                            -->
 |------------------------------------------------|
-           physical log space
+                     physical log space
 
 The iclog has two parameters,
-l_iclog_bufs      8
-l_iclog_size      32K (max 256K)
+l_iclog_bufs            8
+l_iclog_size            32K (max 256K)
 
 iclog is allocated in xlog_alloc_log()
 ---
-    for (i = 0; i < log->l_iclog_bufs; i++) {
-        int align_mask = xfs_buftarg_dma_alignment(mp->m_logdev_targp);
-        size_t bvec_size = howmany(log->l_iclog_size, PAGE_SIZE) *
-                sizeof(struct bio_vec);
+        for (i = 0; i < log->l_iclog_bufs; i++) {
+                int align_mask = xfs_buftarg_dma_alignment(mp->m_logdev_targp);
+                size_t bvec_size = howmany(log->l_iclog_size, PAGE_SIZE) *
+                                sizeof(struct bio_vec);
 
-        iclog = kmem_zalloc(sizeof(*iclog) + bvec_size, KM_MAYFAIL);
-        ...    
-        iclog->ic_data = kmem_alloc_io(log->l_iclog_size, align_mask,
-                        KM_MAYFAIL | KM_ZERO);
-        ...
-        iclog->ic_size = log->l_iclog_size - log->l_iclog_hsize;
-        iclog->ic_state = XLOG_STATE_ACTIVE;
-        ...
+                iclog = kmem_zalloc(sizeof(*iclog) + bvec_size, KM_MAYFAIL);
+                ...        
+                iclog->ic_data = kmem_alloc_io(log->l_iclog_size, align_mask,
+                                                KM_MAYFAIL | KM_ZERO);
+                ...
+                iclog->ic_size = log->l_iclog_size - log->l_iclog_hsize;
+                iclog->ic_state = XLOG_STATE_ACTIVE;
+                ...
 <font color="red">
-        // link all of the iclog in a ring
+                // link all of the iclog in a ring
 </font>
-        iclogp = &iclog->ic_next;
-    }
+                iclogp = &iclog->ic_next;
+        }
 ---
 
 The iclog in the ring will be employed one by one.
 And every iclog has a state machine works as following,
 
 XLOG_STATE_ACTIVE <font color="blue">Be able to receive log</font>
-  - xlog_alloc_log()
-  - xlog_state_do_callback()
-      -> xlog_state_clean_iclog()
-        -> xlog_state_activate_iclogs()
-          -> xlog_state_activate_iclog()
+    - xlog_alloc_log()
+    - xlog_state_do_callback()
+            -> xlog_state_clean_iclog()
+                -> xlog_state_activate_iclogs()
+                    -> xlog_state_activate_iclog()
 
 XLOG_STATE_WANT_SYNC
-  - xlog_state_switch_iclogs()
-  
+    - xlog_state_switch_iclogs()
+    
 XLOG_STATE_SYNCING
-  - xlog_state_release_iclog()
-      -> __xlog_state_release_iclog()
-      -> xlog_sync()
+    - xlog_state_release_iclog()
+            -> __xlog_state_release_iclog()
+            -> xlog_sync()
 
 XLOG_STATE_DONE_SYNC
-  - xlog_ioend_work()
-    -> xlog_state_done_syncing()
+    - xlog_ioend_work()
+        -> xlog_state_done_syncing()
 
 XLOG_STATE_CALLBACK
-  - xlog_state_done_syncing()
-    -> xlog_state_do_callback()
+    - xlog_state_done_syncing()
+        -> xlog_state_do_callback()
 
 </pre>
 
@@ -2668,11 +3299,11 @@ XLOG_STATE_CALLBACK
 <ul>
 <li> Transaction Format
 <pre>
-                 XLOG_REG_TYPE_TRANSHDR          XLOG_REG_TYPE_COMMIT
-                  |                                |
+                                 XLOG_REG_TYPE_TRANSHDR                    XLOG_REG_TYPE_COMMIT
+                                    |                                                                |
 < oph >< oph >< reg0 >< oph >< reg1 >< oph >...< regn >
-   |                            |
-  XLOG_START_TRANS             XLOG_REG_TYPE_ICORE
+     |                                                        |
+    XLOG_START_TRANS                         XLOG_REG_TYPE_ICORE
 
 </pre>
 <li> IO Format
@@ -2682,15 +3313,15 @@ The transaction above is carried by iclog when sent out to disk.
 Note !!! iclog is just used when issue IO. The log item is carried in anther place.
 xlog_write()
 ---
-            if (copy_len > 0) {
+                        if (copy_len > 0) {
 <font color="blue">
-                // The reg here is a xfs_log_iovec
-                // It will copy the data from xfs_log_iovec to iclog buffer
+                                // The reg here is a xfs_log_iovec
+                                // It will copy the data from xfs_log_iovec to iclog buffer
 </font>
-                memcpy(ptr, reg->i_addr + copy_off, copy_len);
-                xlog_write_adv_cnt(&ptr, &len, &log_offset,
-                           copy_len);
-            }
+                                memcpy(ptr, reg->i_addr + copy_off, copy_len);
+                                xlog_write_adv_cnt(&ptr, &len, &log_offset,
+                                                     copy_len);
+                        }
 ---
 
 The buffer carries log is allocated here,
@@ -2702,9 +3333,9 @@ xlog_rec_header_t.
 Every iclog contains a crc num.
 xlog_sync()
 ---
-    /* calculcate the checksum */
-    iclog->ic_header.h_crc = xlog_cksum(log, &iclog->ic_header,
-                        iclog->ic_datap, size)
+        /* calculcate the checksum */
+        iclog->ic_header.h_crc = xlog_cksum(log, &iclog->ic_header,
+                                                iclog->ic_datap, size)
 ---
 </pre>
 <li> Transaction Durability
@@ -2717,48 +3348,48 @@ There are two points here:
 The ctx is installed on the iclog->ic_callbacks where the commit record is written
 xlog_cil_push_work()
 ---
-    list_add_tail(&ctx->iclog_entry, &commit_iclog->ic_callbacks);
+        list_add_tail(&ctx->iclog_entry, &commit_iclog->ic_callbacks);
 ---
 xlog_state_do_callback() would ensure the commit callback is invoked by the order of iclog.
 <font color="red">
 This indicates that even if the commit record is not on the same iclog with its
-records (must be the one behind),  when the callback of commit record is invoked,
+records (must be the one behind),    when the callback of commit record is invoked,
 its records's IO have been completed.
 </font>
 
 xlog_state_do_callback()
 ---
-        do {
+                do {
 <font color="blue">
-                           ------------------->
-                                                  Loop start here
-                                                     ACTIVE
-                                                  Current Head   ACTIVE    ACTIVE   ACTIVE
-                                                        |
-                                                        v
-            // iclog0 -> iclog1 -> iclog2 -> iclog3 -> iclog4 -> iclog5 -> iclog6 -> iclog7
-                  ^        ^         ^         ^
-                  |        |         |         |
-               SYNCING   SYNC_DONE  SYNC_DONE SYNCING
-               [record]    [commit]
+                                                     ------------------->
+                                                                                                    Loop start here
+                                                                                                         ACTIVE
+                                                                                                    Current Head     ACTIVE        ACTIVE     ACTIVE
+                                                                                                                |
+                                                                                                                v
+                        // iclog0 -> iclog1 -> iclog2 -> iclog3 -> iclog4 -> iclog5 -> iclog6 -> iclog7
+                                    ^                ^                 ^                 ^
+                                    |                |                 |                 |
+                             SYNCING     SYNC_DONE    SYNC_DONE SYNCING
+                             [record]        [commit]
 </font>
-            if (xlog_state_iodone_process_iclog(log, iclog,
-                            &ioerror))
-                break;
-            ...
-            xlog_state_do_iclog_callbacks(log, iclog);
-            if (XLOG_FORCED_SHUTDOWN(log))
-                wake_up_all(&iclog->ic_force_wait);
-            else
-                xlog_state_clean_iclog(log, iclog);
-            iclog = iclog->ic_next;
-        } while (first_iclog != iclog);
+                        if (xlog_state_iodone_process_iclog(log, iclog,
+                                                        &ioerror))
+                                break;
+                        ...
+                        xlog_state_do_iclog_callbacks(log, iclog);
+                        if (XLOG_FORCED_SHUTDOWN(log))
+                                wake_up_all(&iclog->ic_force_wait);
+                        else
+                                xlog_state_clean_iclog(log, iclog);
+                        iclog = iclog->ic_next;
+                } while (first_iclog != iclog);
 ---
 <li> REQ_FUA
 xlog_write_iclog()
 ---
-    iclog->ic_bio.bi_opf = REQ_OP_WRITE | REQ_META | REQ_SYNC |
-                REQ_IDLE | REQ_FUA;
+        iclog->ic_bio.bi_opf = REQ_OP_WRITE | REQ_META | REQ_SYNC |
+                                REQ_IDLE | REQ_FUA;
 ---
 </ul>
 
@@ -2787,44 +3418,44 @@ shadow the original buffer_head to do the journal IO.
 
 jbd2_journal_write_metadata_buffer()
 ---
-    spin_lock(&jh_in->b_state_lock);
+        spin_lock(&jh_in->b_state_lock);
 repeat:
-    if (jh_in->b_frozen_data) {
+        if (jh_in->b_frozen_data) {
+                ...
+        } else {
+                new_page = jh2bh(jh_in)->b_page;
+                new_offset = offset_in_page(jh2bh(jh_in)->b_data);
+        }
         ...
-    } else {
-        new_page = jh2bh(jh_in)->b_page;
-        new_offset = offset_in_page(jh2bh(jh_in)->b_data);
-    }
-    ...
-    set_bh_page(new_bh, new_page, new_offset);
-    new_bh->b_size = bh_in->b_size;
-    new_bh->b_bdev = journal->j_dev;
-    new_bh->b_blocknr = blocknr;
-    new_bh->b_private = bh_in;
-    set_buffer_mapped(new_bh);
-    set_buffer_dirty(new_bh);
+        set_bh_page(new_bh, new_page, new_offset);
+        new_bh->b_size = bh_in->b_size;
+        new_bh->b_bdev = journal->j_dev;
+        new_bh->b_blocknr = blocknr;
+        new_bh->b_private = bh_in;
+        set_buffer_mapped(new_bh);
+        set_buffer_dirty(new_bh);
 
-    *bh_out = new_bh;
+        *bh_out = new_bh;
 
-    spin_lock(&journal->j_list_lock);
-    __jbd2_journal_file_buffer(jh_in, transaction, BJ_Shadow);
-    spin_unlock(&journal->j_list_lock);
+        spin_lock(&journal->j_list_lock);
+        __jbd2_journal_file_buffer(jh_in, transaction, BJ_Shadow);
+        spin_unlock(&journal->j_list_lock);
 <font color="red">
-    set_buffer_shadow(bh_in);
+        set_buffer_shadow(bh_in);
 </font>
-    spin_unlock(&jh_in->b_state_lock); //<font color="blue">Protect this journal buffer head</font>
+        spin_unlock(&jh_in->b_state_lock); //<font color="blue">Protect this journal buffer head</font>
 ---
 
 do_get_write_access()
 ---
-    spin_lock(&jh->b_state_lock);
-    ...
-    if (buffer_shadow(bh)) {
-        spin_unlock(&jh->b_state_lock);
-        wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
-        goto repeat;
-    }
-    ...
+        spin_lock(&jh->b_state_lock);
+        ...
+        if (buffer_shadow(bh)) {
+                spin_unlock(&jh->b_state_lock);
+                wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+                goto repeat;
+        }
+        ...
 ---
 <font color="red">
 A very important thing need to be noted is that the modification has been made in
@@ -2850,28 +3481,28 @@ T_A, T_B, T_C, T_D. And each of them need 3 sub-operations.
 Deferred Operations would complete this work as following,
 
 Intent log for T_A \
-Intent log for T_B  \ t0
-Intent log for T_C  /
+Intent log for T_B    \ t0
+Intent log for T_C    /
 Intent log for T_D /
 -------------------
-Done log for T_A  \
-Real log for T_A0  \ t1
-Real log for T_A1  /
+Done log for T_A    \
+Real log for T_A0    \ t1
+Real log for T_A1    /
 Real log for T_A2 /
 -------------------
-Done log for T_B  \
-Real log for T_B0  \ t2
-Real log for T_B1  /
+Done log for T_B    \
+Real log for T_B0    \ t2
+Real log for T_B1    /
 Real log for T_B2 /
 -------------------
-Done log for T_C  \
-Real log for T_C0  \ t4
-Real log for T_C1  /
+Done log for T_C    \
+Real log for T_C0    \ t4
+Real log for T_C1    /
 Real log for T_C2 /
 -------------------
-Done log for T_D  \
-Real log for T_D0  \ t5
-Real log for T_D1  /
+Done log for T_D    \
+Real log for T_D0    \ t5
+Real log for T_D1    /
 Real log for T_D2 /
 -------------------
 
@@ -2881,27 +3512,27 @@ xfs_defer_finish_noroll() is to carry out the work,
 <pre>
 xfs_defer_finish_noroll()
 ---
-    /* Until we run out of pending work to finish... */
-    while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+        /* Until we run out of pending work to finish... */
+        while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
 <font color="blue">
-        //Create intent log for every deferred_operations
+                //Create intent log for every deferred_operations
 </font>
-        xfs_defer_create_intents(*tp);
-        list_splice_init(&(*tp)->t_dfops, &dop_pending);
+                xfs_defer_create_intents(*tp);
+                list_splice_init(&(*tp)->t_dfops, &dop_pending);
 <font color="blue">
-        //Roll the transaction
+                //Roll the transaction
 </font>
-        error = xfs_defer_trans_roll(tp);
-        ...
-        dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
-                       dfp_list);
+                error = xfs_defer_trans_roll(tp);
+                ...
+                dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
+                                             dfp_list);
 <font color="blue">
-        //Pick a defered operation and finish it
-        // - create done
-        // - finish_item <font color="red">do the real work</font>
+                //Pick a defered operation and finish it
+                // - create done
+                // - finish_item <font color="red">do the real work</font>
 </font>
-        error = xfs_defer_finish_one(*tp, dfp);
-    }
+                error = xfs_defer_finish_one(*tp, dfp);
+        }
 ---
 </pre>
 </font>
@@ -2912,18 +3543,18 @@ xfs_defer_finish_noroll()
 <font size="2">
 <pre>
 
-      tail         head
-   cycle=100     cycle=100 
-        |           |
-        v           v
+            tail                 head
+     cycle=100         cycle=100 
+                |                     |
+                v                     v
 |-------xxxxxxxxxxxx------------|
 
 
 
-      head              tail
-   cycle=101         cycle=100 
-        |                |
-        v                v
+            head                            tail
+     cycle=101                 cycle=100 
+                |                                |
+                v                                v
 |xxxxxxx-----------------xxxxxxx|
 </pre>
 <ul>
@@ -2933,12 +3564,12 @@ It is related to XFS_TRANS_PERM_LOG_RES,
 This kind of transaction could be rolled by multiple times.
 Such as
 
-#define    XFS_SYMLINK_LOG_COUNT        3
-#define    XFS_REMOVE_LOG_COUNT        2
-#define    XFS_LINK_LOG_COUNT        2
-#define    XFS_RENAME_LOG_COUNT        2
-#define    XFS_WRITE_LOG_COUNT        2
-#define    XFS_WRITE_LOG_COUNT_REFLINK    8
+#define        XFS_SYMLINK_LOG_COUNT                3
+#define        XFS_REMOVE_LOG_COUNT                2
+#define        XFS_LINK_LOG_COUNT                2
+#define        XFS_RENAME_LOG_COUNT                2
+#define        XFS_WRITE_LOG_COUNT                2
+#define        XFS_WRITE_LOG_COUNT_REFLINK        8
 
 A reflink transaction could be split into 8 sub-transactions.
 If one sub-transaction need T bytes log space, we need
@@ -2948,18 +3579,18 @@ If one sub-transaction need T bytes log space, we need
 Refer to the code in xfs_trans_reserve()
 ---
 <font color="blue">
-    // rolled transaction
+        // rolled transaction
 </font>
-    if (tp->t_ticket != NULL) {
-            ASSERT(resp->tr_logflags & XFS_TRANS_PERM_LOG_RES);
-            error = xfs_log_regrant(mp, tp->t_ticket);
-        } else {
-            error = xfs_log_reserve(mp,
-                        resp->tr_logres,
-                        resp->tr_logcount,
-                        &tp->t_ticket, XFS_TRANSACTION,
-                        permanent);
-        }
+        if (tp->t_ticket != NULL) {
+                        ASSERT(resp->tr_logflags & XFS_TRANS_PERM_LOG_RES);
+                        error = xfs_log_regrant(mp, tp->t_ticket);
+                } else {
+                        error = xfs_log_reserve(mp,
+                                                resp->tr_logres,
+                                                resp->tr_logcount,
+                                                &tp->t_ticket, XFS_TRANSACTION,
+                                                permanent);
+                }
 
 ---
 </pre>
@@ -2969,7 +3600,7 @@ There are two value in ticket, t_curr_res and t_unit_res.<br/>
 xlog_cil_alloc_shadow_bufs() will adapt the t_curr_res
 based on the real situation and then give the left back in 
 xfs_log_commit_cil()
-  -> xfs_log_ticket_regrant/ungrant()
+    -> xfs_log_ticket_regrant/ungrant()
 
 
 The log space will given back after AIL commit with push the lsn tail.
@@ -2979,21 +3610,21 @@ The log space will given back after AIL commit with push the lsn tail.
 In software,
 xfs_cil_ctx represents a transaction.
 xfs_log_vec represents a log item and its space in memory. (li_lv and li_lv_shadow)
-lsn         represents cycle << 32 | log block number //>>
+lsn                 represents cycle << 32 | log block number //>>
 
 There are two lsn for a Transaction
 <B>(1) start lsn</B>
 xlog_cil_push_work()
-  -> xlog_write(log, &lvhdr, tic, <font color="red">&ctx->start_lsn,</font> NULL, 0, true)
-  ---
-        /* start_lsn is the first lsn written to. That's all we need. */
-        if (!*start_lsn)
-            *start_lsn = be64_to_cpu(iclog->ic_header.h_lsn);
-  ---
+    -> xlog_write(log, &lvhdr, tic, <font color="red">&ctx->start_lsn,</font> NULL, 0, true)
+    ---
+                /* start_lsn is the first lsn written to. That's all we need. */
+                if (!*start_lsn)
+                        *start_lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+    ---
 
 <B>(2) commit lsn</B>
 xlog_cil_push_work()
-  -> xlog_commit_record(log, tic, &commit_iclog, <font color="red">&commit_lsn</font>);
+    -> xlog_commit_record(log, tic, &commit_iclog, <font color="red">&commit_lsn</font>);
 
 The io completion callback of log block (iclog) is invoked <U>in the order of lsn</U>.
 And the sign of successful committing of a transaction is the commit lsn (the log block) has been on disk
@@ -3007,70 +3638,70 @@ The tail lsn could be modified in two ways,
 <B>(1) relog</B>
 xfs_trans_committed()
 <font color="blue">
-    // See it ? ctx>start_lsn is used here !!!
+        // See it ? ctx>start_lsn is used here !!!
 </font>
-  -> xfs_trans_committed_bulk(ctx->cil->xc_log->l_ailp, ctx->lv_chain, <font color="red">ctx->start_lsn</font>, abort)
-    -> xfs_log_item_batch_insert()
-      -> xfs_trans_ail_update_bulk()
-      ---
-    for (i = 0; i < nr_items; i++) {
-        struct xfs_log_item *lip = log_items[i];
+    -> xfs_trans_committed_bulk(ctx->cil->xc_log->l_ailp, ctx->lv_chain, <font color="red">ctx->start_lsn</font>, abort)
+        -> xfs_log_item_batch_insert()
+            -> xfs_trans_ail_update_bulk()
+            ---
+        for (i = 0; i < nr_items; i++) {
+                struct xfs_log_item *lip = log_items[i];
 <font color="blue">
-        // Has been on AIL list, relog case !!!
-        // It also inicates that the previous log has been on disk !!!
+                // Has been on AIL list, relog case !!!
+                // It also inicates that the previous log has been on disk !!!
 </font>
-        if (test_and_set_bit(XFS_LI_IN_AIL, &lip->li_flags)) {
-            /* check if we really need to move the item */
-            if (XFS_LSN_CMP(lsn, lip->li_lsn) <= 0)
-                continue;
+                if (test_and_set_bit(XFS_LI_IN_AIL, &lip->li_flags)) {
+                        /* check if we really need to move the item */
+                        if (XFS_LSN_CMP(lsn, lip->li_lsn) <= 0)
+                                continue;
 
 <font color="blue">
-            // relog would release its previous log space !!!
+                        // relog would release its previous log space !!!
 </font>
-            if (mlip == lip && !tail_lsn)
-                tail_lsn = lip->li_lsn;
+                        if (mlip == lip && !tail_lsn)
+                                tail_lsn = lip->li_lsn;
 
 <font color="blue">
-            // remove from the ail list and re-insert it later
+                        // remove from the ail list and re-insert it later
 </font>
-            xfs_ail_delete(ailp, lip);
-        } else {
-            trace_xfs_ail_insert(lip, 0, lsn);
+                        xfs_ail_delete(ailp, lip);
+                } else {
+                        trace_xfs_ail_insert(lip, 0, lsn);
+                }
+                lip->li_lsn = lsn;
+                list_add(&lip->li_ail, &tmp);
         }
-        lip->li_lsn = lsn;
-        list_add(&lip->li_ail, &tmp);
-    }
 
 <font color="blue">
-    // all the log items uses the same lsn, namely, the start lsn of the transaction
+        // all the log items uses the same lsn, namely, the start lsn of the transaction
 </font>
-    if (!list_empty(&tmp))
-        xfs_ail_splice(ailp, cur, &tmp, lsn);
+        if (!list_empty(&tmp))
+                xfs_ail_splice(ailp, cur, &tmp, lsn);
 
-    xfs_ail_update_finish(ailp, tail_lsn);
-      ---
+        xfs_ail_update_finish(ailp, tail_lsn);
+            ---
 
 <B>(2) checkpoint</B>
 xfs_buf_ioend()
-  -> xfs_buf_item_done()
-    -> xfs_trans_ail_delete()
-      -> xfs_ail_delete_one()
-      ---
+    -> xfs_buf_item_done()
+        -> xfs_trans_ail_delete()
+            -> xfs_ail_delete_one()
+            ---
 <font color="blue">
-        // The minimum one is the head of the ailp->ail_head
+                // The minimum one is the head of the ailp->ail_head
 </font>
-        struct xfs_log_item    *mlip = xfs_ail_min(ailp);
-        xfs_lsn_t        lsn = lip->li_lsn;
+                struct xfs_log_item        *mlip = xfs_ail_min(ailp);
+                xfs_lsn_t                lsn = lip->li_lsn;
 
-        xfs_ail_delete(ailp, lip);
-        clear_bit(XFS_LI_IN_AIL, &lip->li_flags);
-        lip->li_lsn = 0;
+                xfs_ail_delete(ailp, lip);
+                clear_bit(XFS_LI_IN_AIL, &lip->li_flags);
+                lip->li_lsn = 0;
 
-        if (mlip == lip)
-            return lsn;
-        return 0;
-      ---
-      -> xfs_ail_update_finish()
+                if (mlip == lip)
+                        return lsn;
+                return 0;
+            ---
+            -> xfs_ail_update_finish()
 
 Why there is only one xfs_buf_ioend() here ?
 Look at the definition of iop_push, only inode, dquot and buf define it.
@@ -3079,8 +3710,8 @@ This indicates that most of the transactions are made of xfs buf updating.
 And inode updating would be applied on xfs buf finally.
 Refer to
 xfs_inode_item_push()
-  -> xfs_iflush_cluster()
-  -> xfs_buf_delwri_queue()
+    -> xfs_iflush_cluster()
+    -> xfs_buf_delwri_queue()
 </pre>
 </ul>
 </font>
@@ -3094,8 +3725,8 @@ xfs_inode_item_push()
 <font size="2">
 The inode number if xfs is composed with 3 parts,
 <pre>
-       AG number        Bn in AG       In in B
-  |----------------|---------------|-------------|
+             AG number                Bn in AG             In in B
+    |----------------|---------------|-------------|
 
 Bn : block number in an AG
 In : inode number in a block (a block could carry multiple inodes)
@@ -3109,9 +3740,9 @@ Allocate a block in that AG !<br/>
 Then create a xfs_inobt_rec as following,
 <pre>
 struct xfs_inobt_rec {
-    __be32   ir_startino;  //<font color="blue">start ino num of this chunk</font>
-    __be32   ir_freecount; //<font color="blue">number of free inodes</font>
-    __be64   ir_free; //<font color="blue">bitmap</font>
+        __be32     ir_startino;    //<font color="blue">start ino num of this chunk</font>
+        __be32     ir_freecount; //<font color="blue">number of free inodes</font>
+        __be64     ir_free; //<font color="blue">bitmap</font>
 
 }
 </pre>
@@ -3130,92 +3761,92 @@ xfs uses xfs_buf to manage its metadata instead of using vfs pagecache.
 <pre>
 xfs_buf_get_map()
 ---
-    error = xfs_buf_find(target, map, nmaps, flags, NULL, &bp);
-    if (!error)
-        goto found;
-    if (error != -ENOENT)
-        return error;
+        error = xfs_buf_find(target, map, nmaps, flags, NULL, &bp);
+        if (!error)
+                goto found;
+        if (error != -ENOENT)
+                return error;
 
-    error = _xfs_buf_alloc(target, map, nmaps, flags, &new_bp);
+        error = _xfs_buf_alloc(target, map, nmaps, flags, &new_bp);
 <font color="blue">
-    // sema_init(&bp->b_sema, 0); /* held, no waiters */
+        // sema_init(&bp->b_sema, 0); /* held, no waiters */
 </font>
 
-    error = xfs_buf_allocate_memory(new_bp, flags);
-    ---
+        error = xfs_buf_allocate_memory(new_bp, flags);
+        ---
 <font color="blue">
-    /*
-     * for buffers that are contained within a single page, just allocate
-     * the memory from the heap - there's no need for the complexity of
-     * page arrays to keep allocation down to order 0.
-     */
+        /*
+         * for buffers that are contained within a single page, just allocate
+         * the memory from the heap - there's no need for the complexity of
+         * page arrays to keep allocation down to order 0.
+         */
 </font>
-    size = BBTOB(bp->b_length);
-    if (size < PAGE_SIZE) {
-        int align_mask = xfs_buftarg_dma_alignment(bp->b_target);
-        bp->b_addr = kmem_alloc_io(size, align_mask,
-                       KM_NOFS | kmflag_mask);
-        ...
-        bp->b_offset = offset_in_page(bp->b_addr);
-        bp->b_pages = bp->b_page_array;
-        bp->b_pages[0] = kmem_to_page(bp->b_addr);
-        bp->b_page_count = 1;
-        bp->b_flags |= _XBF_KMEM;
-        return 0;
-    }
+        size = BBTOB(bp->b_length);
+        if (size < PAGE_SIZE) {
+                int align_mask = xfs_buftarg_dma_alignment(bp->b_target);
+                bp->b_addr = kmem_alloc_io(size, align_mask,
+                                             KM_NOFS | kmflag_mask);
+                ...
+                bp->b_offset = offset_in_page(bp->b_addr);
+                bp->b_pages = bp->b_page_array;
+                bp->b_pages[0] = kmem_to_page(bp->b_addr);
+                bp->b_page_count = 1;
+                bp->b_flags |= _XBF_KMEM;
+                return 0;
+        }
 
 use_alloc_page:
-    ...
-    for (i = 0; i < bp->b_page_count; i++) {
-        struct page    *page;
-        uint        retries = 0;
+        ...
+        for (i = 0; i < bp->b_page_count; i++) {
+                struct page        *page;
+                uint                retries = 0;
 retry:
-        page = alloc_page(gfp_mask);
-        ...
-        nbytes = min_t(size_t, size, PAGE_SIZE - offset);
-        size -= nbytes;
-        bp->b_pages[i] = page;
-        offset = 0;
-    }
+                page = alloc_page(gfp_mask);
+                ...
+                nbytes = min_t(size_t, size, PAGE_SIZE - offset);
+                size -= nbytes;
+                bp->b_pages[i] = page;
+                offset = 0;
+        }
 
-    ---
+        ---
 <font color="blue">
-    // Do insert if new_bp is not NULL
+        // Do insert if new_bp is not NULL
 </font>
-    error = xfs_buf_find(target, map, nmaps, flags, new_bp, &bp);
-    ...
-found:
-    if (!bp->b_addr) {
-        error = _xfs_buf_map_pages(bp, flags);
+        error = xfs_buf_find(target, map, nmaps, flags, new_bp, &bp);
         ...
-    }
+found:
+        if (!bp->b_addr) {
+                error = _xfs_buf_map_pages(bp, flags);
+                ...
+        }
 ---
 </pre>
 <li> lookup
 <pre>
 xfs_buf_find()
 ---
-    pag = xfs_perag_get(btp->bt_mount,
-                xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
+        pag = xfs_perag_get(btp->bt_mount,
+                                xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
 
-    spin_lock(&pag->pag_buf_lock);
-    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
-                    xfs_buf_hash_params);
-    if (bp) {
-        atomic_inc(&bp->b_hold);
-        goto found;
-    }
-    ...
+        spin_lock(&pag->pag_buf_lock);
+        bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                                        xfs_buf_hash_params);
+        if (bp) {
+                atomic_inc(&bp->b_hold);
+                goto found;
+        }
+        ...
 found:
-    spin_unlock(&pag->pag_buf_lock);
-    xfs_perag_put(pag);
+        spin_unlock(&pag->pag_buf_lock);
+        xfs_perag_put(pag);
 <font color="blue">
-    // We need to return a locked xfs_buf here !!!
+        // We need to return a locked xfs_buf here !!!
 </font>
-    if (!xfs_buf_trylock(bp)) {
-        xfs_buf_lock(bp);
-        XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
-    }
+        if (!xfs_buf_trylock(bp)) {
+                xfs_buf_lock(bp);
+                XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+        }
 
 ---
 </pre>
@@ -3223,36 +3854,36 @@ found:
 <pre>
 xfs_buf_read_map()
 ---
-    error = xfs_buf_get_map(target, map, nmaps, flags, &bp);
-    ...
-    if (!(bp->b_flags & XBF_DONE)) {
-<font color="blue">        /* Initiate the buffer read and wait. */</font>
-        bp->b_ops = ops;
-        error = _xfs_buf_read(bp, flags);
-          -> xfs_buf_submit()
-            -> __xfs_buf_submit() <font color="blue">// wait = !(bp->b_flags & XBF_ASYNC)</font>
-            ---
+        error = xfs_buf_get_map(target, map, nmaps, flags, &bp);
+        ...
+        if (!(bp->b_flags & XBF_DONE)) {
+<font color="blue">                /* Initiate the buffer read and wait. */</font>
+                bp->b_ops = ops;
+                error = _xfs_buf_read(bp, flags);
+                    -> xfs_buf_submit()
+                        -> __xfs_buf_submit() <font color="blue">// wait = !(bp->b_flags & XBF_ASYNC)</font>
+                        ---
 <font color="blue">
-            /*
-              * Grab a reference so the buffer does not go away underneath us. For
-              * async buffers, I/O completion drops the callers reference, which
-              * could occur before submission returns.
-              */
+                        /*
+                            * Grab a reference so the buffer does not go away underneath us. For
+                            * async buffers, I/O completion drops the callers reference, which
+                            * could occur before submission returns.
+                            */
 </font>
-            xfs_buf_hold(bp);
-            ...
-            _xfs_buf_ioapply(bp);
-            ...
-            if (wait)
-                error = xfs_buf_iowait(bp);
+                        xfs_buf_hold(bp);
+                        ...
+                        _xfs_buf_ioapply(bp);
+                        ...
+                        if (wait)
+                                error = xfs_buf_iowait(bp);
 
-            xfs_buf_rele(bp);
-            ---
+                        xfs_buf_rele(bp);
+                        ---
 
-        /* Readahead iodone already dropped the buffer, so exit. */
-        if (flags & XBF_ASYNC)
-            return 0;
-    }
+                /* Readahead iodone already dropped the buffer, so exit. */
+                if (flags & XBF_ASYNC)
+                        return 0;
+        }
 ---
 
 <font color="red" size = "2">
@@ -3262,10 +3893,10 @@ In non-readahead case, we have to wait the buffer to be read in.
 When read completes, xfs would verify it.
 xfs_buf_ioend()
 ---
-    if (bp->b_flags & XBF_READ) {
-        if (!bp->b_error && bp->b_ops)
-<font color="red">            bp->b_ops->verify_read(bp);</font>
-    }
+        if (bp->b_flags & XBF_READ) {
+                if (!bp->b_error && bp->b_ops)
+<font color="red">                        bp->b_ops->verify_read(bp);</font>
+        }
 ---
 </pre>
 <li> log
@@ -3275,30 +3906,30 @@ xfs_buf_ioend()
 The xfs buf being written to disk must have been checkpointed.
 During the IO, the xfs_buf is locked. Nobody can touch it.
 xfs_buf_delwri_submit_buffers()
-  -> xfs_buf_lock()
-  -> __xfs_buf_submit() //<font color="blue"> wait is false</font>
-     ---
+    -> xfs_buf_lock()
+    -> __xfs_buf_submit() //<font color="blue"> wait is false</font>
+         ---
 <font color="blue">
-    // buf has been locked, after unpin, nobody can pin it any more.
-    // the modifications in buf should have been in log.
+        // buf has been locked, after unpin, nobody can pin it any more.
+        // the modifications in buf should have been in log.
 </font>
-    if (bp->b_flags & XBF_WRITE)
-        xfs_buf_wait_unpin(bp);
-        ---
-        if (atomic_read(&bp->b_pin_count) == 0)
-            return;
+        if (bp->b_flags & XBF_WRITE)
+                xfs_buf_wait_unpin(bp);
+                ---
+                if (atomic_read(&bp->b_pin_count) == 0)
+                        return;
 
-        add_wait_queue(&bp->b_waiters, &wait);
-        for (;;) {
-            set_current_state(TASK_UNINTERRUPTIBLE);
-            if (atomic_read(&bp->b_pin_count) == 0)
-                break;
-            io_schedule();
-        }
-        remove_wait_queue(&bp->b_waiters, &wait);
-        set_current_state(TASK_RUNNING);
-        ---
-     ---
+                add_wait_queue(&bp->b_waiters, &wait);
+                for (;;) {
+                        set_current_state(TASK_UNINTERRUPTIBLE);
+                        if (atomic_read(&bp->b_pin_count) == 0)
+                                break;
+                        io_schedule();
+                }
+                remove_wait_queue(&bp->b_waiters, &wait);
+                set_current_state(TASK_RUNNING);
+                ---
+         ---
 
 How to ensure the metadata to be on disk instead of disk caching, after release
 the log space ?
@@ -3306,149 +3937,273 @@ the log space ?
 xlog_sync()
 ---
 <font color="blue">
-    /*
-     * Flush the data device before flushing the log to make sure all meta
-     * data written back from the AIL actually made it to disk before
-     * stamping the new log tail LSN into the log buffer.  For an external
-     * log we need to issue the flush explicitly, and unfortunately
-     * synchronously here; for an internal log we can simply use the block
-     * layer state machine for preflushes.
-     */
+        /*
+         * Flush the data device before flushing the log to make sure all meta
+         * data written back from the AIL actually made it to disk before
+         * stamping the new log tail LSN into the log buffer.    For an external
+         * log we need to issue the flush explicitly, and unfortunately
+         * synchronously here; for an internal log we can simply use the block
+         * layer state machine for preflushes.
+         */
 </font>
-    if (log->l_targ != log->l_mp->m_ddev_targp || split) {
-        xfs_blkdev_issue_flush(log->l_mp->m_ddev_targp);
-        need_flush = false;
-    }
+        if (log->l_targ != log->l_mp->m_ddev_targp || split) {
+                xfs_blkdev_issue_flush(log->l_mp->m_ddev_targp);
+                need_flush = false;
+        }
 
-    xlog_verify_iclog(log, iclog, count);
-    xlog_write_iclog(log, iclog, bno, count, need_flush);
+        xlog_verify_iclog(log, iclog, count);
+        xlog_write_iclog(log, iclog, bno, count, need_flush);
 ---
 </pre>
 <li> reclaim
 <pre>
 xfs_buf_rele()
 ---
-    spin_lock(&bp->b_lock);
-    release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
-    if (!release) {
-        if ((atomic_read(&bp->b_hold) == 1) && !list_empty(&bp->b_lru))
-            __xfs_buf_ioacct_dec(bp);
-        goto out_unlock;
-    }
-    ...
-<font color="blue">
-    // insert into the lru list
-</font>
-    if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
-        if (list_lru_add(&bp->b_target->bt_lru, &bp->b_lru)) {
-            bp->b_state &= ~XFS_BSTATE_DISPOSE;
-            atomic_inc(&bp->b_hold);
+        spin_lock(&bp->b_lock);
+        release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
+        if (!release) {
+                if ((atomic_read(&bp->b_hold) == 1) && !list_empty(&bp->b_lru))
+                        __xfs_buf_ioacct_dec(bp);
+                goto out_unlock;
         }
-        spin_unlock(&pag->pag_buf_lock);
-    } 
+        ...
+<font color="blue">
+        // insert into the lru list
+</font>
+        if (!(bp->b_flags & XBF_STALE) && atomic_read(&bp->b_lru_ref)) {
+                if (list_lru_add(&bp->b_target->bt_lru, &bp->b_lru)) {
+                        bp->b_state &= ~XFS_BSTATE_DISPOSE;
+                        atomic_inc(&bp->b_hold);
+                }
+                spin_unlock(&pag->pag_buf_lock);
+        } 
 ---
 
 xfs_buftarg_shrink_scan()
 ---
-    freed = list_lru_shrink_walk(&btp->bt_lru, sc,
-                     xfs_buftarg_isolate, &dispose);
+        freed = list_lru_shrink_walk(&btp->bt_lru, sc,
+                                         xfs_buftarg_isolate, &dispose);
 
-    while (!list_empty(&dispose)) {
-        struct xfs_buf *bp;
-        bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
-        list_del_init(&bp->b_lru);
-        xfs_buf_rele(bp);
-    }
-    freed = list_lru_shrink_walk(&btp->bt_lru, sc,
-                     xfs_buftarg_isolate, &dispose);
+        while (!list_empty(&dispose)) {
+                struct xfs_buf *bp;
+                bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+                list_del_init(&bp->b_lru);
+                xfs_buf_rele(bp);
+        }
+        freed = list_lru_shrink_walk(&btp->bt_lru, sc,
+                                         xfs_buftarg_isolate, &dispose);
 
-    while (!list_empty(&dispose)) {
-        struct xfs_buf *bp;
-        bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
-        list_del_init(&bp->b_lru);
-        xfs_buf_rele(bp);
-    }
+        while (!list_empty(&dispose)) {
+                struct xfs_buf *bp;
+                bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+                list_del_init(&bp->b_lru);
+                xfs_buf_rele(bp);
+        }
 ---
 </pre>
 <li> story of b_hold
 <pre>
 The story of b_hold
 [0] initial value is 1
-    _xfs_buf_alloc()
-    ---
-        atomic_set(&bp->b_hold, 1);
-    ---
+        _xfs_buf_alloc()
+        ---
+                atomic_set(&bp->b_hold, 1);
+        ---
 [1] xfs_buf_find() get and lock
-    ---
-    spin_lock(&pag->pag_buf_lock);
-    bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
-                    xfs_buf_hash_params);
-    if (bp) {
-        atomic_inc(&bp->b_hold);
-        goto found;
-    }
-    ...
-found:
-    spin_unlock(&pag->pag_buf_lock);
-    xfs_perag_put(pag);
-
-    if (!xfs_buf_trylock(bp)) {
-        if (flags & XBF_TRYLOCK) {
-            xfs_buf_rele(bp);
-            XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
-            return -EAGAIN;
+        ---
+        spin_lock(&pag->pag_buf_lock);
+        bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
+                                        xfs_buf_hash_params);
+        if (bp) {
+                atomic_inc(&bp->b_hold);
+                goto found;
         }
-        xfs_buf_lock(bp);
-        XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
-    }
+        ...
+found:
+        spin_unlock(&pag->pag_buf_lock);
+        xfs_perag_put(pag);
 
-    ---
+        if (!xfs_buf_trylock(bp)) {
+                if (flags & XBF_TRYLOCK) {
+                        xfs_buf_rele(bp);
+                        XFS_STATS_INC(btp->bt_mount, xb_busy_locked);
+                        return -EAGAIN;
+                }
+                xfs_buf_lock(bp);
+                XFS_STATS_INC(btp->bt_mount, xb_get_locked_waited);
+        }
+
+        ---
 
 There are mainly two ways to release this reference
 a. xfs_log_commit_cil()
-     -> xfs_trans_free_items()
-       -> iop_unlock()
-          xfs_buf_item_unlock()
-            -> xfs_buf_relse()
+         -> xfs_trans_free_items()
+             -> iop_unlock()
+                    xfs_buf_item_unlock()
+                        -> xfs_buf_relse()
 
 b. xfs_trans_brelse()
-     -> xfs_trans_del_item()
-     -> xfs_buf_relse()
+         -> xfs_trans_del_item()
+         -> xfs_buf_relse()
 
-   release a buf if didn't dirty it
+     release a buf if didn't dirty it
 
 [2] buf log item
 
 The buf log item holds a reference of the xfs_buf
 xfs_buf_item_init()
-  -> xfs_buf_hold()
+    -> xfs_buf_hold()
 
 This reference will be released in xfs_buf_iodone()
 xfs_buf_iodone()
 ---
-    xfs_buf_rele(bp);
-    spin_lock(&ailp->ail_lock);
-    xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
-    xfs_buf_item_free(BUF_ITEM(lip));
+        xfs_buf_rele(bp);
+        spin_lock(&ailp->ail_lock);
+        xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
+        xfs_buf_item_free(BUF_ITEM(lip));
 ---
 
 [3] delwri_queue
 xfs_buf_delwri_queue()
 ---
-    bp->b_flags |= _XBF_DELWRI_Q;
-    if (list_empty(&bp->b_list)) {
-        atomic_inc(&bp->b_hold);
-        list_add_tail(&bp->b_list, list);
-    }
+        bp->b_flags |= _XBF_DELWRI_Q;
+        if (list_empty(&bp->b_list)) {
+                atomic_inc(&bp->b_hold);
+                list_add_tail(&bp->b_list, list);
+        }
 ---
 
 get lock in xfs_buf_delwri_submit_buffers()
 xfs_buf_iodone_callbacks()
-  -> xfs_buf_ioend()
-    -> xfs_buf_relse()
-       unlock and release ref
+    -> xfs_buf_ioend()
+        -> xfs_buf_relse()
+             unlock and release ref
 </pre>
 </ul>
+</font>
+</p>
+
+<h2><a name="xfs_bmap">xfs bmap</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="xfs_bmap_unwritten">xfs bmap unwritten</a></h3>
+<p>
+<font size="2">
+allocated block extent has two state in xfs
+<ul>
+<li> Normal, XFS_EXT_NORM
+<li> Unwritten, XFS_EXT_UNWRITTEN
+</ul>
+The meaning of the state is as the name shows<br/>
+When the block extent is newly allocated, it is unwritten.
+<pre>
+xfs_bmapi_allocate()
+---
+<font color="red">
+    if (bma->flags & XFS_BMAPI_PREALLOC)
+        bma->got.br_state = XFS_EXT_UNWRITTEN;
+</font>
+    if (bma->wasdel)
+        error = xfs_bmap_add_extent_delay_real(bma, whichfork);
+---
+</pre>
+The two main allocation paths,
+<ul>
+<li> writepages
+<pre>
+xfs_map_blocks()
+  -> xfs_convert_blocks()
+    -> xfs_bmapi_convert_delalloc()
+    ---
+<font color="red">    bma.flags = XFS_BMAPI_PREALLOC;</font>
+    ...
+    error = xfs_bmapi_allocate(&bma);
+    ---
+</pre>
+<li> fallocate
+<pre>
+xfs_file_fallocate()
+---
+        if (!xfs_is_always_cow_inode(ip)) {
+            error = xfs_alloc_file_space(ip, offset, len,
+<font color="red">                             XFS_BMAPI_PREALLOC);</font>
+        }
+---
+</pre>
+</ul>
+The unwritten state can influence the xfs in following ways,
+<ul>
+<li> Read, just return zero
+<pre>
+iomap_readpage_actor()
+---
+    if (iomap_block_needs_zeroing(inode, iomap, pos)) {
+        zero_user(page, poff, plen);
+        iomap_set_range_uptodate(page, poff, plen);
+        goto done;
+    }
+---
+iomap_block_needs_zeroing()
+---
+    return iomap->type != IOMAP_MAPPED ||
+        (iomap->flags & IOMAP_F_NEW) ||
+        pos >= i_size_read(inode);
+---
+</pre>
+<li> Write, needn't to do read
+<pre>
+__iomap_write_begin()
+---
+<font color="blue">
+    // iomap->type != IOMAP_MAPPED means needs zeroing
+</font>
+   if (iomap_block_needs_zeroing(inode, srcmap, block_start)) {
+        if (WARN_ON_ONCE(flags & IOMAP_WRITE_F_UNSHARE))
+            return -EIO;
+        zero_user_segments(page, poff, from, to, poff + plen);
+    } else {
+        int status = iomap_read_page_sync(block_start, page,
+                poff, plen, srcmap);
+        if (status)
+            return status;
+    }
+---
+</pre>
+<li> Discard
+<pre>
+xfs_bmap_del_extent_real()
+---
+    if (do_fx && !(bflags & XFS_BMAPI_REMAP)) {
+        if (xfs_is_reflink_inode(ip) && whichfork == XFS_DATA_FORK) {
+            xfs_refcount_decrease_extent(tp, del);
+        } else {
+            __xfs_bmap_add_free(tp, del->br_startblock,
+                    del->br_blockcount, NULL,
+                    (bflags & XFS_BMAPI_NODISCARD) ||
+                    del->br_state == XFS_EXT_UNWRITTEN);
+        }
+    }
+<font color="blue">
+    // If the extent is UNWRITTEN, the skip_discard is true
+</font>
+---
+</pre>
+</ul>
+After write IO completes, xfs will convert unwritten to normal state
+<pre>
+xfs_end_bio()
+  -> queue_work i_ioend_work
+
+xfs_end_io()
+  -> xfs_end_ioend()
+    -> xfs_iomap_write_unwritten()
+    ---
+        error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
+                    XFS_BMAPI_CONVERT, resblks, &imap,
+                    &nimaps);
+    ---
+       -> xfs_bmapi_convert_unwritten()
+</pre>
+
 </font>
 </p>
 
