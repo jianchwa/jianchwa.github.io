@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Scheduler</title>
+</head>
+<body>
+<div>
+    <h1>Scheduler</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#sched_basis">Sched Basis</a>
+<ul>
+<li> <a href="#task_and_rq">Task and RQ</a>
+</ul>
+<a href="#sched_domain">Sched Domain</a>
+<ul>
+<li><a href="#sched_domain_topology">Cpu Topology</a>
+<li><a href="#sched_domain_data_structre">Data Structure</a>
+</ul>
+<a href="#load_balance">Load Balance</a>
+<ul>
+<li><a href="#load_balance_metrics">Metrics</a>
+<li><a href="#load_balance_how">How</a>
+<ul>
+<li><a href="#load_balance_how_pull">Pull</a>
+<li><a href="#load_balance_how_pick">Pick</a>
+</ul>
+<a href="#migration">Migration</a><br/>
+<a href="#cfs_bw">CFS Bandwidth Control</a><br/>
+</ul>
+
+</font>
+</p>
+
+<h2><a name="sched_basis">Sched Basis</a></h2>
+<h3><a name="task_and_rq">Task and RQ</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+There are three kinds of relationship between a task and rq (<font color="red">cpu</font>)
+<ul>
+<li> 0
+<pre>
+The task is not on rq
+^^^^^^^^^^^^^^^^^^^^^
+deactivate_task()
+---
+    p->on_rq = (flags & DEQUEUE_SLEEP) ? 0 : TASK_ON_RQ_MIGRATING;
+
+    dequeue_task(rq, p, flags);
+---
+The only case that invokes deactivate_task with DEQUEUE_SLEEP is
+__schedule()
+---
+if (!preempt && prev_state) {
+        if (signal_pending_state(prev_state, prev)) {
+            prev->state = TASK_RUNNING;
+        } else {
+            deactivate_task(rq, prev, <font color="red">DEQUEUE_SLEEP</font> | DEQUEUE_NOCLOCK);
+
+            if (prev->in_iowait) {
+                atomic_inc(&rq->nr_iowait);
+                delayacct_blkio_start();
+            }
+        }
+    }
+---
+
+In this case, the cpu on which task is on is not necessary because
+try_to_wake_up() will select a new one for it.
+try_to_wake_up()
+---
+    cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+    if (task_cpu(p) != cpu) {
+        if (p->in_iowait) {
+            delayacct_blkio_end(p);
+            atomic_dec(&task_rq(p)->nr_iowait);
+        }
+        ...
+        set_task_cpu(p, cpu);
+    }
+---
+
+</pre>
+<li> QUEUED (TASK_ON_RQ_QUEUED)
+<pre>
+Task is on rq. It maybe running or waiting to be scheduled.
+activate_task()
+---
+    enqueue_task(rq, p, flags);
+
+    p->on_rq = TASK_ON_RQ_QUEUED;
+---
+
+At this moment, the task_cpu() is valid
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</pre>
+<li> MIGRATING (TASK_ON_RQ_MIGRATING)
+<pre>
+This is an intermediate state.
+Task is detached from its previous cpu and has not been attached to its target cpu.
+
+Refer following example,
+move_queued_task()
+---
+    deactivate_task(rq, p, DEQUEUE_NOCLOCK);
+    set_task_cpu(p, new_cpu);
+    rq_unlock(rq, rf);
+<font color="blue">    // TASK_ON_RQ_MIGRATING</font>
+    rq = cpu_rq(new_cpu);
+
+    rq_lock(rq, rf);
+    BUG_ON(task_cpu(p) != new_cpu);
+    activate_task(rq, p, 0);
+<font color="blue">    // TASK_ON_RQ_QUEUED</font>
+    check_preempt_curr(rq, p, 0);
+---
+</pre>
+</ul>
+
+The lock rules to operate task and rq
+<ul>
+<li> 0
+<pre>
+When task is not on rq, we use task->pi_lock, refer to try_to_wake_up()
+try_to_wake_up()
+---
+<font color="red">    raw_spin_lock_irqsave(&p->pi_lock, flags);</font>
+    ...
+    cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+    if (task_cpu(p) != cpu) {
+        if (p->in_iowait) {
+            delayacct_blkio_end(p);
+            atomic_dec(&task_rq(p)->nr_iowait);
+        }
+        ...
+        set_task_cpu(p, cpu);
+    }
+
+    ttwu_queue(p, cpu, wake_flags);
+<font color="red">    raw_spin_unlock_irqrestore(&p->pi_lock, flags);</font>
+---
+</pre>
+<li> QUEUED
+<pre>
+When task is on rq, we use rq_lock, refer to
+load_balance()
+---
+<font color="red">        rq_lock_irqsave(busiest, &rf);</font>
+        update_rq_clock(busiest);
+        cur_ld_moved = detach_tasks(&env);
+<font color="red">        rq_unlock(busiest, &rf);</font>
+
+        if (cur_ld_moved) {
+            attach_tasks(&env);
+            ---
+<font color="red">                rq_lock(env->dst_rq, &rf);</font>
+                update_rq_clock(env->dst_rq);
+
+                while (!list_empty(tasks)) {
+                    p = list_first_entry(tasks, struct task_struct, se.group_node);
+                    list_del_init(&p->se.group_node);
+    
+                    attach_task(env->dst_rq, p);
+                }
+
+<font color="red">                rq_unlock(env->dst_rq, &rf);</font>
+            ---
+        }
+---
+</pre>
+<li> MIGRATING
+<pre>
+If the task is being migrated, task_rq_lock() would wait until it become stable
+task_rq_lock()
+---
+    for (;;) {
+        raw_spin_lock_irqsave(&p->pi_lock, rf->flags);
+        rq = task_rq(p);
+        raw_spin_lock(&rq->lock);
+        if (likely(rq == task_rq(p) && !task_on_rq_migrating(p))) {
+            rq_pin_lock(rq, rf);
+            return rq;
+        }
+        raw_spin_unlock(&rq->lock);
+        raw_spin_unlock_irqrestore(&p->pi_lock, rf->flags);
+<font color="red">
+        while (unlikely(task_on_rq_migrating(p)))
+            cpu_relax();
+</font>
+    }
+---
+</pre>
+</ul>
+
+<B>In conclusion, out of scheduler code, you can use task_rq_lock() to guarantee<br/>
+the task's state is stable.</B>
+</font>
+</p>
+
+<h2><a name="sched_domain">Sched Domain</a></h2>
+<h3><a name="sched_domain_topology">Cpu Topology</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+
+    C0  C2     C1  C3       C4  C6     C5  C7
+   +---+---+  +---+---+    +---+---+  +---+---+
+   | x | x |  | x | x |    | x | x |  | x | x |
+   +---+---+  +---+---+    +---+---+  +---+---+
+   +---L1--+  +---L1--+    +---L1--+  +---L1--+
+   +---L2--+--+---L2--+    +---L2--+--+---L2--+
+   +-------LLC--------+    +-------LLC--------+
+         Node 0                  Node 1
+</pre>
+How does the sched domain reflect the cpu topology above ?
+<pre>
+static struct sched_domain_topology_level default_topology[] = {
+    { cpu_smt_mask,       cpu_smt_flags,  SD_INIT_NAME(SMT) },
+    { cpu_coregroup_mask, cpu_core_flags, SD_INIT_NAME(MC)  },
+    { cpu_cpu_mask,                       SD_INIT_NAME(DIE) },
+    { NULL, },
+};
+<ul>
+<li> SMT (Simultaneous Multithreading)
+     cpu_smt_mask()
+       -> topology_sibling_cpumask()
+         -> per_cpu(cpu_sibling_map, cpu)
+
+    cpu_smt_flags()
+      -> SD_SHARE_CPUCAPACITY | SD_SHARE_PKG_RESOURCES
+<font color="blue">
+      cpu capacity means the resource in one core, including
+      L1, L2, TLB and even the calculation unit. Or we can call
+      it SMT and Intel HyperThreading is one of such technology.
+</font>
+<li> MC (Multiple Core)
+     cpu_coregroup_mask()
+       -> cpu_llc_shared_mask()
+         -> per_cpu(cpu_llc_shared_map, cpu);
+
+     cpu_core_flags()
+       -> SD_SHARE_PKG_RESOURCES
+<font color="blue">
+       The package resource includes the LLC
+</font>
+<li> DIE (SOC)
+     cpu_cpu_mask()
+       -> cpumask_of_node(cpu_to_node(cpu));
+         -> node_to_cpumask_map[node];
+</ul>
+
+In a 3.10 series vmcore, we following value of sched_domain.flags
+       (shared)              SMT: 0x2af                       
+SD_LOAD_BALANCE    (0x0001)  SD_SHARE_CPUPOWER      (0x0080)  
+SD_BALANCE_NEWIDLE (0x0002)  SD_SHARE_PKG_RESOURCES (0x0200)  
+SD_BALANCE_EXEC    (0x0004)     
+SD_BALANCE_FORK    (0x0008)  MC:0x122f   
+SD_WAKE_AFFINE     (0X0020)  SD_SHARE_PKG_RESOURCES (0x0200)
+                             SD_PREFER_SIBLING      (0x1000)
+
+                             NUMA:0x642f
+                             SD_SERIALIZE           (0x0400)
+                             SD_OVERLAP             (0x2000)
+                             SD_NUMA                (0x4000)
+</pre>
+</font>
+</p>
+
+<h3><a name="sched_domain_data_structre">Data Structure</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+Nearly everything here is per-cpu !
+<pre>
+build_sched_domains()
+  -> __visit_domain_allocation_hell()
+    -> __sdt_alloc()
+    ---
+    for_each_sd_topology(tl) {
+        struct sd_data *sdd = &tl->data;
+
+        sdd->sd = alloc_percpu(struct sched_domain *);
+        ...
+        sdd->sg = alloc_percpu(struct sched_group *);
+        
+        for_each_cpu(j, cpu_map) {
+            sd = kzalloc_node(sizeof(struct sched_domain) + cpumask_size(),
+                    GFP_KERNEL, cpu_to_node(j));
+            *per_cpu_ptr(sdd->sd, j) = sd;
+            ...
+            sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),
+                    GFP_KERNEL, cpu_to_node(j));
+            sg->next = sg;
+            *per_cpu_ptr(sdd->sg, j) = sg;
+            ...
+        }
+    }
+    ---
+</pre>
+sched_domain
+<pre>
+   cpu 0        cpu 1        cpu 2        cpu 3         ...
+                                                     
+   sd-DIE(0-7)  sd-DIE(0-7)  sd-DIE(0-7)  sd-DIE(0-7)   ...
+     |            |            |            |
+     v            v            v            v
+   sd-MC(0-3)   sd-MC(0-3)   sd-MC(0-3)   sd-MC(0-3)    ...
+     |            |            |            |
+     v            v            v            v
+   sd-SMT(0,1)  sd-SMT(0,1)  sd-SMT(2,3)  sd-SMT(2,3)   ...
+<font color="red">
+   Note: Every cpu has a sched_domain tree with their own cpumask
+         On cpu 0, its local sd-MC(0-3)'s child is sd-SMT(0,1)
+         On cpu 2, its local sd-MC(0-3)'s child is sd-SMT(2,3)
+</font>
+sd_init()
+---
+    cpumask_and(sched_domain_span(sd), cpu_map, tl->mask(cpu));
+---
+</pre>
+sched_group
+<pre>
+         cpu 0        cpu 1        cpu 2        cpu 3         ...
+  DIE    sd(0-7)      sd(0-7)      sd(0-7)      sd(0-7)
+          |_____________|____________|____________|
+          | 
+          v
+         sg(0,1,2,3)  ... (linked with sg(4,5,6,7))
+  MC     
+         sd(0-3)     sd(0-3)       sd(0-3)      sd(0-3)
+          |___________|             |___________|
+          |                         |
+          v                         v
+     .-> sg(0,1)     ------>       sg(2,3) -.
+     \_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ /
+
+  SMT    sd(0,1)      sd(0,1)      sd(2,3)      sd(2,3) 
+          |            |            |            |
+          v            v            v            v
+     .-> sg(0)  -->   sg(1) -. .-> sg(2)  -->   sg(3) -.
+     \ _ _ _ _ _ _ _ _ _ _ _ / \ _ _ _ _ _ _ _ _ _ _ _ /                                                    :
+
+<font color="blue">
+Note: 
+      (1) sched groups in one sched domain are linked in a list
+      (2) cpus in same sched group share one sg
+      (3) cpus in different sched groups points to different sg
+          because different cpu's sd can have different child sd
+</font>
+get_group()
+---
+    struct sched_domain *child = sd->child;
+    ...
+    if (child)
+        cpu = cpumask_first(sched_domain_span(child));
+
+    sg = *per_cpu_ptr(sdd->sg, cpu);
+    sg->sgc = *per_cpu_ptr(sdd->sgc, cpu);
+    ---
+    if (child) {
+        cpumask_copy(sched_group_span(sg), sched_domain_span(child));
+        cpumask_copy(group_balance_mask(sg), sched_group_span(sg));
+    } else {
+        cpumask_set_cpu(cpu, sched_group_span(sg));
+        cpumask_set_cpu(cpu, group_balance_mask(sg));
+    }
+---
+</pre>
+</font>
+</p>
+
+</body>
+</html>
+
+<h2><a name="load_balance">Load Balance</a></h2>
+
+<h3><a name="load_balance_metrics">Metrics</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> running
+<pre>
+Number of tasks in runqueue
+
+enqueue_task_fair()
+  -> enqueue_entity()
+    -> account_entity_enqueue()
+      -> cfs_rq->nr_running++
+</pre>
+<li> load, runnable, util
+<pre>
+enqueue_task_fair() -> enqueue_entity() \
+dequeue_task_fair() -> dequeue_entity()  > update_load_avg()
+task_tick_fair()    -> entity_tick()    /
+
+update_load_avg()
+  -> __update_load_avg_se()
+    -> ___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se), cfs_rq->curr == se)
+      ---
+        delta = now - sa->last_update_time;
+        ...
+        accumulate_sum(delta, sa, load, runnable, running)
+        ---
+            if (load)
+                sa->load_sum += load * contrib;
+            if (runnable)
+                sa->runnable_sum += runnable * contrib << SCHED_CAPACITY_SHIFT;
+            if (running)
+                sa->util_sum += contrib << SCHED_CAPACITY_SHIFT; >
+        ---
+      ---
+    -> ___update_load_avg()
+      ---
+        u32 divider = get_pelt_divider(sa);
+<font color="blue">
+        // load = se_weight(se)
+</font>
+        sa->load_avg = div_u64(load * sa->load_sum, divider);
+        sa->runnable_avg = div_u64(sa->runnable_sum, divider);
+        WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
+      ---
+
+runnable : the time when the se is on runqueue, including time when the task is
+           scheduled running and wait for being scheduled
+load     : similar with runnable, but note, se weight is taken into account
+until    : the time when the se is scheduled running
+
+These metrics are all historical statistics and <font color="red">can reflect how much cpu a task
+                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+or group will cost.
+^^^^^^^^^^^^^^^^^^</font>
+
+The algorithm is as following,
+
+(1)        time -> 1ms per unit
+     ...|----|----|----|----|--
+     ...   4    3    2    1  0
+
+(2) V = Y*P + N
+    Y : const value, Y^32 = 0.5
+    P : previous value of V
+    N : value of this period
+
+Long running task
+Running time                 Load
+      ^                         ^
+      |                         |
+      |                         |              . /
+1024  |||||||||||||||           |          . /
+      |||||||||||||||           |      . /
+      |||||||||||||||           |  . /
+      |||||||||||||||           |/
+      +------------------>      +------------------>
+
+Short running task
+Running time                 Load
+      ^                         ^
+      |                         |
+      |                         |
+1024  ||  |  |  |  |            |
+      ||  |  |  |  |            |
+      ||  |  |  |  |            | ---. .--. .--. .
+      ||  |  |  |  |            |/    '    '    '        
+      +------------------>      +------------------>
+
+</pre>
+<li> weight
+<li> capacity
+<pre>
+CPU capacity is a measure of the performance a CPU can reach,
+normalized against the most performant CPU in the system.
+Heterogeneous systems are also called asymmetric CPU capacity
+systems, as they contain CPUs of different capacities.
+
+scale_rt_capacity()
+---
+<font color="blue">
+    // only arm implements arch_scale_cpu_capacity as arm has
+    // big.LITTLE cpus
+</font>
+    unsigned long max = arch_scale_cpu_capacity(cpu);
+
+<font color="blue">
+    // the capacity used by handling irq, real-time and deadline
+    // tasks need to be sub
+</font>
+    irq = rq->avg_irq.util_avg;
+    ...
+    used = READ_ONCE(rq->avg_rt.util_avg);
+    used += READ_ONCE(rq->avg_dl.util_avg);
+    used += thermal_load_avg(rq);
+    free = max - used;
+    ...
+    return scale_irq_capacity(free, irq, max);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="load_balance_how">How</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<h4><a name="load_balance_how_pull">Pull</a></h4>
+<p>
+<font size="2">
+<U>Pull means pull tasks from the busiest runqueue to local one</U><br/>
+This is done by load_balance(). Next let's figure out following questions<br/>
+<ul>
+<li> The range to do pull
+<pre>
+Do pull among the sgs in one sd from buttom to top
+           CPU 0
+
+           sd-DIE(0-7) {sg(0-3), sg(4-7)}  
+              ^ 
+              |
+           sd-MC(0-3)  {sg(0,1), sg(2,3)}
+              ^
+              |
+           sd-SMT(0,1) {sg(0), sg(1)}
+</pre>
+<li> Who does the pull
+<pre>
+Refer to the should_we_balance()
+(1) CPU_NEWLY_IDLE, no tasks for pick_next_task_fair()
+(2) first idle cpu
+(3) group_balance_cpu(), namely, the first cpu of local sched group
+
+Let's look into the case (3)
+
+<font color="red">What's the local sched group ?</font>
+
+Let's look at the following diagram,
+  MC     sd(0-3)     sd(0-3)       sd(0-3)      sd(0-3)
+          |___________|             |___________|
+          |                         |
+          v                         v
+     .-> sg(0,1)     ------>       sg(2,3) -.
+     \_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ /
+
+  SMT    sd(0,1)      sd(0,1)      sd(2,3)      sd(2,3) 
+          |            |            |            |
+          v            v            v            v
+     .-> sg(0)  -->   sg(1) -. .-> sg(2)  -->   sg(3) -.
+     \ _ _ _ _ _ _ _ _ _ _ _ / \ _ _ _ _ _ _ _ _ _ _ _ /
+
+In SMT level,
+local sg of cpu0's sd(0,1) is sg(0), but it is sg(1) for cpu1's sd(0,1)
+
+In MC level,
+local sg of cpu0's sd(0-3) is sg(0,1) and its balance cpu is cpu0, as well as cpu1's
+local sg of cpu2's sd(0-3) is sg(2,3) and its balance cpu is cpu2, as well as cpu3's
+
+Look at the code of
+should_we_balance()
+---
+    struct sched_group *sg = env-><font color="red">sd->groups;
+                                  ^^^^^^^^^^</font>
+    ...
+    /* Are we the first CPU of this group ? */
+    return group_balance_cpu(sg) == env->dst_cpu;
+---
+</pre>
+<li> who is the busiest
+</ul>
+
+The process of load balance could be
+<pre>
+CPU0                               CPU1
+               .-------.
+               v       |
+sd-MC(0-3) {sg(0,1) sg(2,3)}  --\  
+  ^             .-----.       --/                  .-----.   
+  |             v     |                            |     v
+sd-SMT(0,1) {sg(0) sg(1)}          sd-SMT(0,1) {sg(0) sg(1)}
+
+                                            ||
+                                            \/
+
+CPU3                               CPU2                        
+                                                  .-------.
+                                                  |       v
+                             /--   sd-MC(0-3) {sg(0,1) sg(2,3)}
+                .-----.      \--     ^             .-----.     
+                |     v              |             v     |     
+sd-SMT(2,3) {sg(2) sg(3)}          sd-SMT(2,3) {sg(2) sg(3)}       
+</pre>
+</font>
+</p>
+
+<h4><a name="load_balance_how_pick">Pick</a></h4>
+<p>
+<font size="2">
+<U>Pick means select an appropriate cpu to schedule a task</U><br/>
+<br/>
+The SD_flags related to TTWU
+<pre>
+<font color="blue">SD_BALANCE_EXEC</font> \
+<font color="blue">SD_BALANCE_FORK</font>  > All of 3 levels sched_domain have these 3 flags
+<font color="blue">SD_WAKE_AFFINE</font>  /
+
+<font color="red">SD_BALANCE_WAKE</font>  > None of 3 levels sched_domain has this flags
+</pre>
+Look at select_task_rq_fair, there are two cases here,
+<ul>
+<li> WF_TTWU, try_to_wake_up()
+<pre>
+
+
+Wakeup means the task used to be scheduled on one cpu.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+At this moment, cache affinity is the most important.
+
+There are two candidates,
+(1) The previous cpu on which the wakee used be scheduled.
+    There can be warm cache there.
+(2) The cpu on which the waker is running.
+    There maybe shared cache between waker and wakee. Such
+    as, task A prepares data and wake up task B to process
+    the data. This is called wake_affine which is determined
+    by record_wakee() and wake_wide().<font color="red">Note, the waker could
+    be an interrupt</font>
+
+When wake_affine is true, select_task_rq_fair() checks whether
+prev_cpu and wake_cpu are on the same sched_domain with SD_WAKE_AFFINE.
+(This is always true)
+
+Then wake_affine() would select the idle or lower load one between
+prev_cpu and wake_cpu. We call it target_cpu.
+
+Finally, select_idle_sibling() would try to find an idle sibling (<font color="red">llc</font>)of target_cpu,
+if exist, return it, otherwise, return target_cpu.
+
+The progress is as following diagram,
+         select_task_rq_fair()
+                |
+                v         Yes
+            wake_affine ? ->  target = (idle or lower load)(prev_cpu, wake_cpu)
+                | No                             |
+                v                                |
+            target = prev_cpu                    |
+                |                                |
+                +--------------------------------+
+                v              Yes
+            idle llc sibling ? -> target = idle llc sibling
+                | No                             |
+                v                                |
+            target = target                      |
+                |                                |
+                +--------------------------------+
+                |
+                v
+            target cpu to wake up the process
+
+In conclusion, in TTWU case, cache affinity is prior. So we would look up the
+target cpu amoung <font color="red">prev_cpu, wake_cpu and their idle llc siblings.</font>
+</pre>
+<li> WF_FORK/WF_EXEC
+<pre>
+For fork and exec cases, wake affinity is not considered.
+
+select_task_rq_fair() selects the highest sched_domain with SD_BALANCE_EXEC/FORK.
+In x86 platform, this is the NUMA sched_domain.
+
+Then find_idlest_cpu() find a idlest cpu level by level.
+
+Note: find_idlest_cpu() 
+
+
+the wakeup
+</pre>
+</ul>
+
+
+</font>
+</p>
+
+<h3><a name="migration">Migration</a></h3>
+<p>
+<font size="2">
+migration is to preempt a running task forcely and move it to other cpu<br/>
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^<br/>
+It depends on a per-cpu migration SCHED_FIFO kthread which can preempt any task<br/>
+<ul>
+<li> sched affinity
+<pre>
+set_cpus_allowed_ptr() <font color="blue">//set cpumask directly on a task, used by kernel</font>
+sched_setaffinity() <font color="blue">//serves the sched_setaffinity syscall </font>
+  -> __set_cpus_allowed_ptr()
+    -> affine_move_task()
+      -> stop_one_cpu_nowait() //migration_cpu_stop()
+</pre>
+<li> load balance
+<pre>
+load_balance()
+---
+            if (active_balance) {
+                stop_one_cpu_nowait(cpu_of(busiest),
+                    active_load_balance_cpu_stop, busiest,
+                    &busiest->active_balance_work);
+            }
+---
+</pre>
+<li> rt, push and pull
+<li> soft lockup touch watchdog
+<pre>
+watchdog_timer_fn()
+---
+    if (completion_done(this_cpu_ptr(&softlockup_completion))) {
+        reinit_completion(this_cpu_ptr(&softlockup_completion));
+        stop_one_cpu_nowait(smp_processor_id(),
+                softlockup_fn, NULL,
+                this_cpu_ptr(&softlockup_stop_work));
+    }
+---
+</pre>
+<li> sched_exec
+<li> task_numa_migrate
+</ul>
+</font>
+</p>
+
+<h3><a name="cfs_bw">CFS Bandwidth Control</a></h3>
+<p>
+<font size="2">
+What's cfs bw ctl ?
+<pre>
+The bandwidth allowed for a group is specified using a quota and period.
+<font color="red">Within each given “period” (microseconds), a task group is allocated
+up to “quota” microseconds of CPU time.</font> That quota is assigned to per-cpu run
+queues in slices as threads in the cgroup become runnable. Once all quota
+has been assigned any additional requests for quota will result in those
+threads being throttled. Throttled threads will not be able to run again
+<font color="red">until the next period when the quota is replenished</font>
+</pre>
+<ul>
+<li> Account
+<pre>
+There are two critical variables in rq to account cfs bw ctl's quota
+<B>cfs_rq->runtime_remaining</B> is the slice that allocated from task group's quota
+sysctl_sched_cfs_bandwidth_slice which is 5 us by default
+update_curr()
+  -> account_cfs_rq_runtime()
+    -> __account_cfs_rq_runtime()
+    ---
+<font color="red">
+    cfs_rq->runtime_remaining -= delta_exec;
+
+    if (likely(cfs_rq->runtime_remaining > 0))
+        return;
+</font>
+    if (cfs_rq->throttled)
+        return;
+<font color="blue">
+    /*
+     * if we're unable to extend our runtime we resched so that the active
+     * hierarchy can be throttled
+     */
+</font>
+    if (!assign_cfs_rq_runtime(cfs_rq) && likely(cfs_rq->curr))
+        resched_curr(rq_of(cfs_rq));
+<font color="blue">
+    //If quota has been used up, resched the current task. The throttle is done
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //when we try to pick up task from it
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</font>
+    ---
+<B>cfs_b->runtime</B> the quota of a task group per period, the cfs_rq under
+it allocate slice from it
+__assign_cfs_rq_runtime()
+---
+    /* note: this is a positive sum as runtime_remaining <= 0 */
+    min_amount = target_runtime - cfs_rq->runtime_remaining;
+
+    if (cfs_b->quota == RUNTIME_INF)
+        amount = min_amount;
+    else {
+        start_cfs_bandwidth(cfs_b);
+<font color="red">
+        if (cfs_b->runtime > 0) {
+            amount = min(cfs_b->runtime, min_amount);
+            cfs_b->runtime -= amount;
+            cfs_b->idle = 0;
+        }
+</font>
+    }
+
+    cfs_rq->runtime_remaining += amount;
+
+    return cfs_rq->runtime_remaining > 0;
+---
+</pre>
+<li> Throttle
+<pre>
+If a cfs_b's runtime is used up, all of the cfs_rqs under it need to be throttled
+
+put_prev_entity()/pick_task_fair()/pick_next_task_fair()
+  -> check_cfs_rq_runtime()
+    -> throttle_cfs_rq() <font color="blue">//if cfs_rq->runtime_remaining <= 0</font>
+      -> dequeue_entity() <font color="blue">//throttle_cfs_rq() tries to allocate runtime slice first, if success, needn't to dequeue</font>
+</pre>
+<li> Period Timer
+<pre>
+When the cfs_rq try to allocate runtime slice from its parent, the period timer
+is started to refill the cfs_b->runtime next period.
+
+__assign_cfs_rq_runtime()
+  -> start_cfs_bandwidth()
+  ---
+    hrtimer_forward_now(&cfs_b->period_timer, cfs_b->period);
+    hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
+  ---
+
+The timer's expire callback do two things,
+ - refill runtime
+ - unthrottle cfs_rq's
+
+do_sched_cfs_period_timer()
+---
+<font color="blue">    /* Refill extra burst quota even if cfs_b->idle */</font>
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+<font color="red">    __refill_cfs_bandwidth_runtime(cfs_b);</font>
+    ...
+    while (throttled && cfs_b->runtime > 0) {
+        raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+        /* we can't nest cfs_b->lock while distributing bandwidth */
+<font color="red">        distribute_cfs_runtime(cfs_b);</font>
+        raw_spin_lock_irqsave(&cfs_b->lock, flags);
+
+        throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+    }
+---
+</pre>
+<li> Unthrottle
+<pre>
+After refill the cfs_b->runtime, some cfs_rq can be unthrottled
+distribute_cfs_runtime()
+---
+    rcu_read_lock();
+    list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+                throttled_list) {
+        struct rq *rq = rq_of(cfs_rq);
+        struct rq_flags rf;
+
+        rq_lock_irqsave(rq, &rf);
+        if (!cfs_rq_throttled(cfs_rq))
+            goto next;
+
+        raw_spin_lock(&cfs_b->lock);
+<font color="blue">
+        //allocate runtime from the cfs_b
+</font>
+        runtime = -cfs_rq->runtime_remaining + 1;
+        if (runtime > cfs_b->runtime)
+            runtime = cfs_b->runtime;
+        cfs_b->runtime -= runtime;
+        remaining = cfs_b->runtime;
+        raw_spin_unlock(&cfs_b->lock);
+
+        cfs_rq->runtime_remaining += runtime;
+
+<font color="blue">
+        /* we check whether we're throttled above */
+</font>
+        if (cfs_rq->runtime_remaining > 0)
+            unthrottle_cfs_rq(cfs_rq);
+next:
+        rq_unlock_irqrestore(rq, &rf);
+
+        if (!remaining)
+            break;
+    }
+    rcu_read_unlock();
+---
+
+</pre>
+</ul>
+</font>
+</p>
+
+
+</body>
+</html>

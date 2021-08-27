@@ -48,12 +48,15 @@
 
 <a href="#bh">buffer head</a>
 <ul>
-<li> <a href="bh_vfs_and_block">bh vs vfs and block</a>
+<li> <a href="#bh_and_friends">bh vs its friends</a>
 </ul>
 
 <a href="#jbd2">jbd2</a>
 <ul>
-<li> <a href="jbd2_transaction">transaction</a>
+<li> <a href="#jbd2_transaction">transaction</a>
+<li> <a href="#jbd2_order">Order</a>
+<li> <a href="#jbd2_recovery">Order</a>
+<li> <a href="#jbd2_revoke">Revoke</a>
 </ul>
 
 <a href="#inode">Inode</a>
@@ -69,6 +72,28 @@
 <li> <a href="#lookup">lookup</a>
 <li> <a href="#dcache_and_metadata">dcache and metadata</a>
 <li> <a href="#add_to_dcache_hash">add to dcache hash</a>
+</ul>
+
+<a href="disk_quota">Quota</a>
+<ul>
+<li> <a href="#disk_quota_where">Where to store quota data</a>
+<li> <a href="#disk_quota_how">How to use quota data</a>
+</ul>
+
+<a href="#ext4">ext4</a>
+<ul>
+<li> <a href="#ext4_xattr">Xattr</a>
+<ul>
+<li> <a href="#ext4_xattr_space">Space for xattr</a>
+<li> <a href="#ext4_xattr_ibody">ibody</a>
+<li> <a href="#ext4_xattr_external_block">external block</a>
+</ul>
+<li> <a href="#ext4_dentry">Dentry</a>
+<ul>
+<li> <a href="#ext4_dentry_dx">DX</a>
+<li> <a href="#ext4_dentry_inline">Inline</a>
+<li> <a href="#ext4_dentry_convert">inline -> block -> dx</a>
+</ul>
 </ul>
 
 <a href="#tmpfs">Tmpfs</a><br/>
@@ -2022,9 +2047,46 @@ In linux kernel, a page is 4K, but the filesystem block could be smaller than it
 In ext2/ext4, bh is used to represent the filesystem block.
 
 page->private -> bh0 -> bh1 -> bh2 -> bh3
-                                         /\
-                                        /    \
-                                 b_this_page
+
+<B>When does the block device know the filesystem block size ?</B>
+It is
+sb_set_blocksize()
+  -> sb_set_blocksize()
+  ---
+    /* Don't change the size if it is same as current */
+    if (bdev->bd_inode->i_blkbits != blksize_bits(size)) {
+        sync_blockdev(bdev);
+<font color"red">        bdev->bd_inode->i_blkbits = blksize_bits(size);</font>
+        kill_bdev(bdev);
+    }
+    return 0;
+  ---
+
+The sb->s_blocksize would influence how many bhs are allocated for a page,
+sb_getblk()
+  -> __getblk_gfp(sb->s_bdev, block, sb->s_blocksize, __GFP_MOVABLE);
+    -> __getblk_slow()
+      -> grow_buffers()
+        -> grow_dev_page()
+          -> alloc_page_buffers()
+          ---
+        offset = PAGE_SIZE;
+        while ((offset -= size) >= 0) {
+            bh = alloc_buffer_head(gfp);
+            if (!bh)
+                goto no_grow;
+
+            bh->b_this_page = head;
+            bh->b_blocknr = -1;
+            head = bh;
+
+            bh->b_size = size;
+
+            /* Link the buffer to its page */
+            set_bh_page(bh, page, offset);
+        }
+          ---
+
 
 Currently, there are mainly two positions that employ bh
 (1) <B>store bmap info</B>
@@ -2150,11 +2212,622 @@ Yes !!! jbd2 still uses bh.
 </p>
 
 <h2><a name="jbd2">jbd2</a></h2>
-<hr style="height:3px;border:none;border-top:3px solid black;" />
+<hr style="height:3px;border:none;border-top:1px solid black;" />
 <h3><a name="jbd2_transaction">transaction</a></h3>
 <p>
 <font size="2">
+<ul>
+<li> Atomicity
+<pre>
+The modifications in a transaction will be done or nothing.
+This is achieved by only flush modifications to disk after persist their log records to disk.
 
+There are TWO points here,
+<font color="red">One, ensure integrity of the log record on disk</font>
+ 
+<B>Descriptor</B>
+journal_header_s
+JBD2_DESCRIPTOR_BLOCK    chksum of descriptor
+  |                                |
+  v                                v
+ |header+tag+tag+tag+tag+tag+tag+chsum--|
+          ^                   ^
+          |                   |
+   journal_block_tag_s     tag with JBD2_FLAG_LAST_TAG
+   ---
+    __be32 t_blocknr;
+    __be16 t_checksum;
+    __be16 t_flags;
+    __be32 t_blocknr_high;
+   ---
+
+commit_header (chksum of whole transaction)
+    |
+    v
+ |commit-------------------------------|
+
+IOs
+                        Wait the IO of Descriptor and LOG completed
+                                           v
+ [Descriptor] [LOG] [LOG] [LOG] [LOG] [LOG] [Commit]
+ \___________________ ____________________/ \___ ___/
+                     v                          v       
+          REQ_OP_WRITE + REQ_SYNC      REQ_OP_WRITE + REQ_SYNC
+                                       + REQ_PREFLUSH + REQ_FUA
+
+There is async commit feature which commit w/o wait descriptor and log completed.
+It depends on the chksum to ensure the integrity of log transaction.
+
+<font color="red">Two, write out modifications only after log has been persistted to disk</font>
+After commit, the bh of metadata is handed over to writeback by
+__jbd2_journal_refile_buffer()
+  -> __jbd2_journal_unfile_buffer()<font color="blue">//jh->b_next_transaction == NULL</font>
+    -> __jbd2_journal_temp_unlink_buffer()
+    ---
+    else if (test_clear_buffer_jbddirty(bh))
+        mark_buffer_dirty(bh);    <font color="blue">/* Expose it to the VM */</font>
+    ---
+
+The interesting thing is ext4 nevery invoke mark_inode_dirty but ext4_mark_inode_dirty
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+__ext4_mark_inode_dirty()
+  -> ext4_mark_iloc_dirty()
+    -> ext4_do_update_inode()
+    ---
+<font color="blue">
+    //Update ext4_inode on buffer_head from in-core inode
+</font>
+    err = ext4_handle_dirty_metadata(handle, NULL, bh);
+    ---
+</pre>
+<li> Count
+<pre>
+How many transaction can exist in kernel ?
+There are 3 kinds of transaction,
+ - running
+ - committing
+ - checkpointing
+
+<font color="red">There can be only one running and one commit transaction at the same time,</font>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+start_this_handle()
+  -> add_transaction_credits()
+  ---
+    needed = atomic_add_return(total, &t->t_outstanding_credits);
+    if (needed > journal->j_max_transaction_buffers) {
+        atomic_sub(total, &t->t_outstanding_credits);
+<font color="blue">
+        /*
+         * Wait until running transaction passes to T_FLUSH state and new transaction
+         * can thus be started. Also starts the commit if needed. The function expects
+         * running transaction to exist and releases j_state_lock.
+         */
+</font>
+        wait_transaction_locked(journal);
+        return 1;
+    }
+  ---
+
+The T_FLUSH state means, the transaction has been totally closed (no opening handle any more)
+and become the journal->j_committing_transaction
+jbd2_journal_commit_transaction()
+---
+<font color="blue">//Drain handles on commit_transaction->t_updates</font>
+    ...
+    write_lock(&journal->j_state_lock);
+<font color="red">    commit_transaction->t_state = T_FLUSH;
+    journal->j_committing_transaction = commit_transaction;
+    journal->j_running_transaction = NULL;</font>
+    start_time = ktime_get();
+    commit_transaction->t_log_start = journal->j_head;
+    wake_up(&journal->j_wait_transaction_locked);
+    write_unlock(&journal->j_state_lock);
+--
+
+And there can be multiple checkpoint transaction,
+jbd2_journal_commit_transaction()
+---
+    spin_lock(&journal->j_list_lock);
+    if (journal->j_checkpoint_transactions == NULL) {
+        journal->j_checkpoint_transactions = commit_transaction;
+        commit_transaction->t_cpnext = commit_transaction;
+        commit_transaction->t_cpprev = commit_transaction;
+    } else {
+        commit_transaction->t_cpnext =
+            journal->j_checkpoint_transactions;
+        commit_transaction->t_cpprev =
+            commit_transaction->t_cpnext->t_cpprev;
+        commit_transaction->t_cpnext->t_cpprev =
+            commit_transaction;
+        commit_transaction->t_cpprev->t_cpnext =
+                commit_transaction;
+    }
+    spin_unlock(&journal->j_list_lock);
+---
+</pre>
+<li> Capacity
+<pre>
+Max size of a transaction is
+static inline int jbd2_journal_get_max_txn_bufs(journal_t *journal)
+{
+    return (journal->j_total_len - journal->j_fc_wbufsize) / 4;
+}
+<font color="red">1/4 total journal size</font>, excluding fast commit.
+
+The transaction size is decided by method that triggers transaction committing
+Refer to <a href="#jbd2_transaction_commit">Commit</a>
+
+The space of journal is deemed as a ring
+
+                     grow up ->
+
+                 j_tail            j_head
+                   |                 |
+                   v                 v
+        |----------drrrrrrcdrrrrrrrrc------------|
+      0            \___ __/\____ ___/              j_total_len
+                       v        v
+                      tx      t(x+1)
+
+        d: Descriptor
+        r: Log Record
+        c: Commit
+        -: free space
+
+<font color="red">Log space allocation:</font>
+jbd2_journal_next_log_block()
+---
+    write_lock(&journal->j_state_lock);
+    blocknr = journal->j_head;
+<font color="red">
+    journal->j_head++;
+    journal->j_free--;
+</font>
+    if (journal->j_head == journal->j_last)
+        journal->j_head = journal->j_first;
+    write_unlock(&journal->j_state_lock);
+    return jbd2_journal_bmap(journal, blocknr, retp);
+---
+
+<font color="red">Log space freeing:</font>
+
+            j_tail
+               |
+               v
+       |-------cpcpcpcpccccccccrrrrrrrrr--------|
+               \__ ___/\___ __/\___ ___/
+                  v        v       v
+         checkpointing committing running
+
+After checkpoint
+                     j_tail
+                       |
+                       v
+       |---------------ccccccccrrrrrrrrr--------|
+                \__ __/ \___ __/\___ ___/
+                   v       v       v
+                freed  committing running
+
+There are 3 space to free log space,
+(1) __jbd2_log_wait_for_space()
+     -> jbd2_log_do_checkpoint()
+(2) jbd2_journal_commit_transaction()
+     -> jbd2_update_log_tail()
+</pre>
+<li> Commit
+<pre>
+The transaction can be committed in following opportunities
+<font color="red"><U>fsync and other where you want files to be synced to disk</U></font>
+file's metadata is in journal
+ocfs2_sync_file()
+  -> jbd2_complete_transaction()
+<font color="blue">
+//Ext4 employs fastcommit, doesn't use jbd2_complete_transaction() in ext4_sync_file() now.
+</font>
+
+And ext4_sync_fs() is also such a thing
+
+<font color="red"><U>Running transaction exceeds its max capacity</U></font>
+Refer to add_transaction_credits()
+
+<font color="red"><U>Timeout, namely the transaction is too old</U></font>
+start_this_handle()
+  -> jbd2_get_transaction()
+  ---
+    transaction->t_expires = jiffies + journal->j_commit_interval;
+    ...
+    /* Set up the commit timer for the new transaction. */
+    journal->j_commit_timer.expires = round_jiffies_up(transaction->t_expires);
+    add_timer(&journal->j_commit_timer);
+  ---
+ 
+commit_timeout(_
+---
+    journal_t *journal = from_timer(journal, t, j_commit_timer);
+
+    wake_up_process(journal->j_task);
+---
+This j_task is kjournald2
+
+The expire time is 5 seconds by default
+#define JBD2_DEFAULT_MAX_COMMIT_AGE 5
+
+
+#define JBD2_DEFAULT_MAX_COMMIT_AGE 5
+</pre>
+<li> Handle
+<li> BH
+</ul>
+</font>
+</p>
+
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<h3><a name="jbd2_order">Order</a></h3>
+<p>
+<font size="2">
+The order here means the ext4's order mode
+<pre>
+In data=ordered mode, ext4 only officially journals metadata, but it logically
+groups metadata information related to data changes with the data blocks into a
+single unit called a transaction.  When it's time to write the new metadata
+out to disk, the associated data blocks are written first.
+</pre>
+What's this mode for ?
+<pre>
+After a system crash or a power failure, files that were written right before the
+system went down could contain previously written data or other garbage.
+With Ordered Mode, journal commits are deferred until the data blocks get written
+to disk. This guarantees that any blocks in the file will be data written by the
+application, avoiding a possibility of a security breach, which is especially
+problematic on a multi-user system.
+<a href="https://ext4.wiki.kernel.org/index.php/Ext3_Data=Ordered_vs_Data=Writeback_mode">Ext3 Order VS Writeback mode</a>
+</pre>
+
+This is not an issue right now, because the unwritten statea
+<pre>
+Both xfs and ext4 support this,
+ext4_map_blocks()
+---
+     ext4_es_lookup_extent(inode, map->m_lblk, NULL, &es)) {
+        if (ext4_es_is_written(&es) || ext4_es_is_unwritten(&es)) {
+            map->m_pblk = ext4_es_pblock(&es) +
+                    map->m_lblk - es.es_lblk;
+            map->m_flags |= ext4_es_is_written(&es) ?
+                    EXT4_MAP_MAPPED : EXT4_MAP_UNWRITTEN;
+        ...
+}
+---
+
+xfs_vm_readpage()
+  -> iomap_readpage()
+    -> iomap_apply()
+      -> iomap_readpage_actor()
+      ---
+    if (iomap_block_needs_zeroing(inode, iomap, pos)) {
+        zero_user(page, poff, plen);
+        iomap_set_range_uptodate(page, poff, plen);
+        goto done;
+    }
+      ---
+</pre>
+
+But why does ext4 still use 'order mode' as default ?
+<pre>
+In addition, <font color="red">there are some applications which depend on data=ordered
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+to automatically force data blocks to be written to disk soon after the
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+file is written.</font> Using Writeback Mode extends the time from when a file
+^^^^^^^^^^^^^^^
+is written to when it is pushed out to disk to 30 seconds. This can be
+surprising for some users; however, it should be noted that such problems
+can still be an issue with Ordered Mode (although they are much rarer).
+Again, a careful application or library should always use fsync() at points
+where the application is at a stable commit point. 
+</pre>
+Let's look at how to implement it
+<pre>
+ext4_jbd2_inode_add_write() <- ext4_map_blocks()
+                            <- __ext4_journalled_writepage()
+                            <- __ext4_block_zero_page_range()
+                            <- ext4_page_mkwrite()
+                            <- move_extent_per_page()
+
+We only need to order the page writting when extent changes
+
+
+But ocfs2 is not different,
+ocfs2_jbd2_inode_add_write()  <- ocfs2_write_failure()
+                              <- ocfs2_map_and_dirty_page()
+                              <font color="red"><- ocfs2_write_end_nolock()</font>
+                              <- ocfs2_zero_start_ordered_transaction()
+</pre>
+</font>
+</p>
+
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<h3><a name="jbd2_recovery">Recovery</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> When
+<pre>
+ext4_fill_super()
+  -> ext4_load_journal()
+    -> jbd2_journal_load()
+      -> jbd2_journal_recover()
+  -> ext4_iget()
+  -> ext4_orphan_cleanup()
+</pre>
+<li> SCAN
+<pre>
+Decide the range of logs need to be replayed, or decide the end transaction ID
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+       start            end
+        |                |
+        v                v
+ |------dlllllcdrlllllcdlll----|
+        \__ __/\___ __/\_ _/
+           t      t+1    t+2
+
+d: JBD2_DESCRIPTOR_BLOCK, journal_header_t + n * journal_block_tag_t
+l: copy of the block that need to be logged
+c: JBD2_COMMIT_BLOCK, commit_header (a journal_header_t embedded)
+r: JBD2_REVOKE_BLOCK, jbd2_journal_revoke_header_t (a journal_header_t embedded)
+
+<B>Start</B>
+Come from the journal superblock, updated by jbd2_update_log_tail()
+<B>End</B>
+(1) check magic, rule out 'l' or empty blocks
+(2) check sequence, rule out stale logs (same mkfs)
+
+(There is time stamp check to avoid previous mkfs's log)
+
+There are following rulers when scan the log
+(1) when meet 'd', bypass the following log blocks
+
+    next_log_block += count_tags(journal, bh);
+
+(2) when meet 'l', if valid increase next_commit_ID
+<font color="red">    This indicates the commit id of last complete transaction</font>
+    this commit id will be used in following pass to decide when to stop
+
+(3) revoke and descriptor block checksum error cause recovery failure,
+    but commit not
+</pre>
+<li> REVOKE
+<pre>
+Only scan the JBD2_REVOKE_BLOCK and record the blocks that need to be revoked
+when replay
+Refer to scan_revoke_records()
+</pre>
+<li> RELAY
+<pre>
+Pick up the JBD2_DESCRIPTOR_BLOCK and copy the following log blocks to it real
+position based on array of journal_block_tag_t
+do_one_pass()
+---
+            while ((tagp - bh->b_data + tag_bytes) <= journal->j_blocksize - descr_csum_size) {
+                unsigned long io_block;
+
+                tag = (journal_block_tag_t *) tagp;
+                flags = be16_to_cpu(tag->t_flags);
+
+                io_block = next_log_block++;
+                wrap(journal, next_log_block);
+<font color="blue">
+                //Read in log block
+</font>
+                err = jread(&obh, journal, io_block);
+                if (err) {
+                } else {
+<font color="blue">
+                    //get the real position on disk
+</font>
+                    blocknr = read_tag_block(journal, tag);
+<font color="blue">
+                    /* If the block has been revoked, then we're all done here. */
+</font>
+                    if (jbd2_journal_test_revoke(journal, blocknr,  next_commit_ID)) {
+                        brelse(obh);
+                        ++info->nr_revoke_hits;
+                        goto skip_write;
+                    }
+<font color="blue">                   /* Look for block corruption */</font>
+                    if (!jbd2_block_tag_csum_verify(journal, tag, obh->b_data, be32_to_cpu(tmp->h_sequence))) {
+                        brelse(obh);
+                        block_error = 1;
+                        goto skip_write;
+                    }
+
+                    nbh = __getblk(journal->j_fs_dev, blocknr, journal->j_blocksize);
+                    lock_buffer(nbh);
+<font color="red">                    memcpy(nbh->b_data, obh->b_data, journal->j_blocksize);</font>
+                    set_buffer_uptodate(nbh);
+<font color="blue">                    //Not issue the IO but just mark bh dirty</font>
+                    mark_buffer_dirty(nbh);
+                    ++info->nr_replays;
+                    unlock_buffer(nbh);
+                    brelse(obh);
+                    brelse(nbh);
+                }
+
+            skip_write:
+                tagp += tag_bytes;
+                if (!(flags & JBD2_FLAG_SAME_UUID))
+                    tagp += 16;
+
+                if (flags & JBD2_FLAG_LAST_TAG)
+                    break;
+            }
+---
+
+In RELAY pass, the do_one_pass() doesn't issue io, but just mark dirty,
+the io is issued here,
+jbd2_journal_recover()
+---
+    err = do_one_pass(journal, &info, PASS_SCAN);
+    if (!err)
+        err = do_one_pass(journal, &info, PASS_REVOKE);
+    if (!err)
+        err = do_one_pass(journal, &info, PASS_REPLAY);
+
+<font color="red">    journal->j_transaction_sequence = ++info.end_transaction;</font>
+
+    jbd2_journal_clear_revoke(journal);
+<font color="red">    err2 = sync_blockdev(journal->j_fs_dev);</font>
+    /* Make sure all replayed data is on permanent storage */
+    if (journal->j_flags & JBD2_BARRIER) {
+        err2 = blkdev_issue_flush(journal->j_fs_dev);
+    }
+
+---
+</pre>
+</ul>
+</font>
+</p>
+
+
+<font size="2">
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="jbd2_revoke">Revoke</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> Why do we need REVOKE
+<pre>
+                  log grow ->
+
+         m     f  da+w                    
+|------+----+----+----+----+----+----+--------|
+       \________ __________/\_ _/\_ _/
+                v             v    v
+               cp             c    r
+
+m : modification to metadata
+f : free the metadata block
+da: data block allocation
+w : data block writing
+
+If we replay the log, the metadata modification will replayed on the blcok
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+which has contained data. This is terrible case because the data that has been
+^^^^^^^^^^^^^^^^^^^^^^^^
+synced to disk is corrupted.
+</pre>
+<li> When to issue revoke
+<pre>
+Track the code invokes ext4_free_blocks with EXT4_FREE_BLOCKS_FORGET.
+</pre>
+<li> How to handle revoke
+<pre>
+         m   f+r  ma+w
+|------+----+----+----+----+----+----+--------|
+       \________ __________/\_ _/\_ _/
+                v             v    v
+               cp             c    r
+m : modification to metadata
+f : free the metadata block
+r : revoke record
+ma: metadata block allocation
+w : data block writing
+
+When replay the log, the revoke record which is in the same transaction
+with the freeing, will stop replaying of 'm' log record. Then it can protect
+the following data allocation and writing. But if the block is allocated
+by meta again, the revoke record won't prevent the replaying of 'ma+w' (or the 'w' only).
+
+<ul>
+<li> <B>commit</B>
+<pre>
+jbd2_journal_commit_transaction()
+---
+    /*
+     * Now start flushing things to disk, in the order they appear
+     * on the transaction lists.  Data blocks go first.
+     */
+    err = journal_submit_data_buffers(journal, commit_transaction);
+    ...
+    blk_start_plug(&plug);
+    jbd2_journal_write_revoke_records(commit_transaction, &log_bufs);
+
+    jbd_debug(3, "JBD2: commit phase 2b\n");
+---
+write_one_revoke_record()
+---
+    if (descriptor) {
+        if (offset + sz > journal->j_blocksize - csum_size) {
+            flush_descriptor(journal, descriptor, offset);
+<font color="blue">            ---
+            write_dirty_buffer() is invoked here to submit_bh
+            ---</font>
+            descriptor = NULL;
+        }
+    }
+
+    if (!descriptor) {
+        descriptor = jbd2_journal_get_descriptor_buffer(transaction,
+                            <font color="red">JBD2_REVOKE_BLOCK</font>);
+        jbd2_file_log_bh(log_bufs, descriptor);
+
+        offset = sizeof(jbd2_journal_revoke_header_t);
+        *descriptorp = descriptor;
+    }
+
+    if (jbd2_has_feature_64bit(journal))
+        * ((__be64 *)(&descriptor->b_data[offset])) =
+            cpu_to_be64(record->blocknr);
+    else
+        * ((__be32 *)(&descriptor->b_data[offset])) =
+            cpu_to_be32(record->blocknr);
+---
+The format of revoke record block is,
+
+journal_header_t
+  |
+  v
+|---|---|-------------------|
+      ^ \_________ _________/
+      |           v
+      |   block num array that need to revoked
+jbd2_journal_revoke_header_t
+</pre>
+<li> <B>recovery</B>
+<pre>
+Revoke records will be scanned before replay pass
+
+do_one_pass()
+---
+    case JBD2_REVOKE_BLOCK:
+<font color="blue">            /* If we aren't in the REVOKE pass, then we can
+             * just skip over this block. */</font>
+            if (pass != PASS_REVOKE) {
+                brelse(bh);
+                continue;
+            }
+
+            err = scan_revoke_records(journal, bh,
+                          next_commit_ID, info);
+            brelse(bh);
+            continue;
+---
+
+do_one_pass()
+---
+<font color="blue">                    /* If the block has been
+                     * revoked, then we're all done
+                     * here. */</font>
+                    if (jbd2_journal_test_revoke(journal, blocknr, next_commit_ID)) {
+                        brelse(obh);
+                        ++info->nr_revoke_hits;
+                        goto skip_write;
+                    }
+--
+</pre>
+</ul>
+</pre>
+</ul>
 </font>
 </p>
 
@@ -3016,6 +3689,633 @@ lookup_slow()
                     -> __d_rehash()
 </pre>
 </ul>
+</font>
+</p>
+
+
+<h2><a name="disk_quota">Quota</a></h2>
+<p>
+<font size="2">
+There are two basic types of disk quotas
+<ul>
+<li> block quota, limits the amount of disk space that can be used
+<li> inode quota, limits the number of files and directories that can be created
+</ul>
+The disk quotas can be set per 3 roles,
+<ul>
+<li> user
+<li> group
+<li> project
+</ul>
+There are two limit,
+<ul>
+<li> a warning level, or soft quota, at which users are informed they are nearing their limit
+<li> effective limit, or hard quota. There may also be a small grace interval, which allows users to temporarily violate their quotas by certain amounts if necessary. 
+</ul>
+</font>
+</p>
+<h3><a name="disk_quota_where">Where to store quota data</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+The quota data is in memory in runtime and need to be persistted on disk.<br/>
+On disk disk quota entry format,
+<pre>
+struct v2r1_disk_dqblk {
+    __le32 dqb_id;        /* id this quota applies to */
+    __le32 dqb_pad;
+    __le64 dqb_ihardlimit;    /* absolute limit on allocated inodes */
+    __le64 dqb_isoftlimit;    /* preferred inode limit */
+    __le64 dqb_curinodes;    /* current # allocated inodes */
+    __le64 dqb_bhardlimit;    /* absolute limit on disk space (in QUOTABLOCK_SIZE) */
+    __le64 dqb_bsoftlimit;    /* preferred limit on disk space (in QUOTABLOCK_SIZE) */
+    __le64 dqb_curspace;    /* current space occupied (in bytes) */
+    __le64 dqb_btime;    /* time limit for excessive disk use */
+    __le64 dqb_itime;    /* time limit for excessive inode use */
+};
+</pre>
+<ul>
+<li> in-memory cache
+<pre>
+dqget()
+  -> find_dquot()<font color="blue">// under dq_list_lock</font>
+  ---
+    hlist_for_each_entry(dquot, dquot_hash+hashent, dq_hash)
+        if (dquot->dq_sb == sb && qid_eq(dquot->dq_id, qid))
+            return dquot;
+  ---
+</pre>
+<li> on-disk data
+<pre>
+The disk quota data is persistted in reserved inode of filesystem.<br/>
+Look at the ext4,
+
+ext4_enable_quotas()
+  -> ext4_quota_enable()
+  ---
+    unsigned long qf_inums[EXT4_MAXQUOTAS] = {
+        le32_to_cpu(EXT4_SB(sb)->s_es-><font color="red">s_usr_quota_inum</font>),
+        le32_to_cpu(EXT4_SB(sb)->s_es-><font color="red">s_grp_quota_inum</font>),
+        le32_to_cpu(EXT4_SB(sb)->s_es-><font color="red">s_prj_quota_inum</font>)
+    };
+
+    qf_inode = ext4_iget(sb, qf_inums[type], EXT4_IGET_SPECIAL);
+<font color="blue">
+    /* Don't account quota for quota files to avoid recursion */
+</font>
+    qf_inode->i_flags |= S_NOQUOTA;
+    err = dquot_load_quota_inode(qf_inode, type, format_id, flags);
+    iput(qf_inode);
+  ---
+
+The dquot file is formated as a hash tree,
+                       |.|.|
+                        / \
+                    |.|.| |.|.|
+                     / \   / \
+                |.|.|   ...   |.|.|
+                 / \           / \
+             |.|.| |.|.|...|.|.| |.|.|
+              |
+         |e|e|e|...|
+
+ - The block size is 1024
+ - Every tree block contains 256 Indexes
+ - Tree level is fixed to 4 level, refer to qtree_depth()
+ - dquot entry is flat in the leaf block.
+
+When a leaf block is empty, it will be linked into the free list in 
+</pre>
+</ul>
+</font>
+</p>
+<h3><a name="disk_quota_how">How to use quota data</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> syncfs
+<pre>
+sync the dquot memory cache into disk,
+ext4_sync_fs()
+  -> dquot_writeback_dquots()
+</pre>
+<li> write one
+<pre>
+ext4_write_dquot()
+  -> ext4_journal_start(inode, EXT4_HT_QUOTA, EXT4_QUOTA_TRANS_BLOCKS(dquot->dq_sb));
+  -> dquot_commit()
+    -> v2_write_dquot()
+      ->qtree_write_dquot()
+        ->ext4_quota_write
+---
+    handle_t *handle = journal_current_handle();
+
+    do {
+        bh = ext4_bread(handle, inode, blk,
+                EXT4_GET_BLOCKS_CREATE |
+                EXT4_GET_BLOCKS_METADATA_NOFAIL);
+    } while (PTR_ERR(bh) == -ENOSPC &&
+         ext4_should_retry_alloc(inode->i_sb, &retries));
+    err = ext4_journal_get_write_access(handle, bh);
+    lock_buffer(bh);
+    memcpy(bh->b_data+offset, data, len);
+    flush_dcache_page(bh->b_page);
+    unlock_buffer(bh);
+    err = ext4_handle_dirty_metadata(handle, NULL, bh);
+    brelse(bh);
+---
+</pre>
+<li> install when open file
+<pre>
+ext4_file_open()
+  -> dquot_file_open()
+    -> __dquot_initialize()
+    ---
+    /* First get references to structures we might need. */
+    for (cnt = 0; cnt < MAXQUOTAS; cnt++) {
+        ...
+        switch (cnt) {
+        case USRQUOTA:
+            qid = make_kqid_uid(inode->i_uid);
+            break;
+        case GRPQUOTA:
+            qid = make_kqid_gid(inode->i_gid);
+            break;
+        case PRJQUOTA:
+            rc = inode->i_sb->dq_op->get_projid(inode, &projid);
+            qid = make_kqid_projid(projid);
+            break;
+        }
+        dquot = dqget(sb, qid);
+        got[cnt] = dquot;
+    }
+    ---
+
+</pre>
+<li> alloc block
+<pre>
+ext4_mb_new_blocks()
+  -> dquot_alloc_block()
+    -> dquot_alloc_space()
+      -> dquot_alloc_space_nodirty()
+        -> __dquot_alloc_space()
+          -> dquot_add_space()
+          -> __inode_add_bytes()_
+          -> mark_all_dquot_dirty()
+            -> mark_dquot_dirty()
+               ext4_mark_dquot_dirty()
+               ---
+            if (ext4_is_quota_journalled(sb)) {
+                dquot_mark_dquot_dirty(dquot);
+                return ext4_write_dquot(dquot);
+            } else {
+                return dquot_mark_dquot_dirty(dquot);
+            }
+               ---
+</pre>
+<li> alloc inode
+<pre>
+__ext4_new_inode()
+<font color="blue">This is invoked after inode is created</font>
+  -> dquot_alloc_inode()
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h2><a name="ext4">Ext4</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="ext4_xattr">Xattr</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+In Linux, the ext2, ext3, ext4, JFS, Squashfs, Yaffs2, ReiserFS, Reiser4, XFS, Btrfs,
+OrangeFS, Lustre, OCFS2 1.6, ZFS, and F2FS[11] filesystems support extended attributes 
+(abbreviated xattr) when enabled in the kernel configuration. Any regular file or directory 
+may have extended attributes consisting of a name and associated data. The name must be a 
+null-terminated string prefixed by a namespace identifier and a dot character. Currently, 
+four namespaces exist: user, trusted, security and system. The user namespace has no 
+restrictions with regard to naming or contents. The system namespace is primarily used by 
+the kernel for access control lists. The security namespace is used by SELinux, for example.
+
+The Linux kernel allows extended attribute to have names of up to 255 bytes and values of 
+up to 64 KiB,[15] as do XFS and ReiserFS, but ext2/3/4 and btrfs impose much smaller limits, 
+requiring all the attributes (names and values) of one file to fit in one "filesystem block" 
+(usually 4 KiB). Per POSIX.1e,[citation needed] the names are required to start with one of 
+security, system, trusted, and user plus a period. This defines the four namespaces of 
+extended attributes.[16]
+
+Extended attributes can be accessed and modified using the getfattr and setfattr commands 
+from the attr package on most distributions.[17] The APIs are called getxattr and setxattr. 
+</pre>
+</font>
+</p>
+
+<h4><a name="ext4_xattr_space">Space for xattr</a></h4>
+<p>
+<font size="2">
+Where is the xattr of ext4 stored ? There are 2 places,
+<ul>
+<li> inode body
+<pre>
+Ext4 has an 256 inode size by default(can be configured), but the ext4_inode structure is only 160
+bytes. The left space is for storing xattr.
+
+|iiiiiiixxxxx|iiiiiiixxxxx|iiiiiiixxxxx|iiiiiiixxxxx|
+
+i: inode on disk
+x: xattrs
+
+ext4_xattr_ibody_get()
+---
+    error = ext4_get_inode_loc(inode, &iloc);
+    raw_inode = ext4_raw_inode(&iloc);
+    header = IHDR(inode, raw_inode);
+<font color="blue">
+        ((void *)raw_inode + EXT4_GOOD_OLD_INODE_SIZE(128) + EXT4_I(inode)->i_extra_isize)
+</font>
+    end = (void *)raw_inode + EXT4_SB(inode->i_sb)->s_inode_size;
+    entry = IFIRST(header);
+    error = xattr_find_entry(inode, &entry, end, name_index, name, 0);
+---
+</pre>
+<li> external block, a filesystem block pointed by inode.i_file_acl_lo | i_file_acl_high
+<pre>
+ext4_xattr_block_get()
+---
+<font color="blue">
+    //one bh is enough as its size is one filesystem block
+</font>
+    bh = ext4_sb_bread(inode->i_sb, EXT4_I(inode)->i_file_acl, REQ_PRIO);
+    entry = BFIRST(bh);
+    end = bh->b_data + bh->b_size;
+    error = xattr_find_entry(inode, &entry, end, name_index, name, 1);
+---
+</pre>
+<li> extended attribute inode
+<pre>
+If value of an attribute is greater than 2048 bytes the value is not
+saved in the external EA block, instead it is saved in an inode. The EA
+entry saves the inode number in e_value_inum field (earlier this was
+e_value_block that was unused). <font color="red">The maximum size of the EA is limited to
+64K </font>due to VFS limitations as can be seen in linux/limits.h. A new
+EXT4_FEATURE_INCOMPAT_EA_INODE feature has been added for this.
+
+ext4_xattr_entry.e_value_inum
+<font color="blue">
+The inode where the value is stored. Zero indicates the value is in the
+same block as this entry. This field is only used if the INCOMPAT_EA_INODE
+feature is enabled.
+</font>
+
+Note ! this kind of xattr entry can be stored in both inode body and external block.
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ext4_xattr_ibody_get()/ext4_xattr_block_get()
+---
+        if (entry->e_value_inum) {
+<font color="red">
+            error = ext4_xattr_inode_get(inode, entry, buffer,
+                             size);
+</font>
+        } else {
+            u16 offset = le16_to_cpu(entry->e_value_offs);
+            void *p = bh->b_data + offset;
+
+            memcpy(buffer, p, size);
+        }
+---
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h3><a name="ext4_dentry">Dentry</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+
+<h4><a name="ext4_dentry_dx">DX</a></h4>
+<p>
+<font size="2">
+First let's look at some basic data structure
+<ul>
+<li> ext4_dir_entry_2
+<pre>
+struct ext4_dir_entry_2 {
+    __le32    inode;            /* Inode number */
+    __le16    rec_len;        /* Directory entry length */
+    __u8    name_len;        /* Name length */
+    __u8    file_type;        /* See file type macros EXT4_FT_* below */
+    char    name[EXT4_NAME_LEN];    /* File name */
+};
+EXT4_NAME_LEN is 255.
+The reason why we still need rec_len when we have name_len,
+    
+     foo      doo    eoo   aoo
+    |-----|--------|-----|------|
+    
+    after unlink eoo
+    
+     foo      doo          aoo
+    |-----|--------------|------|
+          \______ _______/
+                 v
+             doo.rec_len
+
+The rec_len is used to jump to the next dentry.
+Refer to the code of ext4_search_dir()
+
+By default, the directory file is a list of ext4_dir_entry_2 linked by rec_len.
+The lookup method is to serach a dentry in the list which is very ineffcient.
+To imporve this, hash tree dentry is introduced.
+</pre>
+<li> dx_root
+<pre>
+struct dx_root and dx_node of index
+{
+    struct fake_dirent dot; <font color="blue">// for '.', rec_len = 12</font>
+    char dot_name[4];
+    struct fake_dirent dotdot; <font color="blue">// for '..', block_size - 12</font>
+    char dotdot_name[4];
+    struct dx_root_info
+    {
+        __le32 reserved_zero;
+        u8 hash_version;
+        u8 info_length; /* 8 */
+        u8 indirect_levels;
+        u8 unused_flags;
+    }
+    info;
+    struct dx_entry    entries[];
+};
+
+struct dx_node
+{
+    struct fake_dirent fake; //rec_len = block size
+    struct dx_entry    entries[];
+};
+
+For backwards read-only compatibility with ext2, this tree is actually
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+hidden inside the directory file, the fake_dirent is to masquerad as
+"empty" directory data blocks! The ext2 can read the leaf blocks.
+</pre>
+<li> dx_entry
+<pre>
+struct dx_entry
+{
+    __le32 hash;
+    __le32 block;
+};
+
+The first dx_entry of both root or node is special,
+
+__le16     limit     Maximum number of dx_entries that can follow this header,
+                plus 1 for the header itself.
+__le16     count     Actual number of dx_entries that follow this header,
+                plus 1 for the header itself.
+__le32     block     The block number (within the directory file) that goes
+                with the lowest hash value of this block. This value is
+                stored in the parent block. For the root, this hash vaule
+                is 0.
+</pre>
+</ul>
+The directory file can be formated as following,
+<pre>
+R: dx_root    N: dx_node    E: dx_entry     D: ext4_dir_entry_2
+
+       {D/D/D/} {D/D/D/D} {D/D/D/D} {D/D/D/D}
+
+or
+
+                         {R E/E/E/E/E }        \
+                      ...  /       \ ...       |
+                  {N E/E/E/E}     {N E/E/E/E}   > index
+                     /  \             ...      |
+           {N E/E/E/E}  {N E/E/E/E}            /
+                / \        ... 
+       {D/D/D/D}  {D/D/D/D}                    }  dentry
+
+
+(1) The E in index is sorted by hash
+(2) The D in dentry is is a list linked by rec_len
+
+Obviously, the index tree is introduced to promote the lookup performance.
+</pre>
+
+Regarding to the dentry hash tree, there are following points,
+<ul>
+<li> probe
+<pre>
+Look for the dx_entry of the leaf (a block filled by dentry)
+dx_probe()
+---
+    entries = (struct dx_entry *)(((char *)&root->info) +
+                      root->info.info_length);
+    while (1) {
+        count = dx_get_count(entries);
+        p = entries + 1;
+        q = entries + count - 1;
+        while (p <= q) {
+            m = p + (q - p) / 2;
+            if (dx_get_hash(m) > hash)
+                q = m - 1;
+            else
+                p = m + 1;
+        }
+
+        at = p - 1;
+        frame->entries = entries;
+        frame->at = at;
+<font color="red">
+        if (!indirect--)
+            return frame;
+</font>
+        frame++;
+        frame->bh = ext4_read_dirblock(dir, dx_get_block(at), INDEX);
+        entries = ((struct dx_node *) frame->bh->b_data)->entries;
+    }
+---
+</pre>
+<li> split
+<pre>
+When a block is full, we need to split it into two
+
+       []   -\      []
+       /    -/     /  \
+   [xxxxxx]    [xxx]  [xxx]
+
+- index dx_node, split the dx_entry by half, as dx_entry's size is fixed
+  refer to code of ext4_dx_add_entry
+- leaf blocks, split it by the size of dentries, as the dentry's size is different
+  refer to the code of do_split
+
+Note, before do leaf block, we need to check whether the space of index dx_node
+is enough, if not, do split on index first.
+</pre>
+<li> add level
+<pre>
+When there is no space in index tree, we have to add level
+     [yyyyyy]1             [z]1               [z]
+      /            -\      /          -\      /  \
+ [xxx]     [xxx]   -/  [yyyyyy]2      -/  [yyyy] [yyy]
+                          /                 / \
+                     [xxx]    [xxx]     [xxx] [xxx]
+
+The ext4 index's max level is 2 or 3 when largedir feature is enabled
+
+Noted, when add new level, dx_entries in block1, "yyyyyyy", is copied to the new
+block 2, then add a dx_entry into block 1 to point to block2.
+This policy is also suitable for the case when level is 2. Because the root
+block must be logical blk0 of directoy file.
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="ext4_dentry_inline">Inline</a></h4>
+<p>
+<font size="2">
+<ul>
+<li> How many space can used by inlined data <B>in inode</B>
+<pre>
+ext4_inode.i_block[EXT4_N_BLOCKS] //__le32
+
+#define    EXT4_NDIR_BLOCKS        12
+#define    EXT4_IND_BLOCK            EXT4_NDIR_BLOCKS
+#define    EXT4_DIND_BLOCK            (EXT4_IND_BLOCK + 1)
+#define    EXT4_TIND_BLOCK            (EXT4_DIND_BLOCK + 1)
+#define    EXT4_N_BLOCKS            (EXT4_TIND_BLOCK + 1)
+
+60 bytes per inode
+</pre>
+<li> When to use inlined data
+<pre>
+__ext4_new_inode()
+---
+    ei->i_inline_off = 0;
+    if (ext4_has_feature_inline_data(sb) &&
+        (!(ei->i_flags & EXT4_DAX_FL) || S_ISDIR(mode)))
+        ext4_set_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA);
+---
+ext4_init_new_dir()
+---
+    if (ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA)) {
+        err = ext4_try_create_inline_dir(handle, dir, inode);
+        ...
+    }
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h4> <a name="ext4_dentry_convert">inline -> block -> index</a></h4>
+<p>
+<font size="2">
+<pre>
+inode inline            block             index
+   +---+                +----+            +----+
+   |   |            -\  |dddd|    -\      |    |
+   |ddd| } dentry   -/  |dddd|    -/      +----+
+   +---+           [1]  +----+   [2]      /    \
+                                       +----+ +----+
+                                       |dddd| |dddd|
+                                       +----+ +----+
+</pre>
+[1] inline to block
+<pre>
+ext4_try_add_inline_entry()
+  -> ext4_convert_inline_data_nolock()
+  ---
+    map.m_lblk = 0;
+    map.m_len = 1;
+    map.m_flags = 0;
+    error = ext4_map_blocks(handle, inode, &map, EXT4_GET_BLOCKS_CREATE);
+    ...
+    data_bh = sb_getblk(inode->i_sb, map.m_pblk);
+    ...
+    lock_buffer(data_bh);
+    error = ext4_journal_get_create_access(handle, data_bh);
+    memset(data_bh->b_data, 0, inode->i_sb->s_blocksize);
+
+    if (!S_ISDIR(inode->i_mode)) {
+<font color="blue">
+        // The interesting thing is both the inode and data block need
+        // to be recorded in log. Because they need to be completed in
+        // one transaction
+</font>
+        memcpy(data_bh->b_data, buf, inline_size);
+        set_buffer_uptodate(data_bh);
+        error = ext4_handle_dirty_metadata(handle,
+                           inode, data_bh);
+    } else {
+<font color="blue">
+        // There are 3 steps here
+        // (1) create '.' and '..' dentry
+        // (2) copy the inlined dentries
+        // (3) set the tail dentry of which rec_len covers the whole block
+</font>
+        error = ext4_finish_convert_inline_dir(handle, inode, data_bh,
+                               buf, inline_size);
+    }
+    unlock_buffer(data_bh);
+  ---
+</pre>
+
+[2] block to index
+<pre>
+ext4_add_entry()
+  -> make_indexed_dir()
+  ---
+<font color="blue">    /* The 0th block becomes the root, move the dirents out */</font>
+    fde = &root->dotdot;
+    de = (struct ext4_dir_entry_2 *)((char *)fde +
+        ext4_rec_len_from_disk(fde->rec_len, blocksize));
+    len = ((char *) root) + (blocksize - csum_size) - (char *) de;
+<font color="blue">    /* Allocate new block for the 0th block's dirents */</font>
+    bh2 = ext4_append(handle, dir, &block);
+    ext4_set_inode_flag(dir, EXT4_INODE_INDEX);
+    data2 = bh2->b_data;
+
+    memcpy(data2, de, len);
+    memset(de, 0, len); /* wipe old data */
+<font color="blue">//Get the last dentry and make its rec_len cover the whole block</font>
+    de = (struct ext4_dir_entry_2 *) data2;
+    top = data2 + len;
+    while ((char *)(de2 = ext4_next_entry(de, blocksize)) < top)
+        de = de2;
+    de->rec_len = ext4_rec_len_to_disk(data2 + (blocksize - csum_size) -
+                       (char *) de, blocksize);
+<font color="blue">    /* Initialize the root; the dot dirents already exist */</font>
+    de = (struct ext4_dir_entry_2 *) (&root->dotdot);
+    de->rec_len = ext4_rec_len_to_disk(
+            blocksize - ext4_dir_rec_len(2, NULL), blocksize);
+    memset (&root->info, 0, sizeof(root->info));
+    root->info.info_length = sizeof(root->info);
+    if (ext4_hash_in_dirent(dir))
+        root->info.hash_version = DX_HASH_SIPHASH;
+    else
+        root->info.hash_version =
+                EXT4_SB(dir->i_sb)->s_def_hash_version;
+
+    entries = root->entries;
+<font color="blue">// The first leaf block's offset is 1</font>
+    dx_set_block(entries, 1);
+    dx_set_count(entries, 1);
+    dx_set_limit(entries, dx_root_limit(dir, sizeof(root->info)));
+    ...
+    retval = ext4_handle_dirty_dx_node(handle, dir, frame->bh);
+    retval = ext4_handle_dirty_dirblock(handle, dir, bh2);
+<font color="blue">// Split the leaf block as it is filled up
+    de = do_split(handle,dir, &bh2, frame, &fname->hinfo);
+
+    retval = add_dirent_to_buf(handle, fname, dir, inode, de, bh2);
+  ---
+</pre>
 </font>
 </p>
 

@@ -10,311 +10,941 @@
 </div>
 <p>
 <font size="2">
-<a href="#DLM">DLM</a><br/>
+<a href="#format">Disk Format</a>
 <ul>
-<li><a href="#dlmlock_API">dlmlock API</a>
-<li><a href="#Lock_MC">Lock Mode Compatibility</a>
-<li><a href="#Lock_Resource">Lock Resource</a>
-<li><a href="#Interaction">Interaction</a>
-<li><a href="#AST_BAST">AST/BAST</a>
+<li> <a href="#format_basis">Basis</a>
 </ul>
-
-<a href="#OCFS2">OCFS2</a><br/>
+<a href="#o2cb">O2CB</a>
 <ul>
-<li><a href="#Cache_consistency">cache consistency</a>
-
-</ul>
-</font>
-</p>
-
-<h2><a name="DLM">DLM</a></h2>
-<hr style="height:5px;border:none;border-top:1px solid black;" />
-<p>
-<font size="2">
-<a href="http://opendlm.sourceforge.net/cvsmirror/opendlm/docs/dlmbook_final.pdf">DLM book</a>
-</font>
-</p>
-
-<h3><a name="dlmlock_API">dlmlock API</a></h3>
-<p>
-<font size="2">
-<pre>
-status = dlmlock( LKM_CRMODE,   /* mode */
-                       &lksb,   /* addr of lock status block */
-                  LKM_VALBLK,   /* flags */
-                     "RES-A",   /* name */
-                           5,   /* namelen */
-                    ast_func,   /* ast routine triggered */
-                           0,   /* astargs */
-                          0);   /* bast */
-</pre>
-</font>
-</p>
-
-<h3><a name="Lock_MC">Lock Mode Compatibility</a></h3>
-<p>
-<font size="2">
-<pre>
-     NL   CR   CW   PR   PW   EX
-NL   Yes  Yes  Yes  Yes  Yes  Yes
-CR   Yes  Yes  Yes  Yes  Yes  No
-CW   Yes  Yes  Yes  No   No   No
-PR   Yes  Yes  No   Yes  No   No
-PW   Yes  Yes  No   No   No   No
-EX   Yes  No   No   No   No   No
-</pre>
-</font>
-</p>
-
-<h3><a name="Lock_Resource">Lock Resource</a></h3>
-<p>
-<font size="2">
-<pre>
-A lock resource has the following components:
+<li> <a href="#o2cb_nodes">Nodes</a>
+<li> <a href="#o2cb_hb">Heartbeat</a>
+<li> <a href="#o2cb_init">Init when boot</a>
+<li> <a href="#o2cb_net">Net</a>
 <ul>
-<li> A name, which is a string of no more than 31 characters
-<li> A lock value block
-<li> A set of lock queues
+<li> <a href="#o2cb_net_setup">Setup</a>
+<li> <a href="#o2cb_net_purpose">Purpose</a>
+<li> <a href="#o2cb_net_keepalive">Keepalive</a>
 </ul>
-Lock Resource Queues
+<li> <a href="#o2cb_node_down">Node down</a>
+</ul>
+<a href="#journal_replay">Journal Replay</a><br/>
+<a href="#cache_consistency">Cache Consistency</a>
+</font>
+</p>
+
+<h2><a name="format">Disk Format</a></h2>
+<h3><a name="format_basis">Basis</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
 <ul>
-<li> Grant Queue
+<li> cluster size
 <pre>
-     The grant queue contains all locks granted by the lock manager on the lock resource, except those locks
-     converting to a mode incompatible with the mode of a granted lock.
-</pre>
-<li> Convert Queue
-<pre>
-    The convert queue contains all <U>granted</U> locks that have attempted to convert to a mode <U>incompatible</U> with the
-    mode of the most restrictive currently granted lock. The locks on the convert queue are still granted at the same
-    mode as before the conversion request. The lock manager processes the locks on the convert queue in "first-in,
-    first-out" (FIFO) order.
-</pre>
-<li> Wait Queue
-<pre>
-    The wait queue contains all new lock requests not yet granted because their mode is incompatible with the mode
-    of the most restrictive currently granted lock. The lock manager processes the locks on the wait queue in FIFO
-    order.
-</pre>
-</ul>
-</pre>
-</font>
-</p>
+The smallest unit of blocks of regular files
 
-<h3><a name="Interaction">Interaction</a></h3>
-<p>
-<font size="2">
-
-The conversion can promote a lock from a less restrictive to a more restrictive mode, called an up-conversion,<br/>
-or demote a lock from a more restrictive to a less restrictive mode, called a down-conversion.<br/>
-<U>Only granted locks can be converted</U>. It is not possible to convert a lock already in the process of
-converting or a request that is blocked on the wait queue.
-Look at following scenario.
-<pre>
-        G_Q - L1-CR - L2-CR - L3-CR
-[RES-A] C_Q
-        B_Q
-
-If L3 want to convert to CW, Lock manager can grant the request.
-Because
-<ul>
-<li> CW is compatible with the most restrictive granted currently
-<li> C_Q is empty
-</ul>
-        G_Q - L1-CR - L2-CR - L3-CW
-[RES-A] C_Q
-        B_Q
-
-If L1 want to convert to EX, Lock manager will not grant this request,
-because EX is not incompatible with CW. It will move the L1 to C_Q.
-        G_Q - L2-CR - L3-CW
-[RES-A] C_Q - L1-EX
-        B_Q
-
-If L2 want to convert to CW, Lock manager will not grant this requset,
-because C_Q is not empty, it will be queued at the tail of C_Q.
-
-        G_Q - L3-CW
-[RES-A] C_Q - L1-EX - L2-CW 
-        B_Q
-
-
-The lock manager grants all down-conversion requests in-place; that is, the lock is converted to the new mode
-without being moved to the convert queue, even if there are other lock requests on the convert queue. The lock
-manager grants all down-conversions because they are compatible with the most restrictive locks on the grant queue
-(the lock was already granted at a more restrictive mode)
-
-        G_Q - L3-CW
-[RES-A] C_Q - L1-EX - L2-CW 
-        B_Q
-
-If L3 want to convert to NL, it will be granted by Lock manager.
-And then, L1 will be granted and moved to G_Q
-
-        G_Q - L3-NL - L1-EX
-[RES-A] C_Q - L2-CW 
-        B_Q
-
-</pre>
-
-If you request a lock and the mode is incompatible with the most restrictive granted lock, your request is blocked.<br/>
-It will be granted:<br/>
-<pre>
-The lock request becomes compatible with the mode of the most restrictive lock currently granted on the lock
-resource, and there are no converting locks or blocked locks queued ahead of the lock request. The lock manager
-processes the wait queue in FIFO order, after processing the convert queue. No blocked request can be unblocked
-by the release of a granted lock, regardless of the compatibility of its mode, <U>until all blocked requests on the
-convert queue and all blocked requests ahead of it on the wait queue have been granted</U>.
-</pre>
-
-</font>
-</p>
-
-<h3><a name="AST_BAST">AST/BAST</a></h3>
-<p>
-<font size="2">
-<pre>
-Unlike user-space clients, the DLM can directly execute callback routines when asynchronous lock requests are
-satisfied (AST delivery), or in the case <U>a kernel-space client is holding that blocks another lock request (BAST
-delivery)</U>.
-When a kernel-space client’s lock request is satisfied, whether successfully (lock granted) or unsuccessfully (for
-example, request timed out) the client will be notified via an AST.
-
-</pre>
-</font>
-</p>
-
-<h2><a name="OCFS2">OCFS2</a></h2>
-<hr style="height:5px;border:none;border-top:1px solid black;" />
-
-<h3><a name="Cache_consistency">cache consistency</a></h3>
-<p>
-<font size="2">
-OCFS2 caches file data and metadata in memory. Changes on one node are seen on other nodes in a
-cluster. How to achieve this ?<br/>
-<B>
-In one word, take cluster inode lock will force other nodes drop cache
-</B>
-<br/>
-The usage of the lock:
-<pre>
-ocfs2_readpage
-  -> ocfs2_inode_lock_full //<font color="red">DLM_LOCK_PR</font>
-  -> block_read_full_page
-  -> ocfs2_inode_unlock    // ex == false
-
-ocfs2_write_begin
-  -> ocfs2_inode_lock //<font color="red">DLM_LOCK_EX</font>
-ocfs2_write_end
-  -> ocfs2_inode_unlock // ex == true
-
-ocfs2_writepage
-  -> no inode lock
-</pre>
-
-The most important point is ocfs2_inode_unlock will not drop the dlmlock.
-<pre>
-ocfs2_inode_unlock
-  -> ocfs2_cluster_unlock
-    -> __ocfs2_cluster_unlock
-      -> ocfs2_dec_holders // only the DLM_LOCK_EX/DLM_LOCK_PR will be handled.
-                           // this also indicates that only EX/PR is used in ocfs2
-                           // <font color="red">Decrement
-                           // lockres->l_ex_holders/l_ro_holders</font>
-      -> ocfs2_downconvert_on_unlock
+There is a default policy to decide cluster size,
+mkfs.ocfs2/mkfs.c fill_defaults()
 ---
+    if (!s->cluster_size) {
+        switch (s->fs_type) {
+        case OCFS2_MKFSTYPE_DATAFILES:
+        case OCFS2_MKFSTYPE_VMSTORE:
+            s->cluster_size = cluster_size_datafiles(s);
+            ---
 <font color="blue">
-    // someone is waiting for our lock
-    // refer to ocfs2_generic_handle_bast
+                if (volume_gigs < 64)
+                    cluster_size = 128;
+                else if (volume_gigs < 96)
+                    cluster_size = 256;
+                else if (volume_gigs < 128)
+                    cluster_size = 512;
+                else
+                    cluster_size = 1024;
+
+                return cluster_size * 1024;
 </font>
-    if (lockres->l_flags & OCFS2_LOCK_BLOCKED) {
-        switch(lockres->l_blocking) {
-        case DLM_LOCK_EX:
-<font color="blue">
-            // EX is not compatible with both EX and PR
-</font>
-            if (!lockres->l_ex_holders && !lockres->l_ro_holders)
-                kick = 1;
-            break;
-        case DLM_LOCK_PR:
-<font color="blue">
-            // PR is not compatible with EX, but PR
-</font>
-            if (!lockres->l_ex_holders)
-                kick = 1;
+            ---
             break;
         default:
-            BUG();
+            s->cluster_size = cluster_size_default(s);
+            ---
+<font color="blue">
+                for (cluster_size = 4096; cluster_size < 1024 * 1024; cluster_size <<= 1) {
+                    cluster_size_bits = get_bits(s, cluster_size);
+
+                    volume_size =
+                        s->volume_size_in_bytes >> cluster_size_bits;
+
+                    if (volume_size <= (2^32 - 1))
+                        break;
+                }
+            ---
+</font>
+            break;
         }
     }
-
-    if (kick)
-        ocfs2_wake_downconvert_thread(osb);
 ---
 </pre>
-We could see that, the ocfs2_inode_unlock <U>doesn't unlock, but just update
-holders.</U>
+<li> cluster group
 <pre>
-Think of following scenario:
+include/ocfs2/ocfs2.h ocfs2_calc_cluster_groups()
+---
+    uint16_t max_bits = 8 * ocfs2_group_bitmap_size(blocksize, 0, 0);
+<font color="blue">
+    ---
+    int size = blocksize - offsetof(struct ocfs2_group_desc, bg_bitmap);
+    ---
+</font>
 
-Node 0                       Node 1
+    cgs->cgs_cpg = max_bits;
 
-write
-lock inode with EX
-                             read
-                             try to lock inode with PR
-                             blocked
-BAST is triggered
+    cgs->cgs_cluster_groups = (clusters + cgs->cgs_cpg - 1) / 
+                  cgs->cgs_cpg;
+    cgs->cgs_tail_group_bits = clusters % cgs->cgs_cpg;
+    if (cgs->cgs_tail_group_bits == 0)
+        cgs->cgs_tail_group_bits = cgs->cgs_cpg;
+
+ocfs2_group_desc     bitmap
+  +----------+-------------------+
+  |          |                   |
+  +----------+-------------------+
+ bg_next_group
+      |
+      v
+ ocfs2_group_desc     bitmap
+  +----------+-------------------+
+  |          |                   |
+  +----------+-------------------+
+
+---
 </pre>
-<br/>
-Look at what does BAST do:
+<li> journal size
 <pre>
-o2cb_dlm_lock
+    switch (s->fs_type) {
+    case OCFS2_MKFSTYPE_DATAFILES:
+        j_blocks = journal_size_datafiles();<font color="blue">//8K * 4K</font>
+        break;
+    case OCFS2_MKFSTYPE_MAIL:
+        j_blocks = journal_size_mail(s);<font color="blue">//64K * 4K</font>
+        break;
+    case OCFS2_MKFSTYPE_VMSTORE:
+        j_blocks = journal_size_vmstore(s);<font color="blue">//32K * 4K</font>
+        break;
+    default:
+        j_blocks = journal_size_default(s);<font color="blue">//min(64K * 4K, volume_size/160)</font>
+        break;
+    }
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="format_system_files">System Files</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<ul>
+<li> GLOBAL_BITMAP_SYSTEM_INODE
+<pre>
+ocfs2_dinode.id2.i_chain
+struct ocfs2_chain_list {
+/*00*/    __le16 cl_cpg;            /* Clusters per Block Group */
+    __le16 cl_bpc;            /* Bits per cluster */
+    __le16 cl_count;        /* Total chains in this list */
+    __le16 cl_next_free_rec;    /* Next unused chain slot */
+    __le64 cl_reserved1;
+/*10*/    struct ocfs2_chain_rec cl_recs[0];    /* Chain records */
+};
+
+struct ocfs2_chain_rec {
+    __le32 c_free;    /* Number of free bits in this chain. */
+    __le32 c_total;    /* Number of total bits in this chain */
+    __le64 c_blkno;    /* Physical disk offset (blocks) of 1st group */
+};
+
+All of the ocfs2_group_desc and its following bitmap are <font color="red">hash-linked</font> on the
+ocfs2_chain_rec.c_blkno
+
+global bitmap system inode         c_blkno                bg_next_group
+ocfs2_dinode.id2.i_chain.cl_recs[0]  ->  ocfs2_group_desc      ->     ocfs2_group_desc
+                                [1]  ->  ocfs2_group_desc      ->     ocfs2_group_desc
+                                [2]  ->  ocfs2_group_desc      ->     ocfs2_group_desc
+mkfs.ocfs2/mkfs.c main()
 ---
-    status = dlmlock(conn->cc_lockspace, o2dlm_mode, &lksb->lksb_o2dlm,
-             o2dlm_flags, name, namelen,
-             o2dlm_lock_ast_wrapper, lksb,
-             o2dlm_blocking_ast_wrapper);
----
-
-o2dlm_blocking_ast_wrapper
-  -> lksb->lksb_conn->cc_proto->lp_blocking_ast(lksb, level);
-
-ocfs2_blocking_ast
-  -> ocfs2_generic_handle_bast
-    -> lockres_or_flags(lockres, OCFS2_LOCK_BLOCKED) // if needs_downconvert
-  -> ocfs2_schedule_blocked_lock
-    -> lockres_or_flags(lockres, OCFS2_LOCK_QUEUED)
-    -> list_add_tail(&lockres->l_blocked_list,
-                  &osb->blocked_lock_list);
-  -> ocfs2_wake_downconvert_thread
-    -> wake up osb->dc_event
-
-ocfs2_downconvert_thread
-  -> ocfs2_downconvert_thread_do_work
-    -> iterate osb->blocked_lock_list
-       ocfs2_process_blocked_lock
-         -> ocfs2_unblock_lock
-           -> lockres->l_ops->downconvert_worker
-              ocfs2_inode_inode_lops.downconvert_worker
-              ocfs2_data_convert_worker
-
-static int ocfs2_data_convert_worker(struct ocfs2_lock_res *lockres,
-                     int blocking)
-{
+    tmprec = &(record<font color="red">[GLOBAL_BITMAP_SYSTEM_INODE]</font>[0]);
     ...
-    inode = ocfs2_lock_res_inode(lockres);
-    mapping = inode->i_mapping;
+    s->global_bm = initialize_bitmap (s, s->volume_size_in_clusters,
+                      s->cluster_size_bits,
+                      "global bitmap", tmprec);
+---
+initialize_bitmap()
+---
+    for(i = 1; i < s->nr_cluster_groups; i++) {
+        if (i == (s->nr_cluster_groups - 1))
+            cpg = s->tail_group_bits;
+        bitmap->groups[i] = initialize_alloc_group(s, "stupid", bm_record, blkno, chain, cpg, 1);
+        if (wrapped) {
+            j = i - recs_per_inode;
+            bitmap->groups[j]->gd->bg_next_group = blkno;
+            bitmap->groups[j]->next = bitmap->groups[i];
+        }
+
+        bitmap->groups[chain]->chain_total += bitmap->groups[i]->gd->bg_bits;
+        bitmap->groups[chain]->chain_free += bitmap->groups[i]->gd->bg_free_bits_count;
+
+        blkno += (uint64_t) s->global_cpg << (s->cluster_size_bits - s->blocksize_bits);
+        chain++;
+        if (chain >= recs_per_inode) {
+            chain = 0;
+            wrapped = 1;
+        }
+    }
+---
+</pre>
+<li> GLOBAL_INODE_ALLOC_SYSTEM_INODE
+<pre>
+In a word, it is a inode that carry all of the system inodes' block
+mkfs.ocfs2/mkfs.c main()
+---
+    tmprec = &(record[<font color="red">GLOBAL_INODE_ALLOC_SYSTEM_INODE]</font>[0]);
+<font color="blue">
+    //blocks_needed calculate the blocks that all of the system inodes need
+    //Then setup a bitmap to carry them. After this, all of the system inodes
+    //will be allocated here
+</font>
+    need = blocks_needed(s);
+    alloc_bytes_from_bitmap(s, need << s->blocksize_bits,
+                                s->global_bm,
+                                &(crap_rec.extent_off),
+                                &(crap_rec.extent_len));
+
+    s->system_group =
+        initialize_alloc_group(s, "system inode group", tmprec,
+                       crap_rec.extent_off >> s->blocksize_bits,
+                       0, crap_rec.extent_len >> s->cluster_size_bits,
+                       s->cluster_size / s->blocksize);
+---
+</pre>
+<li> INODE_ALLOC_SYSTEM_INODE
+<pre>
+A inode that carries blocks for inodes of one slot.
+When we allocate an inode, we actually allocate a block which will carry the
+inode and inline data in the future.
+
+ocfs2_mknod()
+  -> ocfs2_reserve_new_inode()
+    -> ocfs2_reserve_suballoc_bits() <font color="blue">//INODE_ALLOC_SYSTEM_INODE</font>
+    ---
+    status = ocfs2_inode_lock(alloc_inode, &bh, 1);
+<font color="blue">
+    //The lock will be held during the whole inode allocate process
+    //until ocfs2_free_ac_resource(). This is <B>reservation</B>. No one
+    //can touch the inode bitmap during this.
+</font>
+    ...
+    ac->ac_inode = alloc_inode;
+    ac->ac_alloc_slot = slot;
+
+    fe = (struct ocfs2_dinode *) bh->b_data;
+
+    free_bits = le32_to_cpu(fe->id1.bitmap1.i_total) -
+        le32_to_cpu(fe->id1.bitmap1.i_used);
+
+    if (bits_wanted > free_bits) {
+<font color="blue">
+    // If the space in it is not enough, allocate new cluster from the block allocator.
+</font>
+    }
+    ---
+
+
+ocfs2_block_group_alloc() is used to charge the INODE_ALLOC_SYSTEM_INODE
+
+ocfs2_block_group_alloc()
+ ---
+ <font color="blue">
+     //Similar to ocfs2_reserve_suballoc_bits, prepare enough space in the cluster allocation inode
+    //The allocation unit is a group (cl->cl_cpg, namely, clusters per group)
+ </font>
+    status = ocfs2_reserve_clusters_with_limit(osb, le16_to_cpu(cl->cl_cpg), max_block, flags, &ac);
+<font color="blue">
+    //calculate the needed log space
+</font>
+    credits = ocfs2_calc_group_alloc_credits(osb->sb,
+                         le16_to_cpu(cl->cl_cpg));
+    handle = ocfs2_start_trans(osb, credits);
+<font color="blue">
+    //Do the really allocation and return the buffer_head of block group header
+</font>
+    bg_bh = ocfs2_block_group_alloc_contig(osb, handle, alloc_inode,
+                           ac, cl);
+    bg = (struct ocfs2_group_desc *) bg_bh->b_data;
+
+    status = ocfs2_journal_access_di(handle, INODE_CACHE(alloc_inode),
+                     bh, OCFS2_JOURNAL_ACCESS_WRITE);
+
+    alloc_rec = le16_to_cpu(bg->bg_chain);
+    le32_add_cpu(&cl->cl_recs[alloc_rec].c_free, le16_to_cpu(bg->bg_free_bits_count));
+    le32_add_cpu(&cl->cl_recs[alloc_rec].c_total, le16_to_cpu(bg->bg_bits));
+<font color="blue">
+    //Link the block group in the chain list.
+    //In ocfs2_block_group_alloc_contig->ocfs2_block_group_fill
+    /bg->bg_parent_dinode = cpu_to_le64(OCFS2_I(alloc_inode)->ip_blkno);
+</font>
+<font color="red">    cl->cl_recs[alloc_rec].c_blkno = bg->bg_blkno;</font>
+    if (le16_to_cpu(cl->cl_next_free_rec) < le16_to_cpu(cl->cl_count))
+        le16_add_cpu(&cl->cl_next_free_rec, 1);
+    ...
+    le32_add_cpu(&fe->i_clusters, le16_to_cpu(cl->cl_cpg));
+
+    ocfs2_journal_dirty(handle, bh);
+
+    spin_lock(&OCFS2_I(alloc_inode)->ip_lock);
+    OCFS2_I(alloc_inode)->ip_clusters = le32_to_cpu(fe->i_clusters);
+    fe->i_size = cpu_to_le64(ocfs2_clusters_to_bytes(alloc_inode->i_sb, le32_to_cpu(fe->i_clusters)));
+    spin_unlock(&OCFS2_I(alloc_inode)->ip_lock);
+<font color="red">
+    i_size_write(alloc_inode, le64_to_cpu(fe->i_size));
+</font>
+    alloc_inode->i_blocks = ocfs2_inode_sector_count(alloc_inode);
+    ocfs2_update_inode_fsync_trans(handle, alloc_inode, 0);
+      ---
+After get enough space, the reall allocation is done in following path,
+ocfs2_mknod_locked()
+  -> ocfs2_claim_new_inode()
+    -> ocfs2_claim_suballoc_bits()
+</pre>
+</ul>
+</font>
+</p>
+<h2><a name="o2cb">Ocfs2 Cluster Stack</a></h2>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+OCFS2 is a shard-disk cluster filesystem.<br/>
+It need to feel the state of the cluster and serialize the concurrent accessing to shared disk.<br/>
+o2cb is such a component which is built-in of ocfs2 kernel module.
+<pre>
+     +-----------------------------------+       +-----------------------------------+
+     |              ocfs2                |       |              ocfs2                |
+     +-------------------------+---------+       +---------+-------------------------+
+     |       dlm glue          |         |       |         |        dlm glue         |
+     +------------------+------+         |  OR   |         +-------------------------+
+     |       o2dlm      | o2hb |         |       |   bdev  |                          
+     +------+-----------+------+         |       |         |     dlm | /dev/ocfs2_control                     
+     | o2nm |   o2net   |      bdev      |       |         |                          
+     +------+-----------+----------------+       +---------+                          
+</pre>
+</font>
+</p>
+<h3><a name="o2cb_nodes">Nodes</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+When setup a ocfs2 cluster, we need the ocfs2 to know the information of cluster
+<pre>
+/etc/ocfs2/cluster.conf
+
+node:
+        name = node0
+        cluster = mycluster
+        number = 0
+        ip_address = 10.1.0.100
+        ip_port = 7777
+
+node:
+        name = node1
+        cluster = mycluster
+        number = 1
+        ip_address = 10.1.0.101
+        ip_port = 7777
+
+node:
+        name = node2
+        cluster = mycluster
+        number = 2
+        ip_address = 10.1.0.102
+        ip_port = 7777
+
+cluster:
+        name = mycluster
+        heartbeat_mode = local
+        node_count = 4
+</pre>
+We install these informations to kernel through configfs
+<pre>
++---- cluster
+      +---- test
+            +---- fence_method
+            +---- heartbeat
+            +---- idle_timeout_ms
+            +---- keepalive_delay_ms
+            +---- node
+            +     +---- node0
+            +     +     +---- ipv4_address
+            +     +     +---- ipv4_port
+            +     +     +---- local
+            +     +     +---- num
+            +     +---- node1
+            +           +---- ipv4_address
+            +           +---- ipv4_port
+            +           +---- local
+            +           +---- num
+            +---- reconnect_delay_ms
+
+The information is maintained by o2nm_node.
+</pre>
+Regarding to the progress of setup, please refer to o2nm_node_ipv4_address/ipv4_port/num/local_store.
+<ul>
+<li> 'num' need to be set after 'ipv4_address/ipv4_port'
+<li> 'local' need to be set after 'num/ipv4_address/ipv4_port'
+<li> when local is set
+<pre>
+A listen socket is setup which is used to setup the cluster linkings
+
+o2nm_node_local_store()
+  -> o2net_start_listening()
+</pre>
+</ul>
+Noted ! There can be only one cluster per node
+<pre>
+o2nm_cluster_group_make_group()
+---
+    if (o2nm_single_cluster)
+        return ERR_PTR(-ENOSPC);
+---
+</pre>
+</font>
+</p>
+
+<h3><a name="o2cb_hb">Heartbeat</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+ocfs2 heartbeat is a way to let the nodes in a cluster to know each other is alive.<br/>
+It works through read and write a shared disk.<br/>
+<ul>
+<li> Where
+<pre>
+We have konwn that the ocfs2 heartbeat works on the shared disk. But where to
+read and write ?
+Look into the code of ocfs2tool,
+ocfs2_fill_heartbeat_desc()
+---
+<font color="blue">
+    //sectsize is determined by BLKSSZGET, which is block device's logical block size
+</font>
+    ret = ocfs2_get_device_sectsize(fs->fs_devname, &sectsize);
+    sectsize_bits = ffs(sectsize) - 1;
 
 <font color="blue">
-    /*
-     * <U>We need this before the filemap_fdatawrite() so that it can
-     * transfer the dirty bit from the PTE to the
-     * page</U>. Unfortunately this means that even for EX->PR
-     * downconverts, we'll lose our mappings and have to build
-     * them up again.
+    //It is a system file of ocfs2
+</font>
+    filename = ocfs2_system_inodes[HEARTBEAT_SYSTEM_INODE].si_name;
+
+<font color="blue">
+    //We need to load the inode and bmap information
+</font>
+    ret = ocfs2_lookup(fs, fs->fs_sysdir_blkno, filename,
+               strlen(filename),  NULL, &blkno);
+    ret = ocfs2_read_inode(fs, blkno, buf);
+
+    di = (struct ocfs2_dinode *)buf;
+    if (di->id2.i_list.l_tree_depth || 
+        di->id2.i_list.l_next_free_rec != 1) {
+        ret = OCFS2_ET_BAD_HEARTBEAT_FILE;
+        goto leave;
+    }
+    rec = &(di->id2.i_list.l_recs[0]);
+
+    block_bits = OCFS2_RAW_SB(fs->fs_super)->s_blocksize_bits;
+    cluster_bits = OCFS2_RAW_SB(fs->fs_super)->s_clustersize_bits;
+
+    blocks = ocfs2_rec_clusters(0, rec) << cluster_bits;
+    blocks >>= block_bits;
+
+    start_block = rec->e_blkno << block_bits;
+    start_block >>= sectsize_bits;
+
+<font color="blue">
+    //The region name is the filesystem's uuid
+</font>
+    desc->r_name            = fs->uuid_str;
+    desc->r_device_name        = fs->fs_devname;
+    desc->r_block_bytes        = sectsize;
+    desc->r_start_block        = start_block;
+    desc->r_blocks            = blocks;
+
+---
+<font color="red">This also tell us the heartbeat device need to be formated.</font>
+</pre>
+<li> When
+<pre>
+There are two modes of heartbeat, local and global.
+In local mode, every mount will start a heartbeat for itself. This is infficient
+when there are many ocfs2 volumes in the cluster. At the moment, global
+heartbeat is recommended.
+
+If local mode,
+mount.ocfs2 main()
+  -> ocfs2_fill_heartbeat_desc()
+  -> o2cb_begin_group_join()
+     ---
+        ret = o2cb_validate_cluster_name(cluster);
+        ret = o2cb_validate_cluster_flags(cluster, &globalhb);
+        if (!globalhb)
+            ret = o2cb_start_heartbeat(cluster, region);
+     ---
+  -> ret = mount(spec, mo.dir, OCFS2_FS_NAME, mo.flags & ~MS_NOSYS, mo.xtra_opts);
+
+If global mode, 'oc2b start-heartbeat cluster' name can start the global heartbeat.
+</pre>
+<li> How
+<pre>
+There are two native heartbeat method in ocfs2,
+ - read/write the shared heartbeat file
+ - networking negotiation when shared disk is offline
+
+Every node occupy a block in the region.
+                        +----+
+                        |    | block -> o2hb_disk_heartbeat_block
+                        +----+
+                        |    | block
+                        +----+ 
+                        |    | block
+                        +----+
+                        |    | block
+                        +----+
+
+The block size is logical block size of the block device and
+read/write on this size are atomic
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+o2hb_region_dev_store()
+  -> kthread_run o2hb_thread
+    -> o2hb_do_disk_heartbeat()
+<font color="blue">
+        // Read all of the nodes's block in
+</font>
+      -> o2hb_read_slots(reg, lowest_node, highest_node + 1);
+<font color="blue">
+        // Write my own node's block out
+</font>
+      -> o2hb_issue_node_write(reg, &write_wc);
+         -> o2hb_setup_one_bio(reg, write_wc, &slot, slot+1, REQ_OP_WRITE, REQ_SYNC);
+
+To determine whether a node is OK, o2hb_check_slot() would check the
+<font color="red">o2hb_disk_heartbeat_block.hb_seq</font>
+
+The hb_seq is the wall clock seconds since 1970 get through ktime_get_real_seconds()
+o2hb_prepare_block()
+---
+    cputime = ktime_get_real_seconds();
+    if (!cputime)
+        cputime = 1;
+
+    hb_block->hb_seq = cpu_to_le64(cputime);
+---
+
+o2hb_check_slot() will check whether the hb_seq has been changed during the past time.
+o2hb_check_slot()
+---
+    cputime = le64_to_cpu(hb_block->hb_seq);
+    if (slot->ds_last_time != cputime)
+        slot->ds_changed_samples++;
+    else
+        slot->ds_equal_samples++;
+    slot->ds_last_time = cputime;
+
+    spin_lock(&o2hb_live_lock);
+
+fire_callbacks:
+<font color="blue">
+    /* dead nodes only come to life after some number of
+     * changes at any time during their dead time
      */
 </font>
+    if (list_empty(&slot->ds_live_item) &&
+        slot->ds_changed_samples >= <font color="red">O2HB_LIVE_THRESHOLD (2)</font>) {
+        set_bit(slot->ds_node_num, reg->hr_live_node_bitmap);
+
+        /* first on the list generates a callback */
+        if (list_empty(&o2hb_live_slots[slot->ds_node_num])) {
+            set_bit(slot->ds_node_num, o2hb_live_node_bitmap);
+
+            o2hb_queue_node_event(&event, <font color="red">O2HB_NODE_UP_CB</font>, node,
+                                          ^^^^^^^^^^^^^^
+                          slot->ds_node_num);
+        }
+    }
+<font color="blue">
+    /* live nodes only go dead after enough consequtive missed
+     * samples..  reset the missed counter whenever we see activity
+     */
+</font>
+    if (slot->ds_equal_samples >= <font color="red">o2hb_dead_threshold(31)</font> || gen_changed) {
+        clear_bit(slot->ds_node_num, reg->hr_live_node_bitmap);
+        if (list_empty(&o2hb_live_slots[slot->ds_node_num])) {
+            clear_bit(slot->ds_node_num, o2hb_live_node_bitmap);
+
+            o2hb_queue_node_event(&event, <font color="red">O2HB_NODE_DOWN_CB</font>,
+                                          ^^^^^^^^^^^^^
+                          node, slot->ds_node_num);
+        }
+    }
+---
+Note: regarding to O2HB_NODE_UP_CB/O2HB_NODE_DOWN_CB, we will talk it in next section.
+</pre>
+<li> timeout
+<pre>
+A node depends on heartbeat to announce its liveness. The IO can be timed out
+due to bug in software or hardware.
+
+write timer handle this case.
+o2hb_write_timeout()
+  -> o2quo_disk_timeout()
+    -> o2quo_fence_self() <font color="blue">panic or emergency_restart</font>
+
+There is a special case that the backend of shared disk falls into problem.
+At the moment, all of the nodes will fence theirselves due to heartbeat timeout.
+
+To fix this, negotiation mechanism is introduced,
+Subject: ocfs2: o2hb: add negotiate timer
+
+This series of patches is to fix the issue that when storage down, all
+nodes will fence self due to write timeout.
+
+With this patch set, all nodes will keep going until storage back online,
+except if the following issue happens, then all nodes will do as before to
+fence self.
+
+1. io error got
+2. network between nodes down
+3. nodes panic
+
+
+This patch (of 6):
+
+When storage down, all nodes will fence self due to write timeout.  The
+negotiate timer is designed to avoid this, with it node will wait until
+storage up again.
+
+Negotiate timer working in the following way:
+
+1. The timer expires before write timeout timer, its timeout is half
+   of write timeout now.  It is re-queued along with write timeout timer. 
+   If expires, it will send NEGO_TIMEOUT message to master node(node with
+   lowest node number).  This message does nothing but marks a bit in a
+   bitmap recording which nodes are negotiating timeout on master node.
+
+2. If storage down, nodes will send this message to master node, then
+   when master node finds its bitmap including all online nodes, it sends
+   NEGO_APPROVL message to all nodes one by one, this message will
+   re-queue write timeout timer and negotiate timer.  For any node doesn't
+   receive this message or meets some issue when handling this message, it
+   will be fenced.  If storage up at any time, o2hb_thread will run and
+   re-queue all the timer, nothing will be affected by these two steps.
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="o2cb_net">Net</a></h3>
+<h4><a name="o2cb_net_setup">Setup</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+To setup the connection between nodes in the cluster, we need to configure node ipv4 address and port firstly.<br/>
+This is done through configfs when setup the cluster. Refer to <a href="#o2cb_nodes">Nodes</a><br/>
+<br/>
+The connection is built up when heartbeat starts and the node knows its siblings alive.<br/>
+<ul>
+<li> Listen
+<pre>
+When we set 'local' attribute of node, listen socket is setup
+
+o2nm_node_local_store()
+  -> o2net_start_listening()
+</pre>
+<li> Connect
+<pre>
+o2hb_do_disk_heartbeat()
+  -> o2hb_check_slot()
+    -> o2hb_queue_node_event(&event, <font color="red">O2HB_NODE_UP_CB</font>, node, slot->ds_node_num);
+o2net_hb_node_up_cb()
+  -> o2net_set_nn_state(nn, NULL, 0, 0);
+    -> queue_delayed_work(o2net_wq, <font color="red">&nn->nn_connect_work</font>, delay);
+o2net_start_connect()
+---
+    /* if we're greater we initiate tx, otherwise we accept */
+    if (o2nm_this_node() <= o2net_num_from_nn(nn))
+        goto out;
+
+    sc = sc_alloc(node);
+    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+    sc->sc_sock = sock; /* freed by sc_kref_release */
+    sock->sk->sk_allocation = GFP_ATOMIC;
+    myaddr.sin_family = AF_INET;
+    myaddr.sin_addr.s_addr = mynode->nd_ipv4_address;
+    myaddr.sin_port = htons(0); /* any port */
+
+    ret = sock->ops->bind(sock, (struct sockaddr *)&myaddr,
+                  sizeof(myaddr));
+    ...
+    ret = sc->sc_sock->ops->connect(sc->sc_sock,
+                    (struct sockaddr *)&remoteaddr,
+                    sizeof(remoteaddr),
+                    O_NONBLOCK);
+---
+</pre>
+<li> Establish
+<pre>
+When the connection is setup, the node pair need to exchange handshake.
+
+o2net_state_change()
+  -> o2net_sc_queue_work(sc, &sc->sc_connect_work);
+  ---
+    o2net_initialize_handshake();
+    o2net_sendpage(sc, o2net_hand, sizeof(*o2net_hand));
+  ---
+<font color="blue">The handshake includes
+ - o2hb_heartbeat_timeout_ms
+ - o2net_idle_timeout_ms
+ - o2net_keepalive_delay_ms
+ - o2net_reconnect_delay_ms
+</font>
+
+o2net_data_ready()
+  -> o2net_sc_queue_work(sc, &sc->sc_rx_work)
+    -> o2net_advance_rx()
+      -> o2net_check_handshake()
+        -> o2net_set_nn_state(nn, sc, 1, 0); //<font color="blue">valid is true</font>
+        ---
+        if (!was_valid && valid) {
+            o2quo_conn_up(o2net_num_from_nn(nn));
+            cancel_delayed_work(&nn->nn_connect_expired);
+            printk(KERN_NOTICE "o2net: %s " SC_NODEF_FMT "\n",
+                   o2nm_this_node() > sc->sc_node->nd_num ?
+                   "Connected to" : "Accepted connection from",
+                   SC_NODEF_ARGS(sc));
+        }
+        ---
+</pre>
+</ul>
+</font>
+</p>
+
+<h4><a name="o2cb_net_purpose">Purpose</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+To know the purpose of o2net, we need to get what's messages does it handle,
+<pre>
+We can track the message handler register to know this, namely, caller of o2net_register_handler,
+<B>Heartbeat</B>
+ - O2HB_NEGO_TIMEOUT_MSG
+ - O2HB_NEGO_APPROVE_MSG
+
+<B>O2DLM</B>
+ - DLM_MASTER_REQUEST_MSG
+ - DLM_UNUSED_MSG1          
+ - DLM_ASSERT_MASTER_MSG 
+ - DLM_CREATE_LOCK_MSG      
+ - DLM_CONVERT_LOCK_MSG  
+ - DLM_PROXY_AST_MSG      
+ - DLM_UNLOCK_LOCK_MSG      
+ - DLM_DEREF_LOCKRES_MSG 
+ - DLM_MIGRATE_REQUEST_MS
+ - DLM_MIG_LOCKRES_MSG      
+ - DLM_QUERY_JOIN_MSG      
+ - DLM_ASSERT_JOINED_MSG 
+ - DLM_CANCEL_JOIN_MSG      
+ - DLM_EXIT_DOMAIN_MSG      
+ - DLM_MASTER_REQUERY_MSG
+ - DLM_LOCK_REQUEST_MSG  
+ - DLM_RECO_DATA_DONE_MSG
+ - DLM_BEGIN_RECO_MSG      
+ - DLM_FINALIZE_RECO_MSG 
+ - DLM_QUERY_REGION      
+ - DLM_QUERY_NODEINFO      
+ - DLM_BEGIN_EXIT_DOMAIN_
+ - DLM_DEREF_LOCKRES_DONE
+</pre>
+</font>
+</p>
+
+<h4><a name="o2cb_net_keepalive">Keepalive</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+A node which has given up on connecting to a majority<br/>
+of nodes who are still heartbeating will fence itself.
+<pre>
+o2net_process_message()
+  -> o2net_sc_postpone_idle()
+o2net_check_handshake()
+  -> o2net_sc_reset_idle_timer()
+  ---
+    o2net_sc_cancel_delayed_work(sc, &sc->sc_keepalive_work);
+    o2net_sc_queue_delayed_work(sc, &sc->sc_keepalive_work,
+              msecs_to_jiffies(o2net_keepalive_delay()));
+    o2net_set_sock_timer(sc);
+    mod_timer(&sc->sc_idle_timeout,
+           jiffies + msecs_to_jiffies(o2net_idle_timeout()));
+  ---
+
+When delayed kwork sc_keepalive_work is fired, it will send out a keepalive message,
+when the sc_idle_timeout is expired, it says a nodes has lost connection with us.
+</pre>
+</font>
+</p>
+
+<h3><a name="o2cb_init">Init when boot</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+The system service o2cb would setup the ocfs2 configrations when system boot.
+<pre>
+o2cb.init.sh
+
+online()
+  -> online_o2cb()
+    -> register_cluster_o2cb()
+      -> o2cb register-cluster cluster
+    -> start_global_heartbeat_o2cb()
+      -> o2cb start-heartbeat cluster
+</pre>
+
+When the /etc/ocfs2/cluster.conf is setup properly, o2cb would setup the
+configrations based on it.
+</font>
+</p>
+
+<h3><a name="o2cb_node_down">Node Down</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+Except for provding communication capability (o2net), the main target of o2cb is<br/>
+to feel the state of nodes in cluster. This is provided by o2hb.<br/>
+Let's look at the callback of O2HB_NODE_DOWN_CB
+<ul>
+<li> o2net_hb_node_down_cb
+<pre>
+o2net_hb_node_down_cb()
+---
+    o2quo_hb_down(node_num);
+
+    if (!node)
+        return;
+
+    if (node_num != o2nm_this_node())
+        o2net_disconnect_node(node);
+---
+</pre>
+<li> dlm_hb_node_down_cb
+<pre>
+<font color="blue">
+    /*
+     * This will notify any dlm users that a node in our domain
+     * went away without notifying us first.
+     */
+     //Right now, the only one user is ocfs2_do_node_down
+</font>
+    if (test_bit(idx, dlm->domain_map))
+        dlm_fire_domain_eviction_callbacks(dlm, idx);
+
+    spin_lock(&dlm->spinlock);
+    __dlm_hb_node_down(dlm, idx);
+    spin_unlock(&dlm->spinlock)
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="journal_replay">Journal Replay</a></h2>
+<hr style="height:3px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2"></font>
+When a node is down, there maybe some journal has not been checkpointed <br/>
+to shared disk in its per-node log file.<br/> So,
+<ul>
+<li> flush the log to shared disk by another node
+<pre>
+__ocfs2_recovery_thread()
+---
+<font color="blue">
+    // The node firstly success to get super lock is responsible for recovery.
+    // After recovery the node's slot is cleared. The following node get super
+    // lock see this and will not do recovery any more.
+</font>
+    status = ocfs2_super_lock(osb, 1);
+    ---
+        status = ocfs2_cluster_lock(osb, lockres, level, 0, 0);
+        status = ocfs2_should_refresh_lock_res(lockres);
+        if (status) {
+            status = <font color="red">ocfs2_refresh_slot_info(osb);</font>
+    ---
+    ...
+    spin_lock(&osb->osb_lock);
+    while (rm->rm_used) {
+        /* It's always safe to remove entry zero, as we won't
+         * clear it until ocfs2_recover_node() has succeeded. */
+        node_num = rm->rm_entries[0];
+        spin_unlock(&osb->osb_lock);
+        slot_num = ocfs2_node_num_to_slot(osb, node_num);
+        if (slot_num == -ENOENT) {
+            status = 0;
+            goto skip_recovery;
+        }
+
+        status = ocfs2_recover_node(osb, node_num, slot_num);
+        ...
+    }
+---
+</pre>
+<li> wait the recovery to complete if need to access metadata
+<pre>
+The jbd2 journal recovery just copy the logged blocks to its target position.
+During this, there is no concurrent access control to the metadata.
+
+So we have to stop all of the access to the inode's metadata
+And this is also the reason why all of the nodes need to know recovery is
+ongoing.
+
+ocfs2_inode_lock_full_nested()
+---
+    if (!(arg_flags & OCFS2_META_LOCK_RECOVERY))
+        ocfs2_wait_for_recovery(osb);
+---
+
+</pre>
+</ul>
+</font>
+</p>
+
+<h2><a name="cache_consistency">Cache Consistency</a></h2>
+<hr style="height:3px;border:none;border-top:2px solid black;" />
+<p>
+<font size="2"></font>
+<pre>
+    +----+      +----+     +----+ 
+    | N0 |      | N1 |     | N2 |
+    +----+      +----+     +----+
+       |          |          |
+       |          |          |
+       -----------+-----------
+                +---+
+                | D |
+                +---+
+</pre>
+There are two key points need to do to keep cache consistency
+<ul>
+<li> Data
+<pre>
+The node holding PR lock on a file need to invalidate its cache when other node want to upconvert to EX mode.
+The node holding EX lock on a file need to flush data to shared disk when other node want to downconvert to PR lock.
+ocfs2_data_convert_worker()
+---
     unmap_mapping_range(mapping, 0, 0, 0);
 
     if (filemap_fdatawrite(mapping)) {
@@ -323,6 +953,9 @@ static int ocfs2_data_convert_worker(struct ocfs2_lock_res *lockres,
     }
     sync_mapping_buffers(mapping);
     if (blocking == DLM_LOCK_EX) {
+<font color="red">
+        //If we need to downconvert to NL, drop the cache
+</font>
         truncate_inode_pages(mapping, 0);
     } else {
         /* We only need to wait on the I/O if we're not also
@@ -333,23 +966,43 @@ static int ocfs2_data_convert_worker(struct ocfs2_lock_res *lockres,
         filemap_fdatawait(mapping);
     }
 
-    forget_all_cached_acls(inode);
-
-out:
-    return UNBLOCK_CONTINUE;
-}
-
+---
 </pre>
-So the cache is flushed here.<br/>
-At the same time, ocfs2_unblock_lock will downconvert the lock if needed.
+<li> Meta
 <pre>
-ocfs2_unblock_lock
-  -> ocfs2_downconvert_lock
+The node holding meta EX lock on a file need to wait the log is checkpointed when other node want to downconvert the lock.
+                                                         ^^^^^^^^^^^^^^^^^^^
+                                                         Only after checkpoint,
+                                                         we can ensure the
+                                                         metadata has been
+                                                         flushed do disk.
+ocfs2_unblock_lock()
+---
+    if (lockres->l_ops->check_downconvert
+        && !lockres->l_ops->check_downconvert(lockres, new_level)) {
+        goto leave_requeue;
+    }
+---
+
+ocfs2_check_meta_downconvert()
+  -> ocfs2_ci_checkpointed(INODE_CACHE(inode), lockres, new_level);
+    -> ocfs2_ci_fully_checkpointed()
+    ---
+    spin_lock(&trans_inc_lock);
+    ret = time_after(journal->j_trans_id, ci->ci_last_trans);
+    spin_unlock(&trans_inc_lock);
+    ---
+
+    
 </pre>
+</ul>
+<ul>
+</ul>
 </font>
 </p>
 
 
-
 </body>
 </html>
+
+
