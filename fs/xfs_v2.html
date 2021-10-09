@@ -57,6 +57,7 @@
 <li> <a href="#jbd2_order">Order</a>
 <li> <a href="#jbd2_recovery">Order</a>
 <li> <a href="#jbd2_revoke">Revoke</a>
+<li> <a href="#jbd2_bh">BH</a>
 </ul>
 
 <a href="#inode">Inode</a>
@@ -82,6 +83,18 @@
 
 <a href="#ext4">ext4</a>
 <ul>
+<li> <a href="#ext4_layout">Layout</a>
+<ul>
+<li> <a href="#ext4_layout_bg">Block Group</a>
+</ul>
+<li> <a href="#ext4_extent">Extent</a>
+<ul>
+<li> <a href="#ext4_extent_format">Format</a>
+<li> <a href="#ext4_extent_split">Split</a>
+<li> <a href="#ext4_extent_grow">Grow level</a>
+<li> <a href="#ext4_extent_remove">Remove</a>
+<li> <a href="#ext4_extent_da">Delayed Allocation</a>
+</ul>
 <li> <a href="#ext4_xattr">Xattr</a>
 <ul>
 <li> <a href="#ext4_xattr_space">Space for xattr</a>
@@ -93,6 +106,11 @@
 <li> <a href="#ext4_dentry_dx">DX</a>
 <li> <a href="#ext4_dentry_inline">Inline</a>
 <li> <a href="#ext4_dentry_convert">inline -> block -> dx</a>
+</ul>
+<li> <a href="#ext4_blocks">Blocks</a>
+<ul>
+<li> <a href="#ext4_blocks_buddy">Buddy</a>
+<li> <a href="#ext4_blocks_prealloc">Pre-Allocation</a>
 </ul>
 </ul>
 
@@ -2688,8 +2706,6 @@ jbd2_journal_recover()
 </font>
 </p>
 
-
-<font size="2">
 <hr style="height:3px;border:none;border-top:3px solid black;" />
 <h3><a name="jbd2_revoke">Revoke</a></h3>
 <p>
@@ -2826,6 +2842,162 @@ do_one_pass()
 --
 </pre>
 </ul>
+</pre>
+</ul>
+</font>
+</p>
+
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h3><a name="jbd2_bh">BH</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> bh and jh
+<pre>
+bh and jh reference each other.
+
+Refer to
+jbd2_journal_add_journal_head()
+---
+    if (!buffer_jbd(bh))
+        new_jh = journal_alloc_journal_head();
+
+    jbd_lock_bh_journal_head(bh);
+    if (buffer_jbd(bh)) {
+        jh = bh2jh(bh);
+    } else {
+        jh = new_jh;
+        new_jh = NULL;        /* We consumed it */
+        set_buffer_jbd(bh);
+<font color="red">
+        bh->b_private = jh;
+        jh->b_bh = bh;
+        get_bh(bh);
+    }
+    jh->b_jcount++;
+</font>
+    jbd_unlock_bh_journal_head(bh);
+---
+Note, the reference above happens under bh's lock
+</pre>
+<li> bh and transaction
+<pre>
+Firstly, we must know we cannot modify bh when its previous transaction has not
+been committed. <font color="red">Because the bhs' modification in one transaction compose an atomic
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+filesystem operations.</font>
+^^^^^^^^^^^^^^^^^^^^^
+
+How does jbd2 handle this case ?
+Let's look into 
+jbd2_journal_commit_transaction()
+  -> jbd2_journal_write_metadata_buffer()
+---
+    spin_lock(&jh_in->b_state_lock);
+repeat:
+<font color="blue">    /*
+     * If a new transaction has already done a buffer copy-out, then
+     * we use that version of the data for the commit.
+     */</font>
+    if (jh_in->b_frozen_data) {
+        done_copy_out = 1;
+        new_page = virt_to_page(jh_in->b_frozen_data);
+        new_offset = offset_in_page(jh_in->b_frozen_data);
+    } else {
+        new_page = jh2bh(jh_in)->b_page;
+        new_offset = offset_in_page(jh2bh(jh_in)->b_data);
+    }
+    ...
+<font color="red">    set_bh_page(new_bh, new_page, new_offset);</font>
+    new_bh->b_size = bh_in->b_size;
+    new_bh->b_bdev = journal->j_dev;
+    new_bh->b_blocknr = blocknr;
+    new_bh->b_private = bh_in;
+    set_buffer_mapped(new_bh);
+    set_buffer_dirty(new_bh);
+
+    *bh_out = new_bh;
+
+    spin_lock(&journal->j_list_lock);
+    __jbd2_journal_file_buffer(jh_in, transaction, BJ_Shadow);
+    spin_unlock(&journal->j_list_lock);
+    set_buffer_shadow(bh_in);
+    spin_unlock(&jh_in->b_state_lock);
+---
+
+<font color="red">In a word, if there is b_frozen_data, use it, otherwise use the buffer of bh
+that need to be logged.</font>
+
+The most critical point is the jh->b_state_lock which serialize everything.
+do_get_write_access()
+---
+    lock_buffer(bh);
+    spin_lock(&jh->b_state_lock);
+<font color="blue">    /*
+     * The buffer is already part of this transaction if b_transaction or
+     * b_next_transaction points to it
+     * This also tell us extra copy only happens when one bh needs to join
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * the next transaction and previous one has not been committed. The extra
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * is the data that compose the atomic filesystem operations in previous
+     * transaction.
+     */</font>
+    if (jh->b_transaction == transaction ||
+        jh->b_next_transaction == transaction)
+        goto done;
+
+    /*
+     * If there is already a copy-out version of this buffer, then we don't
+     * need to make another one
+     */
+    if (jh->b_frozen_data) {
+        goto attach_next;
+    }
+<font color="blue">    /*
+     * There is one case we have to be very careful about.  If the
+     * committing transaction is currently writing this buffer out to disk
+     * and has NOT made a copy-out, then we cannot modify the buffer
+     * contents at all right now.  The essence of copy-out is that it is
+     * the extra copy, not the primary copy, which gets journaled.  If the
+     * primary copy is already going to disk then we cannot do copy-out
+     * here.
+     */</font>
+    if (buffer_shadow(bh)) {
+        spin_unlock(&jh->b_state_lock);
+        wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+        goto repeat;
+    }
+
+<font color="blue">    /*
+     * Only do the copy if the currently-owning transaction still needs it.
+     * If buffer isn't on BJ_Metadata list, the committing transaction is
+     * past that stage (here we use the fact that BH_Shadow is set under
+     * bh_state lock together with refiling to BJ_Shadow list and at this
+     * point we know the buffer doesn't have BH_Shadow set).
+     *
+     * Subtle point, though: if this is a get_undo_access, then we will be
+     * relying on the frozen_data to contain the new value of the
+     * committed_data record after the transaction, so we HAVE to force the
+     * frozen_data copy in that case.
+     */</font>
+    if (jh->b_jlist == BJ_Metadata || force_copy) {
+        if (!frozen_buffer) {
+            spin_unlock(&jh->b_state_lock);
+            frozen_buffer = jbd2_alloc(jh2bh(jh)->b_size,
+                           GFP_NOFS | __GFP_NOFAIL);
+            goto repeat;
+        }
+        jh->b_frozen_data = frozen_buffer;
+        frozen_buffer = NULL;
+        jbd2_freeze_jh_data(jh);
+    }
+attach_next:
+    smp_wmb();
+    jh->b_next_transaction = transaction;
+done:
+    spin_unlock(&jh->b_state_lock);
+---
 </pre>
 </ul>
 </font>
@@ -3888,6 +4060,538 @@ __ext4_new_inode()
 <h2><a name="ext4">Ext4</a></h2>
 <hr style="height:3px;border:none;border-top:3px solid black;" />
 
+
+<h3><a name="ext4_layout">Layout</a></h3>
+<h4><a name="ext4_layout_bg">Block Group</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+For the filesystem block size == 4K, The 1st block group is as following,
+
+<pre>
+|rrrrssss....|ggggggggg|rgrgrgrgrg|dd|ii|tttt|....|
+
+rrrr: reserved 1024 bytes for x86 boot sectors
+ssss: in the same fs block with rrrr, filesystem super block
+gggg: block group descriptors in a contiguous space
+rgrg: reserved group descriptors table for filesystem resize,
+dd  : data block bitmap
+ii  : inode block bitmap
+tttt: inode table
+      All of positions above can be got from block group descriptor
+</pre>
+During .fill_super, all of the buffer_head's of block group descriptors are loaded into memory,
+<pre>
+ext4_fill_super()
+---
+<font color="blue">
+    /* Pre-read the descriptors into the buffer cache */
+</font>
+    for (i = 0; i < db_count; i++) {
+        block = descriptor_loc(sb, logical_sb_block, i);
+        ext4_sb_breadahead_unmovable(sb, block);
+    }
+
+    for (i = 0; i < db_count; i++) {
+        struct buffer_head *bh;
+
+        block = descriptor_loc(sb, logical_sb_block, i);
+        bh = ext4_sb_bread_unmovable(sb, block);
+        rcu_read_lock();
+        rcu_dereference(sbi->s_group_desc)[i] = bh;
+        rcu_read_unlock();
+    }
+    sbi->s_gdb_count = db_count;
+---
+
+descriptor_loc() is used to calculate the position of block group descriptors,
+---
+<font color="blue">
+    //When meta block group is not enabled, it is very simple
+</font>
+    if (!ext4_has_feature_meta_bg(sb) || nr < first_meta_bg)
+        return logical_sb_block + nr + 1;
+---
+</pre>
+ext4 use block group descriptor to get the position of data bitmap, inode bitmap<br/>
+and inode table. For example,
+<pre>
+__ext4_get_inode_loc()
+---
+    iloc->block_group = (ino - 1) / EXT4_INODES_PER_GROUP(sb);
+    gdp = ext4_get_group_desc(sb, iloc->block_group, NULL);
+<font color="blue">
+    /*
+     * Figure out the offset within the block group inode table
+     */
+</font>
+    inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
+    inode_offset = ((ino - 1) %    EXT4_INODES_PER_GROUP(sb));
+    block = <font color="red">ext4_inode_table(sb, gdp)</font> + (inode_offset / inodes_per_block);
+    iloc->offset = (inode_offset % inodes_per_block) * EXT4_INODE_SIZE(sb);
+
+    bh = sb_getblk(sb, block);
+---
+
+</pre>
+</font>
+</p>
+
+<h3><a name="ext4_extent">Extent</a></h3>
+<h4><a name="ext4_extent_format">Format</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+There are mainly 3 data structure here,
+struct ext4_extent_header {
+    __le16    eh_magic;    /* probably will support different formats */
+    __le16    eh_entries;    <font color="blue">/* number of valid entries */</font>
+    __le16    eh_max;            <font color="blue">/* capacity of store in entries*/</font>
+    __le16    eh_depth;        <font color="blue">/* has tree real underlying blocks? */</font>
+    __le32    eh_generation;    /* generation of the tree */
+};
+
+struct ext4_extent_idx {
+    __le32    ei_block;    <font color="blue">/* index covers logical blocks from 'block' */</font>
+    __le32    ei_leaf_lo;    <font color="blue">/* pointer to the physical block of the nex level. leaf or next index could be there */</font>
+    __le16    ei_leaf_hi;    /* high 16 bits of physical block */
+    __u16    ei_unused;
+};
+
+struct ext4_extent {
+    __le32    ee_block;    <font color="blue">/* first logical block extent covers */</font>
+    __le16    ee_len;        /* number of blocks covered by extent */
+    __le16    ee_start_hi;    /* high 16 bits of physical block */
+    __le32    ee_start_lo;    /* low 32 bits of physical block */
+};
+
+Note:
+ - ext4_extent.ee_block is 32bits, so the max file size of ext4 is 2^32 * 2^12 (fs blk) = 2^44 (16TiB)
+ - ee_start_hi/ee_start_lo is 48bits, so the max block device size of ext4 is 2^48 * 2^12 = 2^60 (1EiB)
+ - <U>highest bit of ee_len is to indicates unwritten state, refer to ext4_ext_mark_unwritten()</U>
+ - <U>if eh_depth > 0, ext4_extent_idx follows it, otherwise ext4_extent</U>
+ - max level of extent btree is 5, (4 * (((2^12 - 12)/12) ^ n) >= 2^32, n = 5)
+
+
+              inode->i_block  <font color="red">(inode inlined)</font>
+                   |            
+                [hiiii] <font color="blue">eh.eh_max == 4</font>
+                 /   \
+          [hiiii]     [hiiii] <font color="blue">4K - sizeof(eh) / sizeof(ei)</font>
+           /  \          \
+    [heeee]   [heeee]    [heeee]
+
+ei and ee in the nodes are sorted by logical block
+</pre> 
+</font>
+</p>
+
+<h4><a name="ext4_extent_split">Split</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+                [hiii-]
+                 /  \
+          [hiii-]    [<font color="red">hiiii</font>]
+           /   \         \         ^
+    [hee-e]    [heee-]   [<font color="red">heeee</font>]   | walk from down to up
+
+ext4_ext_create_new_leaf()
+---
+<font color="blue">
+    /* walk up to the tree and look for where need new index entry */
+</font>
+    curp = path + depth;
+    while (i > 0 && !EXT_HAS_FREE_INDEX(curp)) {
+        i--;
+        curp--;
+    }
+---
+
+                [hiiii]______
+                 /  \        \
+          [hiii-]    [hiii] <B><font color="blue">[hii]</font></B>
+           /   \         \  <B><font color="blue">   \ </font></B>
+    [hee-e]    [heee-]   [hee] <B><font color="blue">[hee]</font></B>
+
+Split entries from the full ee and ei's and then build a new sub tree above.
+Then insert it to tree.
+
+<font color="red">Note: the new node [hee] is always 1st entry of new [hii]</font>
+
+Let's look at the code,
+ext4_ext_split()
+---
+<font color="blue">
+    //leaf node has been setup in similar way
+</font>
+    while (k--) {
+        oldblock = newblock;
+        newblock = ablocks[--a];
+        bh = sb_getblk(inode->i_sb, newblock);
+        lock_buffer(bh);
+        err = ext4_journal_get_create_access(handle, bh);
+        neh = ext_block_hdr(bh);
+<font color="blue">
+        //setup the new node's header
+</font>
+        neh->eh_entries = cpu_to_le16(1);
+        neh->eh_magic = EXT4_EXT_MAGIC;
+        neh->eh_max = cpu_to_le16(ext4_ext_space_block_idx(inode, 0));
+        neh->eh_depth = cpu_to_le16(depth - i);
+        neh->eh_generation = 0;
+        fidx = EXT_FIRST_INDEX(neh);
+<font color="blue">
+        //insert the 1st one, namely, the newly split child
+        //logical block is same across all new ei and ee
+</font>
+        fidx->ei_block = border;
+        ext4_idx_store_pblock(fidx, oldblock);
+<font color="blue">        /* start copy indexes */</font>
+        m = EXT_MAX_INDEX(path[i].p_hdr) - path[i].p_idx++;
+        if (m) {
+            memmove(<font color="red">++fidx</font>, path[i].p_idx,    sizeof(struct ext4_extent_idx) * m);
+            le16_add_cpu(&neh->eh_entries, m);
+        }
+<font color="blue">
+        //zero out unused area in the extent block
+        //Is it necessary ? eh->eh_entries should be enough
+</font>
+        ext_size = sizeof(struct ext4_extent_header) + (sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries));
+        memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+        ext4_extent_block_csum_set(inode, neh);
+        set_buffer_uptodate(bh);
+        unlock_buffer(bh);
+
+        err = ext4_handle_dirty_metadata(handle, inode, bh);
+<font color="blue">
+        //correct old index
+        //See it ? only update eh->eh_entries here
+</font>
+        if (m) {
+            err = ext4_ext_get_access(handle, inode, path + i);
+            le16_add_cpu(&path[i].p_hdr->eh_entries, -m);
+            err = ext4_ext_dirty(handle, inode, path + i);
+        }
+        i--;
+    }
+
+    /* insert new index */
+    err = ext4_ext_insert_index(handle, inode, path + at,
+                    le32_to_cpu(border), newblock);
+
+---
+</pre>
+</font>
+</p>
+
+<h4><a name="ext4_extent_grow">Grow level</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+All of the ei and ee are full, including the top one that's in inode->i_block
+                [hiiii]                     copy inode->i_block into new block          
+                 /  \                                     [hiiii]         
+          [hiiii]    [hiiii]         --\                   /  \           
+           /   \         \           --/              [hiiii]    [hiiii]           
+    [heeee]    [heeee]   [heeee]                     /   \         \             
+                                              [heeee]    [heeee]   [heeee]
+
+          inode->i_block [hi]                           ||
+                          |                             \/
+                        [hiiii]      link the new block to inode->i_block
+                         /  \           
+                    [hiiii  [hiiii]           
+                   /   \         \             
+            [heeee]    [heeee]   [heeee]
+Look at the code,
+ext4_ext_grow_indepth()
+---
+    bh = sb_getblk_gfp(inode->i_sb, newblock, __GFP_MOVABLE | GFP_NOFS);
+    lock_buffer(bh);
+    err = ext4_journal_get_create_access(handle, bh);
+    ext_size = sizeof(EXT4_I(inode)->i_data);
+<font color="blue">
+    /* move top-level index/leaf into new block */
+</font>
+    memmove(bh->b_data, EXT4_I(inode)->i_data, ext_size);
+    /* zero out unused area in the extent block */
+    memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+
+    /* set size of new block */
+    neh = ext_block_hdr(bh);
+<font color="blue">
+    //if ext_depth(inode) is zero, inode->i_block contain ee.
+    //then new node carries the initial 4 ee's.
+</font>
+    if (ext_depth(inode))
+        neh->eh_max = cpu_to_le16(ext4_ext_space_block_idx(inode, 0));
+    else
+        neh->eh_max = cpu_to_le16(ext4_ext_space_block(inode, 0));
+    neh->eh_magic = EXT4_EXT_MAGIC;
+    err = ext4_handle_dirty_metadata(handle, inode, bh);
+<font color="blue">
+    /* Update top-level index: num,max,pointer */
+</font>
+    neh = ext_inode_hdr(inode);
+    neh->eh_entries = cpu_to_le16(1);
+    ext4_idx_store_pblock(EXT_FIRST_INDEX(neh), newblock);
+    if (neh->eh_depth == 0) {
+<font color="blue">
+        /* Root extent block becomes index block */
+</font>
+        neh->eh_max = cpu_to_le16(ext4_ext_space_root_idx(inode, 0));
+        EXT_FIRST_INDEX(neh)->ei_block = EXT_FIRST_EXTENT(neh)->ee_block;
+    }
+    le16_add_cpu(&neh->eh_depth, 1);
+    err = ext4_mark_inode_dirty(handle, inode);
+---
+</pre>
+</font>
+</p>
+
+<h4><a name="ext4_extent_remove">Remove</a></h4>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+<pre>
+When we need to remove blocks ?
+ext4_ext_truncate()
+ext4_collapse_range()
+ext4_punch_hole()
+
+                          [hii]                             3
+                        [hii] [hii]                         2
+         [hii]     [hii]          [hii]      [hii]          1
+    [hee] [hee]  [hee] <font color="red"> [hee]  [hee]  [hee]  [hee] [hee]</font>    0
+                                             <--- rm direction
+                           ||
+                           \/
+
+                          [hii]                             3
+                        [hii] [hii]                         2
+         [hii]     [hi]          <font color="red">     [h]      [h]</font>          1
+    [hee] [hee]  [hee]                                      0
+
+                           ||
+                           \/
+
+                          [hii]                             3
+                        [hii] <font color="red">[h] </font>                         2
+         [hii]     [hi]                                     1
+    [hee] [hee]  [hee]                                      0
+
+
+                           ||
+                           \/
+
+                          [hi]                              3
+                        [hii]                               2
+         [hii]     [hi]                                     1
+    [hee] [hee]  [hee]                                      0
+
+
+The code is very complicated, so we don't show all of it here, but just some
+important part.
+<B>(1) continue or next level</B>
+                          [hii]                             3
+                        [hii] [hii]                         2
+         [hii]     [hii]          [hii]      [hii]          1
+    [hee] [hee]  [hee] <font color="red"> [hee]  [hee]  [hee]  [hee] [hee]</font>    0
+
+ext4_ext_rm_leaf() can only handle one node, namely a [hee], when to access the
+next one (the right one) ?
+ext4_ext_remove_space()
+---
+    while (i >= 0 && err == 0) {
+        if (i == depth) {
+            /* this is leaf block */
+            err = ext4_ext_rm_leaf(handle, inode, path,
+                           &partial, start, end);
+            /* root level has p_bh == NULL, brelse() eats this */
+            brelse(path[i].p_bh);
+            path[i].p_bh = NULL;
+            i--;
+            continue;
+        }
+
+        if (!path[i].p_idx) {
+        } else {
+<font color="blue">            /* we were already here, see at next index */</font>
+            <font color="red">path[i].p_idx--;</font>
+        }
+
+<font color="blue">
+        // determine based on path->p_idx and EXT_FIRST_INDEX(path->p_hdr)
+                   first  now            first 
+                     v    v                v  
+                    heeeeeeeeeeee         heeeeeeeeeeee
+                                          ^
+                                          now
+        // no more need to remove         previous one is need to be removed
+</font>
+        if (ext4_ext_more_to_rm(path + i)) {
+            struct buffer_head *bh;
+<font color="blue">
+            //Read in the ee or ei block
+</font>
+            bh = read_extent_tree_block(inode, ext4_idx_pblock(path[i].p_idx), depth - i - 1, EXT4_EX_NOCACHE);
+            i++;
+        } else {
+        }
+    }
+---
+   
+<B>(2) revoke ?</B>
+When free metadata block, we need to invoke them
+
+ext4_remove_blocks()
+---
+
+    flags = get_default_free_blocks_flags(inode);
+    ---
+        if (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode) ||
+            ext4_test_inode_flag(inode, EXT4_INODE_EA_INODE))
+            return EXT4_FREE_BLOCKS_METADATA | EXT4_FREE_BLOCKS_FORGET;
+    ---
+    ...
+    flags |= EXT4_FREE_BLOCKS_NOFREE_FIRST_CLUSTER;
+    ext4_free_blocks(handle, inode, NULL, pblk, num, flags);
+---
+ext4_ext_rm_idx()
+---
+    ext4_free_blocks(handle, inode, NULL, leaf, 1,
+             EXT4_FREE_BLOCKS_METADATA | <font color="red">EXT4_FREE_BLOCKS_FORGET</font>);
+---
+</pre>
+</font>
+</p>
+
+<h4> <a name="ext4_extent_da">Delayed Allocation</a></h4>
+<p>
+<font size="2">
+Delayed allocation, where the filesystem defers the allocation of blocks on disk for data <br/>
+written by applications until that data is actually written to disk. The idea is to wait<br/>
+until the application finishes its operations on the file, then allocate the actual number<br/>
+of data blocks needed on the disk at once. This optimization limits unneeded operations<br/>
+related to short-lived, small files, batches large writes, and helps ensure that data space <br/>
+is allocated contiguously.<br/>
+<ul>
+<li> write to page cache
+<pre>
+generic_perform_write()
+---
+    do {
+        ...
+        status = a_ops->write_begin(file, mapping, pos, bytes, flags,
+                        <font color="red">&page</font>, &fsdata);
+<font color="blue">
+         // 'i' here is iov_iter which contains the user buffer
+         // write_begin callback return one page every time.
+</font>
+        copied = copy_page_from_iter_atomic(page, offset, bytes, i);
+        status = a_ops->write_end(file, mapping, pos, bytes, copied,
+                        page, fsdata);
+        ...
+
+<font color="blue">        balance_dirty_pages_ratelimited(mapping);</font>
+    } while (iov_iter_count(i));
+---
+
+ext4_da_write_begin()
+  -> __block_write_begin(page, pos, len, <font color=>ext4_da_get_block_prep</font>);
+    -> ext4_da_get_block_prep()
+      -> ext4_da_map_blocks()
+        -> ext4_insert_delayed_block() <font color="blue">//ext4_ext_map_blocks() returns 0</font>
+          -> ext4_da_reserve_space() <font color="blue">//Reserve space in memory</font>
+          -> ext4_es_insert_delayed_block()
+
+extent status rb tree maintains extent status including,
+<font color="blue">//These flags live in the high bits of extent_status.es_pblk</font>
+enum {
+    ES_WRITTEN_B,
+    ES_UNWRITTEN_B,
+<font color="red">    ES_DELAYED_B,</font>
+    ES_HOLE_B,
+    ES_REFERENCED_B,
+    ES_FLAGS
+};
+</pre>
+<li> flush to disk
+<pre>
+In ext4_writepages(), we first need to get the extent in which pages have same
+state, 
+ - Delayed, pages with delayed allocation,
+ - Unwritten, fallocate
+ - Mapped, pages with Written state
+ - Dirty, has dirty data in cache
+
+This is done in mpage_prepare_extent_to_map(), it first collects the pages on
+demand, check their state and get the contiguous pages with same state.
+mpage_prepare_extent_to_map()
+  -> mpage_process_page_bufs()
+    -> mpage_add_bh_to_extent()
+    ---
+    if (map->m_len == 0) {
+        /* We cannot map unless handle is started... */
+        if (!mpd->do_map)
+            return false;
+        map->m_lblk = lblk;
+        map->m_len = 1;
+<font color="blue">
+        // BH_FLAGS (BIT(BH_Unwritten) | BIT(BH_Delay))
+</font>
+        map->m_flags = bh->b_state & BH_FLAGS;
+        return true;
+    }
+<font color="blue">
+    /* Don't go larger than mballoc is willing to allocate */
+    // MAX_WRITEPAGES_EXTENT_LEN is 2048 (2K * 4K = 8M)
+</font>
+    if (map->m_len >= MAX_WRITEPAGES_EXTENT_LEN)
+        return false;
+<font color="blue">
+    /* Can we merge the block to our big extent? */
+</font>
+    if (lblk == map->m_lblk + map->m_len &&
+        (bh->b_state & BH_FLAGS) == map->m_flags) {
+        map->m_len++;
+        return true;
+    }
+    return false;
+    ---
+
+ext4_writepages()
+  -> mpage_map_and_submit_extent)()
+    -> mpage_map_one_extent()
+      -> ext4_map_blocks()<font color="blue">//do reall allocation here</font>
+  -> mpage_map_and_submit_buffers()
+    -> mpage_process_page()<font color="blue">//update bhs' state </font>
+    -> mpage_submit_page()<font color="blue">//submit pages to io</font>
+</pre>
+<li> truncate
+<pre>
+ext4_truncate()
+  -> ext4_ext_truncate()
+    -> ext4_es_remove_extent()
+  ---
+    write_lock(&EXT4_I(inode)->i_es_lock);
+    err = __es_remove_extent(inode, lblk, end, &reserved);
+    write_unlock(&EXT4_I(inode)->i_es_lock);
+<font color="red">    ext4_da_release_space(inode, reserved);</font>
+  ---
+
+There seems not special optimization related to delayed allocation
+</pre>
+</ul>
+</font>
+</p>
+
+
+
 <h3><a name="ext4_xattr">Xattr</a></h3>
 <hr style="height:3px;border:none;border-top:1px solid black;" />
 <p>
@@ -4316,6 +5020,458 @@ ext4_add_entry()
     retval = add_dirent_to_buf(handle, fname, dir, inode, de, bh2);
   ---
 </pre>
+</font>
+</p>
+
+<h3><a name="ext4_blocks">Blocks</a></h3>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+<h4> <a name="ext4_blocks_buddy">Buddy</a></h4>
+<p>
+<font size="2">
+Ext4 mballoc maintains a buddy system for every block group in memory.
+<pre>
+Every block group needs two blocks (4K), which format is as following,
+
+                      O0                   O1        O2   O3 
+         |--------------------------|-------------|------|--|..|
+         \____________ ____________/ \____________ ____________/
+                      v                           v
+                  block 0                      block 1
+                  <font color="red">bd_bitmap</font>                    <font color="red">bd_buddy</font>
+
+O0: bitmap for order 0
+O1: bitmap for order 1
+    ...
+                      Extent (bit - off) << order, 1 << order)                >
+
+The region for every order is defined in ext4_sb_info.s_mb_offsets/s_mb_max
+which is calculated in ext4_mb_init()
+
+mb_find_buddy() helps to find the bitmap address and range (max)
+---
+    /* at order 0 we see each particular block */
+    if (order == 0) {
+        *max = 1 << (e4b->bd_blkbits + 3);
+        return e4b->bd_bitmap;
+    }
+
+    bb = e4b->bd_buddy + EXT4_SB(e4b->bd_sb)->s_mb_offsets[order];
+    *max = EXT4_SB(e4b->bd_sb)->s_mb_maxs[order];
+---
+
+</pre>
+How does this buddy system work ?
+<ul>
+<li> what
+<pre>
+What's information stored in the buddy (except for order 0 bitmap)?
+<B><font color="red">
+The freed and contiguous blocks of every order.
+</font></B>
+For example, if you have 128M blocks, then the highest order bitmap is cleared,
+all of other are set.
+
+If you have 64M, 32M, 16M, and 8M, then there will a single bit cleared in the
+bitmap of those orders. All of other are set.
+
+The buddy cache is initialized when load buddy,
+ext4_mb_load_buddy_gfp()
+  -> ext4_mb_init_group()
+    -> ext4_mb_init_cache()
+      -> memset(data, 0xff, blocksize);<font color="blue">//See it ? default state is set</font>
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      -> ext4_mb_generate_buddy()
+      ---
+          i = mb_find_next_zero_bit(bitmap, max, 0);
+        grp->bb_first_free = i;
+        while (i < max) {
+            fragments++;
+            first = i;
+            i = mb_find_next_bit(bitmap, max, i);
+            len = i - first;
+            free += len;
+            if (len > 1)
+                ext4_mb_mark_free_simple(sb, buddy, first, len, grp);
+            else
+                grp->bb_counters[0]++;
+            if (i < max)
+                i = mb_find_next_zero_bit(bitmap, max, i);
+        }
+      ---
+<font color="blue">
+    Find the freed and contiguous blocks and mark them free in the buddy
+</font>
+</pre>
+<li> find
+<pre>
+<B>Find by goal</B>
+By searching order 0, we can know whether the block has been allocated.
+By searching order 1 and larger ones, we can know the max contiguous blocks that
+contains the goal block.
+
+A general function we need to know is,
+mb_find_order_for_block()
+---
+    while (order <= e4b->bd_blkbits + 1) {
+        bb = mb_find_buddy(e4b, order, &max);
+        if (!mb_test_bit(block >> order, bb)) {
+            /* this block is part of buddy of order 'order' */
+            return order;
+        }
+<font color="blue">
+        //check in ascending order
+</font>
+        <font color="red">order++;</font>
+    }
+    return 0;
+---
+
+mb_find_extent() returns the range that contains  the goal block and required
+length. It can carry multiple buddies of different size,
+
+                        goal  required len
+                         | ______^_________
+                         v/                \
+   |[x][x][x][x][x][x][x][-][-][-][-][-][-][-][-][-]|
+     \___ ____/ \_ __/ |  | \___________ __________/
+         v        v    v  v             v
+         O2       O1   O0 O0           O3
+
+[x] : allocated
+[-] : freed
+</pre>
+<li> allocate
+<pre>
+This is done by mb_mark_used(), every order of buddies that's involved will be set,
+mb_mark_used()
+---
+<font color="blue">    /* let's maintain buddy itself */</font>
+    while (len) {
+<font color="blue">
+        //Note, it return the order that has free blocks
+</font>
+        ord = mb_find_order_for_block(e4b, start);
+
+        if (((start >> ord) << ord) == start && len >= (1 << ord)) {
+            /* the whole chunk may be allocated at once! */
+            mlen = 1 << ord;
+            buddy = mb_find_buddy(e4b, ord, &max);
+            mb_set_bit(start >> ord, buddy);
+            start += mlen;
+            len -= mlen;
+            continue;
+        }
+<font color="blue">
+        /* we have to split large buddy */
+        // split by descending order
+        // mb_find_order_for_block() in next loop won't return this
+        // order any more, as it has been set
+</font>
+        buddy = mb_find_buddy(e4b, ord, &max);
+        mb_set_bit(start >> ord, buddy);
+        e4b->bd_info->bb_counters[ord]--;
+
+        ord--;
+        cur = (start >> ord) & ~1U;
+        buddy = mb_find_buddy(e4b, ord, &max);
+        mb_clear_bit(cur, buddy);
+        mb_clear_bit(cur + 1, buddy);
+    }
+    mb_set_largest_free_order(e4b->bd_sb, e4b->bd_info);
+
+<font color="blue">
+    //Set the bits on the bitmap of order 0
+</font>
+    ext4_set_bits(e4b->bd_bitmap, ex->fe_start, len0);
+---
+
+The code works as following,
+(1)
+                        off     len
+                         | ______^_________
+                         v/                \
+   |[x][x][x][x][x][x][x]<font color="red">[-]</font>[-][-][-][-][-][-][-][-]|
+     \___ ____/ \_ __/ |  | \___________ __________/
+         v        v    v  v             v
+         O2       O1   O0 O0           O3
+
+    mb_find_order_for_block() return order 0, needn't split, <font color="red">offset is pushed forward</font>
+
+(2)
+                            off   len
+                             | ____^_____
+                             v/          \
+   |[x][x][x][x][x][x][x][x]<font color="red">[-][-][-][-][-]</font>[-][-][-]|
+     \___ ____/ \_ __/ |  | \___________ __________/
+         v        v    v  v             v
+         O2       O1   O0 O0           O3
+
+    mb_find_order_for_block() return order 3, need to split.
+    The entry of off in order 3 is set, so in next loop,
+    <font color="red">mb_find_order_for_block() can only return order 2</font>
+
+(3)
+                            off   len
+                             | ____^_____
+                             v/          \
+   |[x][x][x][x][x][x][x][x]<font color="red">[-][-][-][-]</font>[-][-][-][-]|
+     \___ ____/ \_ __/ |  | \____ ____/ \____ ____/
+         v        v    v  v      v           v
+         O2       O1   O0 O0    O2          O2
+
+    mb_find_order_for_block() return order 2, needn't to split, off is pushed forward
+
+(4) 
+                                        off
+                                         |
+                                         v
+   |[x][x][x][x][x][x][x][x][x][x][x][x]<font color="red">[-]</font>[-][-][-]|
+     \___ ____/ \_ __/ |  | \____ ____/ \____ ____/
+         v        v    v  v      v           v
+         O2       O1   O0 O0    O2          O2
+
+    mb_find_order_for_block() return order 2, need to split
+    The entry of off in order 2 is set, mb_find_order_for_block() will return
+    order 1 in next loop.
+
+(5)
+                                        off
+                                         |
+                                         v
+   |[x][x][x][x][x][x][x][x][x][x][x][x]<font color="red">[-]</font>[-][-][-]|
+     \___ ____/ \_ __/ |  | \____ ____/ \_ _/  \_ _/
+         v        v    v  v      v        v      v
+         O2       O1   O0 O0    O2       O1     O1
+    mb_find_order_for_block() return order 1, need to split again
+    The entry of off in order 1 is set, mb_find_order_for_block() will return
+    order 0 in next loop.
+
+(6)
+                                        off
+                                         |
+                                         v
+   |[x][x][x][x][x][x][x][x][x][x][x][x]<font color="red">[-]</font>[-][-][-]|
+     \___ ____/ \_ __/ |  | \____ ____/  |  | \_ _/
+         v        v    v  v      v       v  v   v
+         O2       O1   O0 O0    O2      O0  O0  O1
+
+    mb_find_order_for_block() return order 0, needn't to split, off is pushed forward
+</pre>
+<li> free
+<pre>
+Too lazy to read the code here. To be continued later
+</pre>
+<li> flush
+<pre>
+<B>Allocate</B>
+ext4_mb_new_blocks()
+---
+    if (!ext4_mb_use_preallocated(ac)) {
+        ac->ac_op = EXT4_MB_HISTORY_ALLOC;
+        ext4_mb_normalize_request(ac, ar);
+        ...
+<font color="blue">
+        // do allocation in mb
+</font>
+        *errp = ext4_mb_regular_allocator(ac);
+        ...
+    }
+    if (likely(ac->ac_status == AC_STATUS_FOUND)) {
+        *errp = ext4_mb_mark_diskspace_used(ac, handle, reserv_clstrs);
+    }
+
+---
+<B>Free</B>
+ext4_free_blocks()
+---
+    bitmap_bh = ext4_read_block_bitmap(sb, block_group);
+    gdp = ext4_get_group_desc(sb, block_group, &gd_bh);
+    err = ext4_journal_get_write_access(handle, bitmap_bh);
+    err = ext4_journal_get_write_access(handle, gd_bh);
+    ...
+    err = ext4_mb_load_buddy_gfp(sb, block_group, &e4b,
+                     GFP_NOFS|__GFP_NOFAIL);
+    if (ext4_handle_valid(handle) &&
+        ((flags & EXT4_FREE_BLOCKS_METADATA) ||
+         !ext4_should_writeback_data(inode))) {
+        ...
+        ext4_lock_group(sb, block_group);
+<font color="blue">
+        //Set in the bitmap on disk
+</font>
+        mb_clear_bits(bitmap_bh->b_data, bit, count_clusters);
+        ext4_mb_free_metadata(handle, &e4b, new_entry);
+    }
+
+    ret = ext4_free_group_clusters(sb, gdp) + count_clusters;
+    ext4_free_group_clusters_set(sb, gdp, ret);
+    ext4_block_bitmap_csum_set(sb, block_group, gdp, bitmap_bh);
+    ext4_group_desc_csum_set(sb, block_group, gdp);
+    ext4_unlock_group(sb, block_group);
+    ...
+    ext4_mb_unload_buddy(&e4b);
+    ...
+    err = ext4_handle_dirty_metadata(handle, NULL, bitmap_bh);
+    ret = ext4_handle_dirty_metadata(handle, NULL, gd_bh);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h4> <a name="ext4_blocks_prealloc">Pre Allocation</a></h4>
+<p>
+<font size="2">
+What is ext4 preallocation for ?
+<pre>
+The main goal is to provide better allocation for small and large files.
+This is achieved by using a different strategy for different allocation
+requests. For a relatively small allocation request, Ext4 tries to allocate
+from a per-CPU locality group, which is shared by all allocations under
+the same CPU, in order to try to keep these small files close to each other.
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+A large allocation request is allocated from per-file preallocation first.
+</pre>
+<ul>
+<li> How to determine the size of preallocation
+<pre>
+There are two steps,
+<B>(1) decide the goal allocation length</B>
+ext4_mb_normalize_request()
+---
+    if (ac->ac_flags & EXT4_MB_HINT_GROUP_ALLOC) {
+        ext4_mb_normalize_group_request(ac);
+        return ;
+    }
+<font color="blue">
+    // The code to decide length of per-file preallocation is a bit long, so
+    // don't share it here. The basic principle is take the 1st one larger than
+    // what you want,
+    // 16K 32K 64K 128K 256K 512K 1M 2M 4M 8M, what you want
+</font>
+---
+<B>(2) allocate from mb</B>
+ext4_mb_regular_allocator()
+---
+<font color="blue">    /*
+     * ac->ac_2order is set only if the fe_len is a power of 2
+     * if ac->ac_2order is set we also set criteria to 0 so that we
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * try exact allocation using buddy.
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     */</font>
+    i = fls(ac->ac_g_ex.fe_len);
+    ac->ac_2order = 0;
+<font color="blue">    /*
+     * We search using buddy data only if the order of the request
+     * is greater than equal to the sbi_s_mb_order2_reqs
+     * You can tune it via /sys/fs/ext4/<partition>/mb_order2_req
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     * We also support searching for power-of-two requests only for
+     * requests upto maximum buddy size we have constructed.
+     */</font>
+    if (i >= sbi->s_mb_order2_reqs && i <= MB_NUM_ORDERS(sb)) {
+        if ((ac->ac_g_ex.fe_len & (~(1 << (i - 1)))) == 0)
+            ac->ac_2order = array_index_nospec(i - 1,
+                               MB_NUM_ORDERS(sb));
+    }
+---
+
+ext4_mb_simple_scan_group()
+searching the buddy, if there is available one,
+ext4_mb_use_best_found()
+---
+<font color="blue">
+    //Note, it will use goal length instead of the one get from buddy
+</font>
+    ac->ac_b_ex.fe_len = min(ac->ac_b_ex.fe_len, <font color="red">ac->ac_g_ex.fe_len</font>);
+    ac->ac_b_ex.fe_logical = ac->ac_g_ex.fe_logical;
+    ret = mb_mark_used(e4b, &ac->ac_b_ex);
+    ...
+<font color="blue">    /*
+     * As we've just preallocated more space than
+     * user requested originally, we store allocated
+     * space in a special descriptor.
+     */</font>
+    if (ac->ac_o_ex.fe_len < ac->ac_b_ex.fe_len)
+        ext4_mb_new_preallocation(ac);
+---
+</pre>
+<li> How to decide use per-cpu and per-inode
+<pre>
+If EXT4_MB_HINT_GROUP_ALLOC is set, employ per-cgroup locality group alloc
+ext4_mb_group_or_file()
+---
+    size = ac->ac_o_ex.fe_logical + EXT4_C2B(sbi, ac->ac_o_ex.fe_len);
+    isize = (i_size_read(ac->ac_inode) + ac->ac_sb->s_blocksize - 1)
+        >> bsbits;
+
+    if ((size == isize) && !ext4_fs_is_busy(sbi) &&
+        !inode_is_open_for_write(ac->ac_inode)) {
+        ac->ac_flags |= EXT4_MB_HINT_NOPREALLOC;
+        return;
+    }
+<font color="blue">
+    // /sys/fs/ext4/xxx/mb_group_prealloc
+</font>
+    if (sbi->s_mb_group_prealloc <= 0) {
+        ac->ac_flags |= EXT4_MB_STREAM_ALLOC;
+        return;
+    }
+<font color="blue">
+    /* don't use group allocation for large files */
+    // The block allocation happens when .writepages. Writing has been
+    // aggregated through delayed-allocation.
+</font>
+    size = max(size, isize);
+    if (size > sbi->s_mb_stream_request) {
+        ac->ac_flags |= EXT4_MB_STREAM_ALLOC;
+        return;
+    }
+<font color="blue">    /*
+     * locality group prealloc space are per cpu. The reason for having
+     * per cpu locality group is to reduce the contention between block
+     * request from multiple CPUs.
+     */</font>
+    ac->ac_lg = raw_cpu_ptr(sbi->s_locality_groups);
+
+    /* we're going to use group allocation */
+    ac->ac_flags |= EXT4_MB_HINT_GROUP_ALLOC;
+
+    /* serialize all allocations in the group */
+    mutex_lock(&ac->ac_lg->lg_mutex);
+---
+</pre>
+<li> Preallocation in-core or on-disk
+<pre>
+Preallocation is only in-core, not on-disk.
+
+When the allocation completes, only the spaces used by file is flushed to disk,
+ext4_mb_new_blocks()
+  -> ext4_mb_mark_diskspace_used()
+  ---
+    ext4_set_bits(bitmap_bh->b_data, ac->ac_b_ex.fe_start,
+              <font color="red">ac->ac_b_ex.fe_len</font>);
+  ---
+
+  Don't worry, this is not the one used in ext4_mb_use_best_found()
+  It has been adapted,
+  ext4_mb_use_best_found()
+    -> ext4_mb_new_preallocation()
+      -> ext4_mb_new_inode_pa()
+        -> ext4_mb_use_inode_pa()
+        ---
+        /* found preallocated blocks, use them */
+        start = pa->pa_pstart + (ac->ac_o_ex.fe_logical - pa->pa_lstart);
+        end = min(pa->pa_pstart + EXT4_C2B(sbi, pa->pa_len),
+              start + EXT4_C2B(sbi, ac->ac_o_ex.fe_len));
+        len = EXT4_NUM_B2C(sbi, end - start);
+        ac->ac_b_ex.fe_len = len;
+        ac->ac_status = AC_STATUS_FOUND;
+        ac->ac_pa = pa;
+        ---
+</pre>
+</ul>
 </font>
 </p>
 

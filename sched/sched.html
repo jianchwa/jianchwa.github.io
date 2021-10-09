@@ -12,6 +12,7 @@
 <font size="2">
 <a href="#sched_basis">Sched Basis</a>
 <ul>
+<li> <a href="#priority">Priority</a>
 <li> <a href="#task_and_rq">Task and RQ</a>
 </ul>
 <a href="#sched_domain">Sched Domain</a>
@@ -29,12 +30,255 @@
 </ul>
 <a href="#migration">Migration</a><br/>
 <a href="#cfs_bw">CFS Bandwidth Control</a><br/>
+<ul>
+<li> <a href="#cfs_bw_basis">Basis</a><br/>
+<li> <a href="#cfs_bw_hierarchy">Hierarchy</a><br/>
+</ul>
 </ul>
 
 </font>
 </p>
 
 <h2><a name="sched_basis">Sched Basis</a></h2>
+<h3><a name="priority">Priority</a></h3>
+<hr style="height:3px;border:none;border-top:1px solid black;" />
+<p>
+<font size="2">
+How does the priority influence the scheduling ?<br/>
+Before answer this question, we need to figure out what's the priority of tasks in linux.<br/>
+<pre>
+ps ax -o pid,ni,pri,cmd
+  pid ni  pri cmd
+  255 -20  39 [kworker/40:0H]
+  256   0  19 [cpuhp/41]
+  257   - 139 [watchdog/41]
+  258   - 139 [migration/41]
+  259   0  19 [ksoftirqd/41]
+
+Priority : 0 ~ 139
+           used by linux kernel
+Nice     : 19 ~ -20
+           A POSIX syscall for UNIX and UNIX-like OS such as Linux,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           used by userland process to specific the priority
+           Smaller values means higher priority
+</pre>
+In linux kernel sched, priority is converted to weight
+<pre>
+const int sched_prio_to_weight[40] = {
+ /* -20 */     88761,     71755,     56483,     46273,     36291,
+ /* -15 */     29154,     23254,     18705,     14949,     11916,
+ /* -10 */      9548,      7620,      6100,      4904,      3906,
+ /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ /*   0 */      1024,       820,       655,       526,       423,
+ /*   5 */       335,       272,       215,       172,       137,
+ /*  10 */       110,        87,        70,        56,        45,
+ /*  15 */        36,        29,        23,        18,        15,
+};
+
+When the nice value goes up by 1, the weight 25%. Why ?
+
+cfs scheduling algorithm guarantee, if you go up 1 level, it's -10% CPU usage,
+if you go down 1 level it's +10% CPU usage.
+
+Say we have two task with nice 0 and nice 1 running on the same cpu,
+<font color="red">
+task with nice 0 get 1.25/2.25 = 0.55 cpu time
+task with nice 1 get 1/2.25 = 0.44 cpu time
+</font>
+it is about 0.11 gap here
+</pre>
+The weight is stored in sched_entity.load.weight, it influences scheduling in two ways,
+<ul>
+<li> virtual runtime
+<pre>
+sched_entity.vruntime is used to sorted se's in cfs_rq.tasks_timeline rbtree.
+We can take it as the priority in cfs.
+
+update_curr()
+---
+    delta_exec = now - curr->exec_start;
+    curr->exec_start = now;
+    curr->sum_exec_runtime += delta_exec;
+    curr->vruntime += calc_delta_fair(delta_exec, curr);
+---
+
+calc_delta_fair()
+---
+    if (unlikely(se->load.weight != NICE_0_LOAD))
+        delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+
+    return delta;
+---
+<font color="red">
+    delta = 1024/sched_prio_to_weight[nice]
+</font>
+</pre>
+<li> physical runtime
+<pre>
+There is a basic guarantee that
+a task must be scheduled one time during sysctl_sched_latency or __sched_period()
+
+We can test this in following way,
+echo.c
+=============================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+int main(int argc, const char *argv[])
+{
+    const char * tag = "Nobody";
+    struct timespec spec;
+    unsigned long prev,now, index;
+
+    if (argc > 1)
+        tag = argv[1];
+
+    prev = 0;
+    index = 0;
+    while (1) {
+        clock_gettime(CLOCK_REALTIME, &spec);
+        now = spec.tv_sec * 1000000000 + spec.tv_nsec;
+        if (!prev) {
+            prev = now;
+            continue;
+        }
+
+        if (now - prev >= 1000000) {
+            prev = now;
+            printf("%s tick %ld\n", tag, index);
+            index++;
+        }
+    }
+
+    return 0;
+}
+==============================================================
+Then use start two such process and bind them on one cpu, we get
+Jim tick 10315
+Tim tick 10317 \
+Tim tick 10318 |
+Tim tick 10319 |
+Tim tick 10320 |
+Tim tick 10321 |
+Tim tick 10322 |
+Tim tick 10323  >   13 times 
+Tim tick 10324 |
+Tim tick 10325 |
+Tim tick 10326 |
+Tim tick 10327 |
+Tim tick 10328 |
+Tim tick 10329 /
+Jim tick 10316 \
+Jim tick 10317 |
+Jim tick 10318 |
+Jim tick 10319 |
+Jim tick 10320 |
+Jim tick 10321 |
+Jim tick 10322  >   13 times 
+Jim tick 10323 |
+Jim tick 10324 |
+Jim tick 10325 |
+Jim tick 10326 |
+Jim tick 10327 |
+Jim tick 10328 /
+Tim tick 10330
+
+And the /proc/sys/kernel/sched_latency_ns is 24000000
+
+How to achieve this ?
+
+check_preempt_tick()
+---
+    ideal_runtime = sched_slice(cfs_rq, curr);
+    delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+    if (delta_exec > ideal_runtime) {
+        resched_curr(rq_of(cfs_rq));
+        ...
+        return;
+    }
+
+    /*
+     * Ensure that a task that missed wakeup preemption by a
+     * narrow margin doesn't have to wait for a full slice.
+     * This also mitigates buddy induced latencies under load.
+     */
+    if (delta_exec < sysctl_sched_min_granularity)
+        return;
+
+    se = __pick_first_entity(cfs_rq);
+    delta = curr->vruntime - se->vruntime;
+
+    if (delta < 0)
+        return;
+
+    if (delta > ideal_runtime)
+        resched_curr(rq_of(cfs_rq));
+---
+The code here is very simple, the most important part is the <font color="red">ideal_runtime</font>
+Let look at how to calculate it,
+sched_slice()
+---
+    slice = __sched_period(nr_running + !se->on_rq);
+
+    for_each_sched_entity(se) {
+        struct load_weight *load;
+        struct load_weight lw;
+
+        cfs_rq = cfs_rq_of(se);
+        load = &cfs_rq->load;
+        ...
+        slice = __calc_delta(slice, se->load.weight, load);
+    }
+---
+<font color="red">Do (se.load.weight/cfs_rq.load.weight) * slice on every level hierarchy.</font>
+</pre>
+</ul>
+
+There are two values need to be noted,
+<ul>
+<li> cfs_rq.load.weight
+<pre>
+It is relatively simple,
+
+enqueue_task_fair()
+  -> enqueue_entity()
+    -> account_entity_enqueue()
+      -> update_load_add(&cfs_rq->load, se->load.weight)
+      ---
+        lw->weight += inc;
+        lw->inv_weight = 0;
+      ---
+</pre>
+<li> se.load.weight
+<pre>
+The se here is not only the task, but also task_group
+The weight of task comes from priority or nice, but task_group not
+
+                   tg (shares = 1024)
+     __________________^___________________
+    /                                      \
+    cfs_rq0    cfs_rq1    cfs_rq2    cfs_rq3
+    se0        se1        se2        se3
+
+Every se is scheduled on the hierarchy of a specific cpu
+
+The total weight of a task weight is tg->shares (<font color="red">scale_load(cpu.shares)</font>)
+
+The weight of a se of task group is calculated by calc_group_shares(),
+the basic algorithm is as following,
+<font color="blue">
+                     tg->weight * grq->load.weight
+   ge->load.weight = -----------------------------               (1)
+                       Sum grq->load.weight
+</font>
+</pre>
+</ul>
+</font>
+</p>
+
+
 <h3><a name="task_and_rq">Task and RQ</a></h3>
 <hr style="height:3px;border:none;border-top:1px solid black;" />
 <p>
@@ -725,6 +969,7 @@ watchdog_timer_fn()
 </p>
 
 <h3><a name="cfs_bw">CFS Bandwidth Control</a></h3>
+<h4><a name="cfs_bw_basis">Basis</a></h4>
 <p>
 <font size="2">
 What's cfs bw ctl ?
@@ -877,7 +1122,53 @@ next:
     }
     rcu_read_unlock();
 ---
+</pre>
+</ul>
+</font>
+</p>
 
+<h4><a name="cfs_bw_hierarchy">Hierarchy</a></h4>
+<p>
+<font size="2">
+How does the cfs bw ctl work across hierarchy ?
+<pre>
+Period=100ms
+                 China
+              (1000ms)
+               / \
+        Beijing  Shanghai
+        (400ms)  (600ms)
+         /  \
+ Haidian     Other
+ (200ms)     (200ms)
+
+Every task cgroup has
+ - cfs_bandwidth
+ - cfs_rq per cpu
+ - sched_entity that represents itself
+
+All of the children se's are scheduled on the task cgroups cfs_rq's
+And also one task cgroup's se is scheduled on its parent's cfs_rq
+</pre>
+<ul>
+<li> account
+<pre>
+task_tick_fair()
+---
+<font color="blue">
+    //Iterate from buttom to top parent
+</font>
+    for_each_sched_entity(se) {
+        cfs_rq = cfs_rq_of(se);
+        entity_tick(cfs_rq, se, queued);
+          ->update_curr()
+            -> account_cfs_rq_runtime()
+<font color="">
+            //Check cfs bw runtime of every level
+</font>
+
+    }
+---
 </pre>
 </ul>
 </font>

@@ -19,68 +19,153 @@
 <hr style="height:3px;border:none;border-top:3px solid black;" />
 <p>
 <font size="2">
-hugetlb fs is a pseudo filesystem in which a file represents a range <br/>
-of configuous memory, namely huge page, and application could map this <br/>
-file into its address space directly.
 <ul>
-<li> hugetlbfs_fs_type
+<li> hstate   page pool of different huge page size
 <pre>
-hugetlbfs_init_fs_context()
-  -> hugetlbfs_fs_context_ops
-    -> hugetlbfs_get_tree()
-      -> hugetlbfs_fill_super()
-        -> hugetlbfs_get_root()
-          -> hugetlbfs_dir_inode_operations
-            -> hugetlbfs_create()
-              -> hugetlbfs_mknode()
-                -> do_hugetlbfs_mknode()
-                  -> hugetlbfs_get_inode()
-                  ---
-        case S_IFREG:
-            inode->i_op = &hugetlbfs_inode_operations;
-            inode->i_fop = &hugetlbfs_file_operations;
-            break;
-                  ---
-hugetlbfs_file_mmap()
+hugetlb_sysfs_init() add directory for them,
+ll /sys/kernel/mm/hugepages/hugepages-1048576kB
+ll /sys/kernel/mm/hugepages/hugepages-2048kB
+
+hstate comes from
+(1) hugetlb_init()
+	hugetlb_add_hstate(HUGETLB_PAGE_ORDER);
+	for x86, it is (PMD_SHIFT - PAGE_SHIFT)
+
+(2) setup_hugepagesz()
+	'hugepagesz=xxx' kernel command line
+
+(3) gigantic_pages_init()
+	---
+	/* With compaction or CMA we can allocate gigantic pages at runtime */
+	if (boot_cpu_has(X86_FEATURE_GBPAGES) && !size_to_hstate(1UL << PUD_SHIFT))
+		hugetlb_add_hstate(PUD_SHIFT - PAGE_SHIFT);
+	return 0;
+	---
+
+	X86_FEATURE_GBPAGES is 'pdpe1gb' in lscpu
+
+The default_hstate is the one which page size is HPAGE_SIZE (ARCH specific 2M in x86)
+
+At the same time, every hstate has its own kernel mount which can be used to
+allocate huge pages for other subsystem,
+init_hugetlbfs_fs()
 ---
-    vma->vm_flags |= VM_HUGETLB | VM_DONTEXPAND;
-    vma->vm_ops = &hugetlb_vm_ops;
-    ...
+	for_each_hstate(h) {
+		char buf[50];
+		unsigned ps_kb = 1U << (h->order + PAGE_SHIFT - 10);
+
+		snprintf(buf, sizeof(buf), "pagesize=%uK", ps_kb);
+		hugetlbfs_vfsmount[i] = kern_mount_data(&hugetlbfs_fs_type,
+							buf);
+		i++;
+	}
+---
+
+When you mount a hugetlbfs, it need to select a hstate,
+By default, it is default_hstate(HPAGE_SIZE), and you can set it through mount
+option 'pagesize'
+</pre>
+<li> When to allocate huge page for it ?
+<pre>
+alloc_pool_huge_page() <- hugetlb_hstate_alloc_pages() <- hugetlb_nrpages_setup() "hugepages=" kernel command line
+                       <- set_max_huge_pages() <- __nr_hugepages_store_common() <- /sys/kernel/mm/hugepages/xxx/nr_hugepages/nr_hugepages_mempolicy
+					                           <- hugetlb_sysctl_handler_common()
+
+alloc_pool_huge_page()
+  -> alloc_fresh_huge_page()
+	-> alloc_gigantic_page()/alloc_buddy_huge_page()
+	-> prep_new_huge_page()
+	  -> set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
+  -> put_page()
+	  -> __put_compound_page()
+	    -> dtor = get_compound_page_dtor(page);
+		-> (*dtor)(page)
+	       free_huge_page()
+	         -> enqueue_huge_page(h, page)
+	       
+See it ? When you free a hugepage, it is not freed back to system, but to hstate
+
+The hugepages are stored on hstate.hugepage_freelists
+</pre>
+<li> persistent and surplus
+<pre>
+/sys/kernel/mm/hugepages/xxx/nr_hugepages is the 'persistent'.
+'surplus' is the number of hugepages above the value of 'persistent'
+
+Let's look at the code of allocation and free
+hugetlb_fault()
+  -> hugetlb_no_page
+    -> alloc_huge_page()
+---
 <font color="blue">
-<U>    /* must be huge page aligned */</U>
+	//dequeue hugepages from hstate.hugepage_freelists()
 </font>
-    if (vma->vm_pgoff & (~huge_page_mask(h) >> PAGE_SHIFT))
-        return -EINVAL;
-
+	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
+	if (!page) {
+		spin_unlock(&hugetlb_lock);
+<font color="blue">
+		//Try 'surplus' ones
+</font>
+		page = alloc_buddy_huge_page_with_mpol(h, vma, addr);
+		if (!page)
+			goto out_uncharge_cgroup;
+		...
+	}
 ---
+alloc_buddy_huge_page_with_mpol()
+  -> alloc_surplus_huge_page()
+---
+	spin_lock(&hugetlb_lock);
+<font color="blue">
+	//exceeds the overcommit limit ?
+</font>
+	if (h->surplus_huge_pages >= h->nr_overcommit_huge_pages)
+		goto out_unlock;
+	spin_unlock(&hugetlb_lock);
 
-handle_mm_fault()
-  -> hugetlb_fault()
-    -> hugetlb_no_page()
-    ---
-    page = find_lock_page(mapping, idx);
-    if (!page) {
-        ...
-        page = alloc_huge_page(vma, haddr, 0);
-        ...
-    }
-    ptl = huge_pte_lock(h, mm, ptep);
-    ...
-    new_pte = make_huge_pte(vma, page, ((vma->vm_flags & VM_WRITE)
-                && (vma->vm_flags & VM_SHARED)));
-    set_huge_pte_at(mm, haddr, ptep, new_pte);
+	page = alloc_fresh_huge_page(h, gfp_mask, nid, nmask);
+	if (!page)
+		return NULL;
 
-    hugetlb_count_add(pages_per_huge_page(h), mm);
-    if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
-        /* Optimization, do the COW without a second fault */
-        ret = hugetlb_cow(mm, vma, address, ptep, page, ptl);
-    }
+	spin_lock(&hugetlb_lock);
+	if (h->surplus_huge_pages >= h->nr_overcommit_huge_pages) {
+		SetPageHugeTemporary(page);
+		put_page(page);
+		page = NULL;
+	} else {
+<font color="red">		h->surplus_huge_pages++;
+		h->surplus_huge_pages_node[page_to_nid(page)]++;</font>
+	}
+	...
+---
+When free hugepages,
+free_huge_page()
+---
+	spin_lock(&hugetlb_lock);
+	clear_page_huge_active(page);
+	hugetlb_cgroup_uncharge_page(hstate_index(h),
+				     pages_per_huge_page(h), page);
+	if (restore_reserve)
+		h->resv_huge_pages++;
 
-    spin_unlock(ptl);
-
-    ---
-
-
+	if (PageHugeTemporary(page)) {
+		list_del(&page->lru);
+		ClearPageHugeTemporary(page);
+		update_and_free_page(h, page);
+	} else if (h->surplus_huge_pages_node[nid]) {
+<font color="red">
+		//remove the surplus hugepages
+</font>
+		list_del(&page->lru);
+		update_and_free_page(h, page);
+		h->surplus_huge_pages--;
+		h->surplus_huge_pages_node[nid]--;
+	} else {
+		arch_clear_hugepage_flags(page);
+		enqueue_huge_page(h, page);
+	}
+	spin_unlock(&hugetlb_lock);
+---
 </pre>
 </ul>
 </font>

@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Overlayfs</title>
+</head>
+<body>
+<div>
+    <h1>Overlayfs</h1> 
+</div>
+<p>
+<font size="2">
+<a href="#lookup">lookup</a><br/>
+<a href="#copy_up">Copy Up</a>
+<ul>
+<li> <a href="#copy_up_when">When</a>
+<li> <a href="#copy_up_how0">How 0</a>
+<li> <a href="#copy_up_how1">How 1</a>
+</ul>
+</font>
+</p>
+
+<h2><a name="lookup">lookup</a></h2>
+<p>
+<font size="2">
+The basic principle of overlay fs lookup is:
+<ul>
+<li> For non-directory, upper overrides lower
+<pre>
+metacopy is a special case for regular file. In this case, only metadata is
+copied up, to get the data of file, we need the lower
+</pre>
+<li> For directory, upper merges with lower
+</ul>
+And also there are following special cases to handle
+<ul>
+<li> whiteout
+<pre>
+'writeout' is a special file to hide the file in lower.
+# rm merge/xfstests
+# umount merge
+# ll upper/merge
+c--------- 1 root root 0, 0 Apr 13 19:32 xfstests
+
+writeout file can hide any file including both directory and regular file
+Look at
+ovl_lookup_single()
+---
+    this = ovl_lookup_positive_unlocked(name, base, namelen, drop_negative);
+    ...
+    if (ovl_is_whiteout(this)) {
+<font color="blue">
+        // A whiteout would stop further lookup into lower
+</font>
+        d->stop = d->opaque = true;
+        goto put_and_out;
+    }
+    ...
+out:
+    *ret = this;
+    return 0;
+
+put_and_out:
+<font color="blue">
+        // The dentry of the whiteout file will be put and returns NULL
+        // this means you get nothing ...
+</font>
+    dput(this);
+    this = NULL;
+    goto out;
+---
+</pre>
+<li> opaque
+<pre>
+whiteout is used to hide the lower's file. However, what if we want to create a
+file with same name with the whiteout file ?
+ - for a regular file, overlayfs would use upper file to overwrite the lower one
+ - for a directory, overlayfs would merge upper directory with the lower ones with
+   same name.
+We don't want merging as the uppper directory is a new one after delete.
+
+'opaque' is used to handle this case. xattr 'trusted.overlay.opaque' is used to
+represent this feature.
+# rm -r merge/test
+# mkdir merge/test
+# umount merge
+# getfattr -n "trusted.overlay.opaque" upper/test
+# file: xfstests
+# trusted.overlay.opaque="y"
+
+Look at ovl_lookup_single()
+---
+    this = ovl_lookup_positive_unlocked(name, base, namelen, drop_negative);
+    ...
+    if (!d_can_lookup(this)) {
+        ...
+    } else {
+        if (ovl_is_opaquedir(d->sb, this)) {
+<font color="blue">
+            //opaque would stop further lookup into lower directories
+</font>
+            d->stop = true;
+            if (last_element)
+                d->opaque = true;
+            goto out;
+        }
+    }
+    ...
+out:
+<font color="blue">
+    // The dentry of the directory with 'opaque' is returned
+</font>
+    *ret = this;
+    return 0;
+---
+
+</pre>
+<li> redirect
+<pre>
+<font color="red">Redirect is to implement directory rename.</font>
+
+By default, overlayfs only supports to rename directorie purely from upper.
+As for directories from lower or merge, overlayfs returns EXDEV.
+
+With 'redirect_dir=on' when mount, a 'trusted.overlay.redirect' xattr is
+employed to implement the renaming. For example,
+merge  # mv foo test
+upper  # getfattr -n 'trusted.overlay.redirect'
+       # file: test
+       # trusted.overlay.redirect="foo"
+Then when we access the 'test' on merge, it will be redirected to 'foo'.
+This is done in ovl_check_redirect()
+---
+    buf = ovl_get_redirect_xattr(ofs, dentry, prelen + strlen(post));
+    ...
+    if (buf[0] == '/') {
+        d->stop = false;
+    } else {
+        res = strlen(buf) + 1;
+        memmove(buf + prelen, buf, res);
+        memcpy(buf, d->name.name, prelen);
+    }
+    strcat(buf, post);
+    kfree(d->redirect);
+    d->redirect = buf;
+<font color="blue">
+    // let d->name point to the redirect name
+</font>
+    d->name.name = d->redirect;
+    d->name.len = strlen(d->redirect);
+---
+
+<font color="red">
+Note !
+The semantics behind the the 'trusted.overlay.redirect' is that
+<B>The corresponding lower directory of this directory is the value of xattr 'trusted.overlay.redirect'</B>
+                     ^^^^^^^^^^^^^^^
+</font>
+Look into the code of ovl_lookup(), we could know the 'redirect' influence the lower lookup
+</pre>
+<li> metacopy
+<pre>
+metacopy is delayed data-copy-up. In some cases that don't change the file's
+data, such as owner/mode, only copy the inode but not data. Then different ovl
+mount can share the same page cache of lower files.
+
+A xattr 'trusted.overlay.metacopy' is set on the metacopy inode. At this case,
+lookup needs to know both the upper to get meta and lower inodes to get data.
+ovl_lookup_single()
+---
+    this = ovl_lookup_positive_unlocked(name, base, namelen, drop_negative);
+    if (!d_can_lookup(this)) {
+        err = ovl_check_metacopy_xattr(OVL_FS(d->sb), this);
+        ..
+        d->metacopy = err;
+<font color="blue">
+        // If the metacopy is set, it we need the lower inodes, otherwise,
+        // stop looking up futher.
+</font>
+        d->stop = !d->metacopy;
+        if (!d->metacopy || d->last)
+            goto out;
+    }
+---
+When read the inode,
+ovl_read_iter()
+  -> ovl_read_iter()
+    -> ovl_real_fdget_meta()
+      -> ovl_inode_realdata()
+      ---
+        upperinode = ovl_inode_upper(inode);
+        if (upperinode && ovl_has_upperdata(inode))
+            return upperinode;
+
+        return ovl_inode_lowerdata(inode);
+      ---
+The basic inode metadata are from upper inode,
+ovl_get_inode()
+---
+    ovl_fill_inode(inode, realinode->i_mode, realinode->i_rdev);
+    ovl_inode_init(inode, oip, ino, fsid);
+---
+The real inode is the upper one
+</pre>
+</ul>
+To know this, we could look at how does ovl_lookup_single set d->stop which<br/>
+decides whether to do lower lookup
+<pre>
+ovl_lookup_single()
+---
+    this = ovl_lookup_positive_unlocked(name, base, namelen, drop_negative);
+    ...
+<font color="blue">
+    // writeout means a file (both regular and directory) is deleted on upper.
+</font>
+    if (ovl_is_whiteout(this)) {
+        d->stop = d->opaque = true;
+        goto put_and_out;
+    }
+    ...
+    if (!d_can_lookup(this)) {
+        ...
+        err = ovl_check_metacopy_xattr(OVL_FS(d->sb), this);
+        ...
+        d->metacopy = err;
+<font color="blue">
+        // If it is a metacopy regular file, we need the lower
+        // inode to get the file data. Otherwise, use the upper
+        // one
+</font>
+        d->stop = !d->metacopy;
+        if (!d->metacopy || d->last)
+            goto out;
+    } else {
+        ...
+<font color="blue">
+        // Directory need to be merged except for it has been
+        // deleted and then create a same on on upper
+</font>
+        if (ovl_is_opaquedir(d->sb, this)) {
+            d->stop = true;
+            if (last_element)
+                d->opaque = true;
+            goto out;
+        }
+    }
+---
+</pre>
+</font>
+</p>
+
+<h2><a name="copy_up">Copy Up</a></h2>
+<hr style="height:3px;border:none;border-top:3px solid black;" />
+
+<h3><a name="copy_up_when">When</a></h3>
+<p>
+<font size="2">
+<pre>
+ovl_copy_up_flags <- ovl_maybe_copy_up() <- ovl_open()
+                                         <- ovl_ioctl_set_flags()
+
+                  <- ovl_copy_up_with_data \ ovl_setattr
+                  <-           ovl_copy_up /
+</pre>
+<ul>
+<li> ovl_open()
+<pre>
+ovl_open()
+  -> ovl_maybe_copy_up()
+    -> ovl_open_need_copy_up()
+      -> ovl_open_flags_need_copy_up()
+         ---
+            return ((OPEN_FMODE(flags) & FMODE_WRITE) || (flags & O_TRUNC));
+         ---
+  -> ovl_open_realfile()
+</pre>
+<li> ovl_ioctl_set_flags()
+<pre>
+ovl_ioctl()
+  -> ovl_ioctl_set_flags() //FS_IOC_SETFLAGS
+</pre>
+<li> ovl_setattr()
+<pre>
+ovl_setattr()
+---
+    if (attr->ia_valid & ATTR_SIZE) {
+        /* Truncate should trigger data copy up as well */
+        full_copy_up = true;
+    }
+    if (!full_copy_up)
+<font color="blue">
+        // metacopy should happen here
+</font>
+        err = ovl_copy_up(dentry);
+    else
+        err = ovl_copy_up_with_data(dentry);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+
+<h3><a name="copy_up_how0">How 0</a></h3>
+<p>
+<font size="2">
+Some thing you need to know about copy_up
+<ul>
+<li> copy up is synchronous
+<li> root inode of overlayfs has upper dir
+<pre>
+Yes, the upper is the upper directory
+ovl_get_root()
+---
+    struct ovl_inode_params oip = {
+        .upperdentry = upperdentry,
+        .lowerpath = lowerpath,
+    };
+
+    root = d_make_root(ovl_new_inode(sb, S_IFDIR, 0));
+    ...
+    ovl_inode_init(d_inode(root), &oip, ino, fsid);
+---
+</pre>
+
+<li> copy up is recurrent
+<pre>
+# ls upper/
+# ls lower/a/b/c/d.txt
+# mount -t overlay -o lowdir=lower,upperdir=upper,workdir=work overlay merge
+# touch merge/a/b/c/d.txt
+# umount merge
+# ls upper/a/b/c/d.txt
+
+ovl_copy_up_flags()
+---
+    while (!err) {
+        struct dentry *next;
+        struct dentry *parent = NULL;
+
+        if (ovl_already_copied_up(dentry, flags))
+            break;
+
+        next = dget(<font color="red">dentry</font>);
+<font color="blue">
+        // find the topmost dentry not yet copied up
+        // the topmost dentry is root which already has a upper dir
+</font>
+        for (; !disconnected;) {
+            parent = dget_parent(next);
+
+            if (ovl_dentry_upper(parent))
+                break;
+
+            dput(next);
+            next = parent;
+        }
+
+        err = ovl_copy_up_one(parent, next, flags);
+
+        dput(parent);
+        dput(next);
+    }
+---
+
+</pre>
+<li> how to serialize multiple copy-up attemp on one inode
+<pre>
+ovl_copy_up_one()
+  -> ovl_copy_up_start()
+     ---
+        err = ovl_inode_lock_interruptible(inode);
+        if (!err && ovl_already_copied_up_locked(dentry, flags)) {
+            err = 1; /* Already copied up */
+            ovl_inode_unlock(inode);
+        }
+     ---
+  
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="copy_up_how1">How 1</a></h3>
+<p>
+<font size="2">
+<ul>
+<li> copy the file data
+<ul>
+<li> regular file && non-metacopy
+<pre>
+When the file to be copied-up is regular file and memcpy is not set, do data copy
+
+ovl_copy_up_inode()
+---
+    if (S_ISREG(c->stat.mode) && !c->metacopy) {
+        ...
+        err = ovl_copy_up_data(ofs, &datapath, &upperpath,
+                       c->stat.size);
+    }
+---
+
+The ctx.metacopy is set in
+ovl_copy_up_one
+---
+    ctx.metacopy = ovl_need_meta_copy_up(dentry, ctx.stat.mode, flags);
+    ---
+    struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+
+    if (!ofs->config.metacopy)
+        return false;
+
+    if (!S_ISREG(mode))
+        return false;
+
+    if (flags && ((OPEN_FMODE(flags) & FMODE_WRITE) || (flags & O_TRUNC)))
+        return false;
+    ---
+---
+</pre>
+<li> clone file range
+<pre>
+Some filesystems support clone method, such as xfs(based on reflink), btrfs.
+In these cases, overlay uses clone_file_range.
+
+ovl_copy_up_data()
+---
+<font color="blue">    /* Try to use clone_file_range to clone up within the same fs */</font>
+    cloned = do_clone_file_range(old_file, 0, new_file, 0, len, 0);
+    if (cloned == len)
+        goto out;
+---
+</pre>
+<li> seek data
+<pre>
+Fill zero for hole will cost unnecessary disk space and meanwhile slow down the
+copy-up speed. With SEEK_DATA support of lower filesystem, we can skip the holes
+
+ovl_copy_up_data()
+---
+    data_pos = vfs_llseek(old_file, old_pos, SEEK_DATA);
+---
+</pre>
+<li> splice
+<pre>
+splice is used to copy data from lower to upper directly
+If we look into the code, the do_splice_direct() in ovl_copy_up_with_data() is
+buffer IO. This is well because the page cache will be used later.
+</pre>
+</ul>
+<li> atomicity (workdir)
+<pre>
+The atomicity of the copy-up is guaranteed by the finally rename.
+The copy-up including inode, xattr and data is multiple-steps and not atomic.
+overlay does copy-up in work directory and rename it to the destination by a
+atomic rename.
+
+During this, the workdir and upperdir need to be in one filesystem.
+This is needby the rename,
+do_renameat2()
+---
+    from = filename_parentat(olddfd, from, lookup_flags, &old_path,
+                    &old_last, &old_type);
+    to = filename_parentat(newdfd, to, lookup_flags, &new_path, &new_last,
+                &new_type);
+    error = -EXDEV; <font color="blue">//Cross-device link</font>
+    if (old_path.mnt != new_path.mnt)
+        goto exit2;
+---
+
+The atomicity of rename is provided by filesystem.
+
+If the rename isn't done, the temp files in workdir will be removed during mount.
+</pre>
+<li> atomicity (tmpfile)
+<pre>
+The tmpfile is actually an orphan inode in ext4, namely, there is not any dentry
+linked with it. Look at the implementation in ext4
+ext4_tmpfile()
+---
+    inode = ext4_new_inode_start_handle(mnt_userns, dir, mode,
+                        NULL, 0, NULL,
+                        EXT4_HT_DIR,
+            EXT4_MAXQUOTAS_INIT_BLOCKS(dir->i_sb) +
+              4 + EXT4_XATTR_TRANS_BLOCKS);
+    handle = ext4_journal_current_handle();
+    err = PTR_ERR(inode);
+    if (!IS_ERR(inode)) {
+        inode->i_op = &ext4_file_inode_operations;
+        inode->i_fop = &ext4_file_operations;
+        ext4_set_aops(inode);
+        d_tmpfile(dentry, inode);
+<font color="red">
+        err = ext4_orphan_add(handle, inode);
+</font>
+        mark_inode_dirty(inode);
+        unlock_new_inode(inode);
+    }
+    if (handle)
+        ext4_journal_stop(handle);
+---
+
+Then after the copy-up is completed, overlay link the upper dentry
+to this tmpfile.
+
+ovl_copy_up_tmpfile()
+---
+    temp = ovl_do_tmpfile(c->workdir, c->stat.mode);
+    err = ovl_copy_up_inode(c, temp);
+
+    inode_lock_nested(udir, I_MUTEX_PARENT);
+
+    upper = lookup_one_len(c->destname.name, c->destdir, c->destname.len);
+    err = PTR_ERR(upper);
+    if (!IS_ERR(upper)) {
+        err = ovl_do_link(temp, udir, upper);
+        dput(upper);
+    }
+    inode_unlock(udir);
+---
+
+__ext4_link()
+---
+    handle = ext4_journal_start(dir, EXT4_HT_DIR,
+        (EXT4_DATA_TRANS_BLOCKS(dir->i_sb) +
+         EXT4_INDEX_EXTRA_TRANS_BLOCKS) + 1);
+
+    inode->i_ctime = current_time(inode);
+<font color="red">
+    ext4_inc_count(inode);
+</font>
+    ihold(inode);
+
+    err = ext4_add_entry(handle, dentry, inode);
+    if (!err) {
+        err = ext4_mark_inode_dirty(handle, inode);
+<font color="red">
+        if (inode->i_nlink == 1)
+            ext4_orphan_del(handle, inode);
+</font>
+        d_instantiate(dentry, inode);
+        ext4_fc_track_link(handle, dentry);
+    } else {
+        drop_nlink(inode);
+        iput(inode);
+    }
+    ext4_journal_stop(handle);
+---
+</pre>
+</ul>
+</font>
+</p>
+
+<h3><a name="copy_up_ino">inode number after copy up</a></h3>
+<p>
+<font size="2">
+We have known that a new inode is created after copy up.<br/>
+But how to guarantee the inode number is still consistent ?
+<pre>
+# mount -t overlay -o lowerdir=lower,upperdir=upper,workdir=work,metacopy=on overlay merge
+# ls -i merge/name 
+108531 name
+# echo willson > merge/name
+# ls -i name
+108531 name
+# umount merge/
+# ls -i upper/name 
+<font color="red">108533</font> name
+</pre>
+How does the overlay let's see the lower inode ?<br/>
+The answer is the xattr 'trusted.overlay.origin'
+<pre>
+# getfattr -n trusted.overlay.origin name
+file: name
+trusted.overlay.origin=0sAPshAIFVsxR/YzRGOKE7HuBP5ouF86cBAAAAAAAD7Ky9
+</pre>
+The file handle is decoded into xattr 'trusted.overlay.origin',<br/>
+For a regular file, this xattr helps to get its lower copy origin
+<pre>
+ovl_lookup()
+---
+    upperdir = ovl_dentry_upper(dentry->d_parent);
+    if (upperdir) {
+        err = ovl_lookup_layer(upperdir, &d, &upperdentry, true);
+        if (upperdentry && !d.is_dir) {
+            err = ovl_check_origin(ofs, upperdentry, &origin_path);
+            ...
+        }
+---
+
+ovl_check_origin()
+---
+    struct ovl_fh *fh = ovl_get_fh(ofs, upperdentry, OVL_XATTR_ORIGIN);
+    ...
+    err = ovl_check_origin_fh(ofs, fh, false, upperdentry, stackp);
+    kfree(fh);
+---
+
+ovl_check_origin_fh()
+---
+    for (i = 1; i < ofs->numlayer; i++) {
+
+        origin = ovl_decode_real_fh(ofs, fh, ofs->layers[i].mnt,
+                        connected);
+        if (origin)
+            break;
+    }
+    ...
+    **stackp = (struct ovl_path){
+        .dentry = origin,
+        .layer = &ofs->layers[i]
+    };
+---
+</pre>
+</font>
+</p>
+
+<h2><a name="hardlink">hardlink</a></h2>
+<p>
+<font size="2">
+overlay doesn't support hardlink very well. See the following example,
+<pre>
+# ls -l merge
+-rw-r--r--  3 root root    5 Apr 16 15:51 a
+-rw-r--r--  3 root root    5 Apr 16 15:51 b
+-rw-r--r--  3 root root    5 Apr 16 15:51 c
+# touch merge/a
+# ls -l merge
+<font color="red">-rw-r--r--  1 root root    5 Apr 16 15:53 a</font>
+-rw-r--r--  3 root root    5 Apr 16 15:51 b
+-rw-r--r--  3 root root    5 Apr 16 15:51 c
+
+When we touch the 'a', a copy-up is setup and a new 'a' on upper is created.
+However, look at the i_nlink and time of 'b' and 'c'. This is not a POSIX compatible
+action. In theory, 'a' 'b' and 'c', these 3 dentries point to a same inode. But
+now, they are not. 'a' becomes a standalone file after copy-up and overwrites
+the lower 'a'. This is not what POSIX expects.
+
+merge   a   b   c           a   b   c
+      -------------       -------------
+upper   .   .   .    --\    a   .   .  
+      -------------  --/  -------------
+lower   a   b   c           a   b   c
+         \  |  /             \  |  /
+          inode               inode
+</pre>
+A new feature named 'index' is introduced. We need to open it with mount option 'index=on'
+<pre>
+It works as following,
+
+merge   a   b   c           a   b   c
+      -------------       -------------
+upper   .   .   .    --\    a --------> index/ABCDEFG....
+      -------------  --/  -------------
+lower   a   b   c           a   b   c
+         \  |  /             \  |  /
+          inode               inode
+
+With index feature, the 'a' 'b' and 'c' points to the same inode again.
+Look at the example,
+
+# ls merge
+-rw-r--r--  3 root root    5 Apr 16 15:51 a
+-rw-r--r--  3 root root    5 Apr 16 15:51 b
+-rw-r--r--  3 root root    5 Apr 16 15:51 c
+# touch a
+# ls merge
+-rw-r--r--  3 root root    5 Apr 16 16:19 a
+-rw-r--r--  3 root root    5 Apr 16 16:19 b
+-rw-r--r--  3 root root    5 Apr 16 16:19 c
+# umount merge
+# getfattr -n 'trusted.overlay.origin' upper/a
+file: upper/a
+trusted.overlay.origin=0sAPshAIFVsxR/YzRGOKE7HuBP5ouF86cBAAAAAAAD7Ky9
+# getfattr -n 'trusted.overlay.nlink' upper/a
+file: upper/a
+trusted.overlay.nlink="U+1"
+# ls -i upper/a
+2148917051 upper/a
+# ls -i work/index/
+2148917051 00fb21008155b3147f63344638a13b1ee04fe68b85f3a701000000000003ecacbd
+</pre>
+The most important point to achieve this is how to let the other link (such as<br/>
+'b' and 'c') point to the new copy-up inode and get a correct i_nlink.
+<ul>
+<li> Step 1, copy up the lower file into index directory
+<pre>
+copy-up the inode and set xattr 'trusted.overlay.origin' to lower original inode.
+The naming the dentry in index is done by ovl_get_index_name() which is
+distinguished with lower original inode number
+ovl_do_copy_up()
+---
+    if (to_index) {
+        c->destdir = ovl_indexdir(c->dentry->d_sb);
+        err = ovl_get_index_name(ofs, c->lowerpath.dentry, &c->destname);
+    }
+<font color="blue">
+    // The copy-up destination is not the upper but the __index__
+</font>
+    if (S_ISREG(c->stat.mode) && ofs->tmpfile)
+        err = ovl_copy_up_tmpfile(c);
+    else
+        err = ovl_copy_up_workdir(c);
+
+    if (to_index) {
+        /* Initialize nlink for copy up of disconnected dentry */
+        err = ovl_set_nlink_upper(c->dentry);
+          -> ovl_set_nlink_common(dentry, ovl_dentry_upper(dentry), "U%+i");
+            -> len = snprintf(buf, sizeof(buf), format, (int) <font color="red">(inode->i_nlink - realinode->i_nlink)</font>);
+    }
+---
+</pre>
+<li> Step 2, link the index file to upper
+<pre>
+This is done by
+ovl_copy_up_one()
+  -> ovl_link_up()
+  ---
+    inode_lock_nested(udir, I_MUTEX_PARENT);
+    upper = lookup_one_len(c->dentry->d_name.name, upperdir,
+                   c->dentry->d_name.len);
+    if (!IS_ERR(upper)) {
+        err = ovl_do_link(ovl_dentry_upper(c->dentry), udir, upper);
+        dput(upper);
+    }
+    inode_unlock(udir);
+    err = ovl_set_nlink_upper(c->dentry);
+  ---
+
+After this, when we access the upper 'a', then we can get the copied-up inode.
+</pre>
+<li> Step 3 lookup
+<pre>
+Now, we have get following,
+merge   a   b   c
+      -------------
+upper   a --------> index/ABCDEFG....
+      -------------
+lower   a   b   c
+         \  |  /
+          inode
+
+When we access 'a', the dentry in 'upper' will lead us to the index.
+What if we access b and c ? There is no upper for them.
+
+The magic is here,
+ovl_lookup()
+---
+    if (origin && ovl_indexdir(dentry->d_sb) &&
+        (!d.is_dir || ovl_index_all(dentry->d_sb))) {
+        index = ovl_lookup_index(ofs, upperdentry, origin, true);
+    }
+    ...
+    else if (index) {
+<font color="red">
+        upperdentry = dget(index);
+</font>
+        ...
+    }
+---
+Based on the lower inode, lookup the index and take it as our upper
+</pre>
+</ul>
+</font>
+</p>
+
+
+</body>
+</html>
+
+
